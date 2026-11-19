@@ -1,0 +1,9 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "aliyun-slider-solve",
+  "version": "0.1.0",
+  "description": "Aliyun slider captcha - mechanism and solver. 阿里云滑块验证码的机制拆解与自动化求解。",
+  "author": {
+    "name": "black-mouse-sha"
+  }
+}

@@ -1,0 +1,650 @@
+"""LLM 供应商管理（DESIGN.md §8，2026-09-13）——多供应商配置/发现/工厂。
+
+config/providers.json：
+    {"providers": [
+        {"name": "ark-coding", "base_url": "...", "api_key": "",
+         "models": ["ark-code-latest", ...], "enabled": true}, ...]}
+
+可选字段（2026-09-30 上下文治理 ct-7，均为 provider 级；缺省走运行时模块常量）：
+- "model_window": 1048566      硬窗口（优先于按模型的 "model_context"）
+- "ctx_soft_budget": 512000    有效软上限（支持 1M≠在 1M 最好，超此主动压缩）
+- "summarizer_model": "<model>" 专用摘要模型（缺省用会话模型）
+- "proxy": "http://127.0.0.1:7890" 可选供应商专属 HTTP/HTTPS 代理；缺省沿用系统代理环境
+- "vision": true                该供应商/模型支持图片输入（2026-10-19，vision 通道）：
+                               True → view_image 出图（内部 image 块按协议翻译成
+                               chat-completions 的 image_url / Responses 的
+                               input_image）；未声明或 false → view_image 只回文本
+                               摘要 + OCR 引导。**必须显式声明**——往不支持的网关
+                               塞图片块会被 400 打死整轮，宁缺勿炸。
+- "system_delivery": "auto"      system 送达方式（2026-10-28，system-delivery）：
+                               "field"=原生 system/instructions（最优）；
+                               "inline"=前置于首条 user 内容（= 旧 "system_in_user"）；
+                               "auto"=**默认**，读落库判定，没有就按 inline（安全侧）。
+                               顶层 "system_delivery_default" 改全局缺省。
+                               动机：中转网关会按 UA 静默丢 instructions，而本地快照/
+                               请求体全显示"已注入"——新加供应商默认踩坑。
+- "system_delivery_verdict"     服务端写入的判定（field/inline/unknown），
+  "system_delivery_verdict_for" 连同指纹（base_url|format|model）与
+  "system_delivery_checked_at"  判定时间；指纹变了即视为过期重探。**勿手改**。
+
+约定：
+- models[] 有序，**第一个 = 该供应商默认模型**；全局默认 = 第一个启用供应商的第一个模型。
+- api_key 留空 → 回退 ARK_API_KEY/.env（resolve_api_key），ark-coding 的标准姿态。
+- API 读出一律脱敏（masked()：has_key 布尔，不回传明文）；保存时空串=保持原 key。
+- 端点均为 Anthropic /v1/messages 兼容协议（AnthropicCompatProvider）。
+"""
+
+import json
+import logging
+import re
+import shutil
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Callable
+from urllib.parse import urlsplit
+
+from core.llm.anthropic_compat import AnthropicCompatProvider, CLIENT_USER_AGENT
+from core.llm.effort import GEARS as EFFORT_GEARS
+from core.llm.openai_compat import CHAT_COMPLETIONS, RESPONSES, OpenAICompatProvider
+from core.llm import system_delivery as delivery
+from core.llm.ark import resolve_api_key
+
+log = logging.getLogger(__name__)
+
+ANTHROPIC_MESSAGES = "anthropic-messages"
+DEFAULT_FORMAT = CHAT_COMPLETIONS
+SUPPORTED_FORMATS = {DEFAULT_FORMAT, RESPONSES, ANTHROPIC_MESSAGES}
+
+CONFIG_PATH = "config/providers.json"
+NAME_RE = re.compile(r"^[\w][\w.-]{0,63}$")
+
+# /v1/models 不支持时的降级探活候选（实测/官方环境已知模型；用户也可手填测活）
+FALLBACK_CANDIDATES = [
+    "ark-code-latest",
+    "deepseek-v4-flash",
+    "glm-5-3-flash-260828",
+]
+
+_SEED = {
+    "providers": [
+        {
+            "name": "ark-coding",
+            "base_url": "https://ark.cn-beijing.volces.com/api/coding",
+            "api_key": "",  # 留空：走 ARK_API_KEY / .env
+            "models": ["ark-code-latest", "deepseek-v4-flash"],
+            "enabled": True,
+        },
+        {
+            "name": "ark-plan",
+            "base_url": "https://ark.cn-beijing.volces.com/api/plan",
+            "api_key": "",  # 本机在设置页/配置文件中填入
+            "models": ["ark-code-latest", "deepseek-v4-flash", "glm-5-3-flash-260828"],
+            "enabled": True,
+            # 上下文治理（可选，2026-09-30 ct-7）：硬窗口/软上限/专用摘要模型；
+            # 省略即用运行时模块常量（1048566 / 512000 / 会话模型）
+            "model_window": 1048566,
+            "ctx_soft_budget": 512000,
+        },
+    ]
+}
+
+
+class ProviderError(ValueError):
+    """供应商配置错误（名称非法 / 模型为空 / 无启用供应商等）。"""
+
+
+# ---------- HTTP（可注入，测试不触网） ----------
+
+HttpGetter = Callable[[str, dict[str, str], float], tuple[int, dict[str, Any] | None]]
+
+
+def _http_get(url: str, headers: dict[str, str], timeout: float = 20.0,
+              proxy: str | None = None
+              ) -> tuple[int, dict[str, Any] | None]:
+    req = urllib.request.Request(url, method="GET")
+    for k, v in {"User-Agent": CLIENT_USER_AGENT, "Accept": "application/json", **headers}.items():
+        req.add_header(k, v)
+    try:
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+            response = opener.open(req, timeout=timeout)
+        else:
+            response = urllib.request.urlopen(req, timeout=timeout)
+        with response as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, {"error": {"message": raw[:300]}}
+
+
+# ---------- 存储 ----------
+
+class ProviderStore:
+    def __init__(self, path: str | Path = CONFIG_PATH, *, seed: bool = True):
+        self.path = Path(path)
+        if seed and not self.path.is_file():
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(
+                json.dumps(_SEED, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load(self) -> list[dict[str, Any]]:
+        if not self.path.is_file():
+            return json.loads(json.dumps(_SEED["providers"]))  # 深拷贝种子
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        providers = data.get("providers", [])
+        return providers
+
+    def _read_default_provider(self) -> str | None:
+        """JSON 顶层 default_provider（用户可选的全局默认供应商）；未设置返回 None。"""
+        if not self.path.is_file():
+            return None
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        v = data.get("default_provider")
+        return str(v) if v else None
+
+    def default_provider_name(self) -> str | None:
+        """已设置的默认供应商名（UI 下拉用）；未设置返回 None。"""
+        return self._read_default_provider()
+
+    def delivery_default(self) -> str:
+        """顶层 `system_delivery_default`（全局缺省送达方式）；未设置 → "auto"。
+
+        与 default_provider 同层：改一次对**所有没显式声明的供应商**生效，
+        新加的供应商天然继承——这就是「一劳永逸」的落点。
+        """
+        if not self.path.is_file():
+            return delivery.DEFAULT_MODE
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return delivery.DEFAULT_MODE
+        v = str(data.get("system_delivery_default") or "").strip().lower()
+        return v if v in delivery.MODES else delivery.DEFAULT_MODE
+
+    def resolve_delivery(self, p: dict[str, Any]) -> str:
+        """该供应商实际怎么发 system → "field" | "inline"（永不为 auto）。"""
+        return delivery.resolve_mode(p, self.delivery_default())
+
+    def needs_delivery_probe(self, p: dict[str, Any]) -> bool:
+        """该供应商现在要不要跑一次送达探测（→ 保存供应商时调用）。
+
+        只在「auto 且没有同指纹判定」时为真。显式 field/inline 是用户的决定，
+        不去打扰；unknown 也是**已探过的结论**（网关当时不通），重探留给人工
+        （诊断页红线自检 / 重新保存前改指纹），否则每次保存都白等超时。
+        """
+        mode = str(p.get("system_delivery") or "").strip().lower()
+        if mode not in delivery.MODES:
+            if p.get("system_in_user") is not None:
+                return False        # 历史显式开关 → 用户已表态
+            mode = self.delivery_default()
+        if mode != "auto":
+            return False
+        verdict = str(p.get("system_delivery_verdict") or "").strip().lower()
+        if verdict not in delivery.VERDICTS:
+            return True
+        return p.get("system_delivery_verdict_for") != delivery.fingerprint(p)
+
+    def record_verdicts(self, verdicts: dict[str, str]) -> int:
+        """把探测判定写回 providers.json（服务端写入）。返回写入条数。
+
+        **必须绕过 `save()`**：那是 UI 的整表 PUT 语义（带 key 掩码、默认供应商
+        校验），拿它写两个附加字段容易把用户刚编辑的内容覆盖掉。这里只做
+        "读原文 → 改指定供应商的三个字段 → 备份 → 写回"，其余字节原样保留。
+        """
+        if not verdicts or not self.path.is_file():
+            return 0
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            log.exception("system_delivery 判定写入：配置读取失败")
+            return 0
+        items = data.get("providers") or []
+        written = 0
+        for p in items:
+            name = str(p.get("name") or "")
+            verdict = str(verdicts.get(name) or "").strip().lower()
+            if verdict not in delivery.VERDICTS:
+                continue
+            p["system_delivery_verdict"] = verdict
+            p["system_delivery_verdict_for"] = delivery.fingerprint(p)
+            p["system_delivery_checked_at"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            written += 1
+        if not written:
+            return 0
+        try:
+            self._backup_before_write()
+            self.path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            log.exception("system_delivery 判定写入失败")
+            return 0
+        return written
+
+    def save(self, providers: list[dict[str, Any]],
+             default_provider: str | None = None,
+             system_delivery_default: str | None = None) -> list[dict[str, Any]]:
+        """整表保存（PUT 语义）。api_key 空串=沿用库中同名供应商原 key。
+        default_provider 给定时必须命中提交清单中的**启用**供应商（否则 ProviderError）；
+        缺省沿用已存设置。`system_delivery_default` 给定时写顶层全局送达方式
+        （auto/field/inline，非法值忽略）。返回落库后的明文表。"""
+        normalized = [self._validate(p) for p in providers]
+        if not any(p["enabled"] for p in normalized):
+            raise ProviderError("至少保留一个启用供应商，否则 Agent 无模型可用")
+        if default_provider is not None:
+            hit = next((p for p in normalized if p["name"] == default_provider), None)
+            if hit is None:
+                raise ProviderError(f"默认供应商不存在: {default_provider}")
+            if not hit["enabled"]:
+                raise ProviderError(f"默认供应商 {default_provider} 已停用，不能设为默认")
+        old = {p["name"]: p for p in self.load()}
+        for p in normalized:
+            if not p.get("api_key") and p["name"] in old:
+                p["api_key"] = old[p["name"]].get("api_key", "")
+            # 判定回填（system-delivery）：UI 不暴露这三个字段，客户端也不会带；
+            # 只要指纹（base_url|format|model）没变就当同一通道，沿用旧判定。
+            # 指纹变了就**不**回填 —— 换通道后旧结论可能正好相反。
+            prev = old.get(p["name"])
+            if prev and delivery.fingerprint(prev) == delivery.fingerprint(p):
+                for k in ("system_delivery_verdict", "system_delivery_verdict_for",
+                          "system_delivery_checked_at"):
+                    if prev.get(k):
+                        p.setdefault(k, prev[k])
+        if default_provider is None:
+            default_provider = self._read_default_provider()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # 顶层**附加键**原样保留（system_delivery_default 等）：save() 是 UI 的整表
+        # 保存，只认 providers/default_provider，顺手把别的顶层键写成默认值就等于
+        # 「保存一次即抹掉全局开关」——thinking/system_in_user 都栽过同一坑。
+        extra: dict[str, Any] = {}
+        if self.path.is_file():
+            try:
+                prev_data = json.loads(self.path.read_text(encoding="utf-8"))
+                extra = {k: v for k, v in prev_data.items()
+                         if k not in ("providers", "default_provider")}
+            except (OSError, ValueError):
+                extra = {}
+        payload: dict[str, Any] = dict(extra)
+        payload["providers"] = normalized
+        if default_provider:
+            payload["default_provider"] = default_provider
+        # 全局送达方式：显式给了才改（None=沿用原值），非法值忽略而不是打回 422
+        sd_default = str(system_delivery_default or "").strip().lower()
+        if sd_default in delivery.MODES:
+            payload["system_delivery_default"] = sd_default
+        self._backup_before_write()
+        self.path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return normalized
+
+    def _backup_before_write(self) -> Path | None:
+        """写盘前把旧文件存进同级 ``.history/<UTC时间戳>_providers.json``。
+
+        2026-10-20 事故：测试里 `create_app(...)` 没隔离 ``providers_config``，
+        `llm_store.save()` 直接覆盖了用户真实的 `config/providers.json`——
+        6 个供应商（含 API key）瞬间只剩一个测试用的 "P"，**无任何回滚依据**。
+        同一目录下的 `mcp.json` 早有历史备份，供应商配置却一直裸写。
+
+        口径对齐 `core/api/app.py::_pack_history_backup`：同秒多次写入用 ``.n``
+        避让，绝不覆盖既有版本。备份失败不阻断保存（宁可少一份历史，也不能
+        让用户改不了配置），但会打 warning 留痕。
+        """
+        if not self.path.is_file():
+            return None
+        try:
+            hist = self.path.parent / ".history"
+            hist.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            dest = hist / f"{ts}_{self.path.name}"
+            n = 1
+            while dest.exists():
+                dest = hist / f"{ts}.{n}_{self.path.name}"
+                n += 1
+            shutil.copy2(self.path, dest)
+            return dest
+        except OSError as e:  # noqa: BLE001 —— 备份是附加项，不能挡住保存
+            log.warning("供应商配置历史备份失败（继续保存）: %s", e)
+            return None
+
+    @staticmethod
+    def _validate(p: dict[str, Any]) -> dict[str, Any]:
+        name = str(p.get("name", "")).strip()
+        if not NAME_RE.match(name):
+            raise ProviderError(f"供应商名称非法（字母数字._-，1-64 字符）: {name!r}")
+        base_url = str(p.get("base_url", "")).strip().rstrip("/")
+        if not base_url.startswith(("http://", "https://")):
+            raise ProviderError(f"{name}: base_url 须为 http(s) 地址")
+        models = [str(m).strip() for m in p.get("models", []) if str(m).strip()]
+        if not models:
+            raise ProviderError(f"{name}: 至少勾选/填写一个模型")
+        protocol = str(p.get("format") or DEFAULT_FORMAT).strip()
+        if protocol not in SUPPORTED_FORMATS:
+            raise ProviderError(f"{name}: 不支持的兼容格式: {protocol}")
+        # 每模型最大上下文（token，可选）：models 保持纯字符串列表不破坏兼容；
+        # 非法项（非正数/超大/未勾选的模型）静默剔除，宁少勿滥
+        raw_ctx = p.get("model_context") or {}
+        ctx: dict[str, int] = {}
+        if isinstance(raw_ctx, dict):
+            for m, v in raw_ctx.items():
+                m = str(m).strip()
+                try:
+                    n = int(v)
+                except (TypeError, ValueError):
+                    continue
+                if m in models and 0 < n <= 10_000_000:
+                    ctx[m] = n
+        out = {
+            "name": name,
+            "base_url": base_url,
+            "api_key": str(p.get("api_key", "")),
+            "format": protocol,
+            "models": models,
+            "enabled": bool(p.get("enabled", True)),
+            "model_context": ctx,
+        }
+        # 思考链开关（2026-09-30）：显式 True/False 才落字段；None/缺失=不写，
+        # 运行时按网关缺省猜（base_url 含 ark 默认开）。此前本函数白名单把
+        # thinking 抹掉——设置页保存一次即丢，思考链静默消失
+        thinking = p.get("thinking")
+        if thinking is not None:
+            out["thinking"] = bool(thinking)
+        effort = str(p.get("thinking_effort") or "").strip().lower()
+        if effort in EFFORT_GEARS:
+            out["thinking_effort"] = effort
+        # 上下文治理（2026-09-30 ct-7）：同 thinking——显式才落字段，否则设置页
+        # 保存一次即被白名单抹掉（此前 thinking 就是这么静默消失的）。三者均为
+        # 可选，缺省时运行时用模块常量兜底：
+        #   model_window     硬窗口（provider 级，优先于按模型的 model_context）
+        #   ctx_soft_budget  有效软上限（支持 1M≠在 1M 最好，超此主动压缩）
+        #   summarizer_model  专用摘要模型（缺省用会话模型）
+        mw = p.get("model_window")
+        if mw is not None:
+            try:
+                n = int(mw)
+            except (TypeError, ValueError):
+                n = 0
+            if 0 < n <= 10_000_000:
+                out["model_window"] = n
+        sb = p.get("ctx_soft_budget")
+        if sb is not None:
+            try:
+                n = int(sb)
+            except (TypeError, ValueError):
+                n = 0
+            if 0 < n <= 10_000_000:
+                out["ctx_soft_budget"] = n
+        sm = str(p.get("summarizer_model") or "").strip()
+        if sm:
+            out["summarizer_model"] = sm
+        proxy = str(p.get("proxy") or "").strip()
+        if proxy:
+            parsed_proxy = urlsplit(proxy)
+            if (parsed_proxy.scheme not in {"http", "https"}
+                    or not parsed_proxy.hostname):
+                raise ProviderError(f"{name}: proxy 须为 http(s) 地址")
+            out["proxy"] = proxy.rstrip("/")
+        # system 兼容通道（2026-10-17）：网关整个丢弃 system 字段（实测幻灵）时，把
+        # system 前置于首条 user 消息下发。同 thinking 的教训——显式才落字段，否则
+        # 设置页保存一次即被白名单抹掉，兼容通道静默失效。
+        siu = p.get("system_in_user")
+        if siu is not None:
+            out["system_in_user"] = bool(siu)
+        # system 送达方式（2026-10-28，system-delivery）：三档，非法值静默丢弃
+        # （回落 auto/全局缺省），不让一个拼错的值把整份供应商配置打回 422。
+        sd = str(p.get("system_delivery") or "").strip().lower()
+        if sd in delivery.MODES:
+            out["system_delivery"] = sd
+        # 判定三元组：**服务端写入**，但必须原样留存——否则 UI 保存一次就把判定
+        # 抹掉，下次要重探（与 thinking/system_in_user 同一坑，别再踩）。
+        verdict = str(p.get("system_delivery_verdict") or "").strip().lower()
+        if verdict in delivery.VERDICTS:
+            out["system_delivery_verdict"] = verdict
+            fp = str(p.get("system_delivery_verdict_for") or "")
+            if fp:
+                out["system_delivery_verdict_for"] = fp
+            at = str(p.get("system_delivery_checked_at") or "")
+            if at:
+                out["system_delivery_checked_at"] = at
+        # 视觉能力（vision 通道，2026-10-19）：同 thinking/system_in_user——显式才
+        # 落字段，否则设置页保存一次即被白名单抹掉（这两个字段都栽过同一坑）。
+        # True → view_image 出图；未声明/False → 只回文本 + OCR 引导（宁缺勿炸：
+        # 往不支持的网关塞图片块会被 400 打死整轮）。
+        vis = p.get("vision")
+        if vis is not None:
+            out["vision"] = bool(vis)
+        return out
+
+    def masked(self) -> list[dict[str, Any]]:
+        """API 出参：不回传明文 key。"""
+        out = []
+        for p in self.load():
+            q = {k: v for k, v in p.items() if k != "api_key"}
+            q["format"] = p.get("format", DEFAULT_FORMAT)
+            q["has_key"] = bool(p.get("api_key"))
+            out.append(q)
+        return out
+
+    def get(self, name: str) -> dict[str, Any]:
+        for p in self.load():
+            if p["name"] == name:
+                return p
+        raise ProviderError(f"供应商不存在: {name}")
+
+    def default(self) -> dict[str, Any]:
+        """全局默认供应商：用户显式选择的 default_provider 优先（须启用），
+        未设置/已失效 → 第一个启用供应商（旧行为兜底）。"""
+        named = self._read_default_provider()
+        if named:
+            for p in self.load():
+                if p["name"] == named:
+                    if p.get("enabled", True):
+                        return p
+                    break  # 选中的供应商已停用 → 兜底第一个启用
+        for p in self.load():
+            if p.get("enabled", True):
+                return p
+        raise ProviderError("无启用供应商")
+
+    def default_target(self) -> tuple[str, str]:
+        p = self.default()
+        return p["name"], p["models"][0]
+
+    # ---------- 工厂 ----------
+
+    def resolve_key(self, p: dict[str, Any]) -> str:
+        if p.get("api_key"):
+            return p["api_key"]
+        try:
+            return resolve_api_key()
+        except ValueError as e:
+            raise ProviderError(
+                f"供应商 {p['name']} 未配置 api_key，且环境/.env 也无 ARK_API_KEY") from e
+
+    def alternate_targets(self, exclude: str | None = None
+                          ) -> list[tuple[str, str | None]]:
+        """其它**启用**供应商的兜底目标（配置顺序 = 设置页顺序），排除主供应商。
+
+        模型取该供应商的第一个（= 它的默认模型）：跨供应商时「同名模型」大多
+        不存在（各家目录不同），拿别家的默认模型才是有意义的兜底。
+        没有模型的条目直接跳过——`build()` 会在 `models[0]` 上炸。
+        """
+        out: list[tuple[str, str | None]] = []
+        for p in self.load():
+            if not p.get("enabled", True):
+                continue
+            name = str(p.get("name") or "")
+            if not name or (exclude and name == exclude):
+                continue
+            models = [str(m) for m in (p.get("models") or []) if str(m).strip()]
+            if not models:
+                continue
+            out.append((name, models[0]))
+        return out
+
+    def build(self, name: str | None = None, model: str | None = None,
+              timeout: float | None = None, *, fallback: bool = True,
+              thinking_effort: str | None = None):
+        """构造与供应商兼容格式匹配的 provider 实例。
+
+        ``timeout``：覆盖默认 600s（诊断类一次性探测用，避免长挂死 HTTP 请求）。
+
+        ``thinking_effort``（thinking-effort，2026-10-21）：**覆盖**该供应商配置里的
+        思考强度（七档，见 effort.py）。线程级覆写走这条路——强度必须在这里落进
+        实例，不能构造后改属性（`with_fallback` 包装器会把赋值吞在自己身上）。
+
+        ``fallback``（provider-failover，2026-10-21）：默认给实例挂上「其它启用
+        供应商」的兜底链（`core/llm/fallback.py`）——某家重试 3 次仍失败就按序
+        换下一家，全链失败才抛。**探活/自检路径必须传 False**：那里要测的是
+        「这一家通不通」，静默换家会把结论变成假的。
+        """
+        primary = self._build_one(name, model, timeout,
+                                  thinking_effort=thinking_effort)
+        if not fallback:
+            return primary
+        try:
+            label = str((self.default() if name is None else self.get(name))["name"])
+        except ProviderError:
+            return primary
+        from core.llm.fallback import with_fallback
+        return with_fallback(primary, self, label=label, timeout=timeout,
+                             thinking_effort=thinking_effort)
+
+    def _build_one(self, name: str | None = None, model: str | None = None,
+                   timeout: float | None = None,
+                   thinking_effort: str | None = None):
+        """单实例构建（不含兜底包装）。"""
+        p = self.default() if name is None else self.get(name)
+        if not p.get("enabled", True):
+            raise ProviderError(f"供应商 {p['name']} 已停用")
+        model = model or p["models"][0]
+        # 思考开关（2026-09-19 直播间终端化）：供应商条目 "thinking": true/false 显式控制；
+        # 缺省时 Ark coding 网关默认开启（思考链路可见），其余网关默认关。模型不支持时
+        # anthropic_compat 层 400 去参降级兜底，不会炸调用。
+        thinking = p.get("thinking")
+        if thinking is None:
+            thinking = "ark" in str(p.get("base_url", "")).lower()
+        # 硬窗口优先取 provider 级 model_window（2026-09-30 ct-7），否则按模型粒度
+        # model_context[model]；两者皆空 → None（运行时回落 _MODEL_WINDOW_FALLBACK）。
+        window = p.get("model_window") or (p.get("model_context") or {}).get(model)
+        kwargs = {
+            "base_url": p["base_url"], "api_key": self.resolve_key(p), "model": model,
+            "enable_thinking": bool(thinking), "context_tokens": window,
+            "ctx_soft_budget": p.get("ctx_soft_budget"),
+            "summarizer_model": p.get("summarizer_model"),
+            "proxy": p.get("proxy"),
+            # vision 通道（2026-10-19）：两条协议路径都收该能力位
+            "supports_vision": bool(p.get("vision")),
+            # 思考强度（thinking-effort，2026-10-21）：两条协议路径都收。
+            # OpenAI 侧映射成 reasoning_effort，Anthropic 侧映射成 thinking 预算
+            # ——原先只有 OpenAI 侧收，导致 UI 上的强度滑块对 Anthropic 网关
+            # （智谱/DeepSeek-Anthropic 等）完全无效。
+            # 显式传入的（线程级覆写）优先于供应商配置。
+            "thinking_effort": thinking_effort or p.get("thinking_effort"),
+        }
+        if timeout is not None:
+            kwargs["timeout"] = float(timeout)
+        if p.get("format", DEFAULT_FORMAT) == ANTHROPIC_MESSAGES:
+            return AnthropicCompatProvider(**kwargs)
+        # system 送达方式（system-delivery，2026-10-28）：由 system_delivery 三档 →
+        # 具体开关；auto 的落库判定在这里生效，未判定按 inline（安全侧）。
+        # 历史 `system_in_user` 仍有效（等价 inline/field），由 resolve_mode 兼容。
+        # anthropic 路径不收此开关：该协议 system 是顶层字段，直连基本不丢。
+        return OpenAICompatProvider(format=p.get("format", DEFAULT_FORMAT),
+                                    system_in_user=(
+                                        self.resolve_delivery(p) == "inline"),
+                                    **kwargs)
+
+    # ---------- 发现 / 探活 ----------
+
+    def discover(self, name: str, *, http_get: HttpGetter | None = None,
+                 prober: Callable[[str], bool] | None = None
+                 ) -> dict[str, Any]:
+        """按已保存供应商名发现模型（key 空→env/.env 回退）。"""
+        p = self.get(name)
+        probe = prober or (lambda model: self.probe(name, model))
+        return self.discover_credentials(
+            p["base_url"], self.resolve_key(p), format=p.get("format", DEFAULT_FORMAT),
+            saved_models=p.get("models", []), http_get=http_get, prober=probe,
+            proxy=p.get("proxy"))
+
+    def discover_credentials(self, base_url: str, api_key: str, *,
+                             format: str = DEFAULT_FORMAT,
+                             saved_models: list[str] | None = None,
+                             proxy: str | None = None,
+                             http_get: HttpGetter | None = None,
+                             prober: Callable[[str], bool] | None = None
+                             ) -> dict[str, Any]:
+        """获取某端点支持的模型（未保存的新供应商也可用）。
+
+        1) GET {base_url}/v1/models（Bearer）——ark-coding 支持，返回 data[]（过滤 Shutdown）。
+        2) 404/不支持（ark-plan 实测）→ 候选清单 + 已保存模型逐个最小调用探活。
+        返回 {listed: bool, models: [{id, status?}], probed: [...可用...]}。
+        """
+        headers = {"Authorization": f"Bearer {api_key}"}
+        if format == ANTHROPIC_MESSAGES:
+            headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+        if http_get is None:
+            status, data = _http_get(f"{base_url.rstrip('/')}/v1/models", headers,
+                                     proxy=proxy)
+        else:
+            status, data = http_get(f"{base_url.rstrip('/')}/v1/models", headers)
+        if status == 200 and isinstance(data, dict) and isinstance(data.get("data"), list):
+            models = []
+            for m in data["data"]:
+                mid = m.get("id")
+                if not mid or m.get("status") == "Shutdown":
+                    continue
+                models.append({"id": mid, "status": m.get("status")})
+            return {"listed": True, "models": models}
+        if status not in (404, 405):
+            raise ProviderError(
+                f"模型列表接口返回 HTTP {status}: {(data or {}).get('error', '') if data else ''}")
+        # 降级：候选探活
+        probe = prober or (lambda model: _probe_safe(base_url, api_key, model, format,
+                                                      proxy=proxy))
+        candidates: list[str] = []
+        for m in FALLBACK_CANDIDATES + (saved_models or []):
+            if m not in candidates:
+                candidates.append(m)
+        ok = [m for m in candidates if probe(m)]
+        return {"listed": False, "models": [{"id": m} for m in ok], "probed": ok}
+
+    def probe(self, name: str, model: str) -> bool:
+        p = self.get(name)
+        probe_credentials(p["base_url"], self.resolve_key(p), model,
+                          format=p.get("format", DEFAULT_FORMAT), proxy=p.get("proxy"))
+        return True
+
+
+def probe_credentials(base_url: str, api_key: str, model: str, *, format: str = DEFAULT_FORMAT,
+                      proxy: str | None = None) -> None:
+    """手填测活：任意 base_url/key/model 组合，不通抛 ProviderError/LLMError。"""
+    if format == ANTHROPIC_MESSAGES:
+        provider = AnthropicCompatProvider(
+            base_url=base_url.rstrip("/"), api_key=api_key, model=model, timeout=30.0,
+            proxy=proxy)
+    else:
+        provider = OpenAICompatProvider(
+            base_url=base_url.rstrip("/"), api_key=api_key, model=model,
+            format=format, timeout=30.0, proxy=proxy)
+    provider.chat(
+        [{"role": "user", "content": "reply exactly: OK"}], max_tokens=8)
+
+
+def _probe_safe(base_url: str, api_key: str, model: str, format: str = DEFAULT_FORMAT,
+                *, proxy: str | None = None) -> bool:
+    """候选探活用：不通返回 False，不抛异常（一次坏候选不影响整体发现）。"""
+    try:
+        probe_credentials(base_url, api_key, model, format=format, proxy=proxy)
+        return True
+    except Exception:  # noqa: BLE001
+        return False

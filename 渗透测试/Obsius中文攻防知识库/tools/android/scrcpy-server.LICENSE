@@ -1,0 +1,23 @@
+scrcpy-server — vendored binary
+
+来源: https://github.com/Genymobile/scrcpy
+版本: 3.3.4
+文件: scrcpy-server (90,980 bytes)
+许可: Apache License 2.0
+
+用途: 逆向工作台「手机」面板的实时投屏。桌面主进程把它 push 到设备
+/data/local/tmp/ 后用 app_process 启动，再经 adb forward 取 H.264 裸流，
+由渲染进程 WebCodecs 硬解到 canvas。
+
+为什么 vendor 而不是依赖用户安装:
+  scrcpy 的 server jar 与客户端协议是**版本绑定的**（协议头字段、控制消息
+  编号都随版本变）。若依赖用户机器上恰好装了某个版本的 scrcpy，版本一换
+  协议解析就静默错位。固定 3.3.4 并随仓分发，才能保证协议解析与 jar 一致。
+
+升级流程:
+  1. 用新版 scrcpy 的 scrcpy-server 替换本文件
+  2. 同步改 desktop/main.js 的 SCRCPY_SERVER_VERSION
+  3. 复核协议头解析（device name 64B + codec/width/height 12B 是否仍一致）
+  4. 真机跑一遍：确认能出画面、坐标点按位置正确
+
+许可全文: https://www.apache.org/licenses/LICENSE-2.0

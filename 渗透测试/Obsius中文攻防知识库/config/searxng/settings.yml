@@ -1,0 +1,39 @@
+{
+  "use_default_settings": true,
+  "server": {
+    "secret_key": "CHANGE_ME_BEFORE_DEPLOY",
+    "limiter": false
+  },
+  "search": {
+    "safe_search": 0,
+    "formats": [
+      "html",
+      "json"
+    ]
+  },
+  "outgoing": {
+    "proxies": {
+      "all://": "http://user:CHANGE_ME_BEFORE_DEPLOY@host.docker.internal:7891"
+    }
+  },
+  "engines": [
+    {
+      "name": "google",
+      "engine": "google",
+      "shortcut": "go",
+      "disabled": false
+    },
+    {
+      "name": "bing",
+      "engine": "bing",
+      "shortcut": "bi",
+      "disabled": false
+    },
+    {
+      "name": "brave",
+      "engine": "brave",
+      "shortcut": "br",
+      "disabled": false
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "pwn|二进制漏洞|堆|栈溢出": [
+    "binary/漏洞利用/"
+  ],
+  "逆向|reverse|脱壳|反编译": [
+    "binary/逆向工程/"
+  ],
+  "android|apk|安卓|移动逆向": [
+    "binary/移动安全/"
+  ],
+  "恶意样本|malware|病毒分析": [
+    "binary/恶意样本/"
+  ],
+  "容器里工具缺失|装不了|EPERM|Operation not permitted|环境缺失|能力边界": [
+    "binary/环境与工具/"
+  ]
+}

@@ -1,0 +1,71 @@
+import { useCallback, useEffect, useState } from "react"
+import { api } from "@/lib/api"
+import type { ChallengeFlag } from "@/lib/types"
+
+/** 候选 flag 数据源（ctf-flag-wake，2026-10-20）。
+ *
+ *  子代理提交候选 flag 时后端会唤醒 CTF 解题主控说一段话，本 hook 给那句话配一张
+ *  「复制 / 确认」卡。**卡片数据取台账，不取事件载荷**：事件里的 flag 被截到 120
+ *  字符（`record_flag` 有意为之，防事件表膨胀），拿它渲染会出现半截 flag——而
+ *  「复制」功能复制出半截串比没有更糟。台账端点给完整串。
+ *
+ *  `wakeKey` 变化即立即重拉（对话页监听到 `challenge.flag.recorded` 时传事件 id），
+ *  让卡片「即弹」而不等下一拍轮询。轮询间隔 3s 与 `usePendingApprovals` 同口径。
+ *
+ *  **顺带返回 `quota` / `accepted` / `hintOf`**（flag-hint，2026-10-21）：卡片的
+ *  确认按钮必须写明后果，而后果取决于「这题有几条 flag」——单 flag 题确认即解出，
+ *  6 flag 题确认只是 1/6、探索会继续。此前卡片一律写「确认 = 该题判为解出」，
+ *  在多 flag 题里是**错的**，用户据此以为题目已完（而 agent 那边还在找剩下的）。
+ */
+export function useCandidateFlags(challengeId: string | null | undefined,
+                                  wakeKey: string | number = 0) {
+  const [flags, setFlags] = useState<ChallengeFlag[]>([])
+  const [quota, setQuota] = useState(1)
+  const [accepted, setAccepted] = useState(0)
+  const [hints, setHints] = useState<string[]>([])
+  const [loading, setLoading] = useState(false)
+
+  const apply = useCallback((d: {
+    flags?: ChallengeFlag[]; flag_hints?: string[]
+    state?: { quota?: number; accepted?: number }
+  }) => {
+    // **不再按 verdict 过滤**（2026-10-26 用户裁决：「取消过滤相关内容，只要提交
+    // 必须在前端显示，且置信度只用来排序」）。
+    //
+    // 原实现 `.filter(f => f.verdict === "pending")`，只留待确认的。问题有两个：
+    // ① 后端若因任何原因没写进台账（当时 candidate=true 就不写），这里拉不到
+    //   任何东西，界面上「提交了但什么都没出现」；② 人一点「确认」，这条立刻
+    //    从卡片消失，看不到自己刚确认了什么。
+    // 现在全量返回，由卡片自己按 verdict 渲染（pending 给按钮、已裁决的给结果），
+    // **排序用置信度**（高→低），让人先看最可能对的。
+    setFlags([...(d.flags ?? [])].sort(
+      (a, b) => Number(b.confidence ?? 0) - Number(a.confidence ?? 0)))
+    setQuota(Number(d.state?.quota ?? 1) || 1)
+    setAccepted(Number(d.state?.accepted ?? 0) || 0)
+    setHints(Array.isArray(d.flag_hints) ? d.flag_hints : [])
+  }, [])
+
+  const refresh = useCallback(() => {
+    if (!challengeId) { setFlags([]); return }
+    setLoading(true)
+    api.challengeFlags(challengeId)
+      .then(apply)
+      .catch(() => { /* 轮询失败静默，下一拍重试 */ })
+      .finally(() => setLoading(false))
+  }, [challengeId, apply])
+
+  useEffect(() => {
+    if (!challengeId) { setFlags([]); return }
+    let alive = true
+    const tick = () => {
+      api.challengeFlags(challengeId)
+        .then((d) => { if (alive) apply(d) })
+        .catch(() => { /* 同上 */ })
+    }
+    tick()
+    const t = setInterval(tick, 3000)
+    return () => { alive = false; clearInterval(t) }
+  }, [challengeId, wakeKey, apply])
+
+  return { flags, quota, accepted, hints, loading, refresh }
+}

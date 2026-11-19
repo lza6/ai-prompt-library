@@ -1,0 +1,111 @@
+# 密钥与环境
+.env
+*.local.json
+config/providers.json
+config/fofa.json
+config/tools.json
+# 本机环境配置：MCP server 路径每机不同、Claude 工具钩子引用本机绝对路径（2026-09-29 提交治理）
+config/mcp.json
+# 本机反编译覆盖层：headless_timeout（秒）逐机不同（大样本加速 P1，2026-09-30）
+config/decompiler.json
+# 会话级常驻容器覆盖层：session_scoped/idle_timeout/reaper_interval 逐机不同（2026-10-07）
+config/containers.json
+# 代理池覆盖层：端口基址/地区/延迟阈值逐机不同（2026-10-07）
+config/proxy.json
+# 代理池抓取源清单覆盖层（逐机不同；默认走 runner 内置精选）（2026-10-08）
+config/proxy_sources.json
+# 浏览器动作覆盖层：action_timeout_s（秒）逐机不同——慢站要放宽（投诉 D，2026-10-26）
+config/browser.json
+# 执行网关覆盖层：cmd_timeout（run_cmd 缺省超时秒数）逐机不同（投诉 D，2026-10-26）
+config/runtime.json
+# 飞书连接器配置：webhook+secret 每环境不同，绝不入库（feishu-push v1，同 fofa 口径）
+config/feishu.json
+config/llm_dump.json
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+# 测试套件（2026-10-16）：仅本地保留，不入库
+tests/
+.venv/
+# 桌面打包（desktop-app-shell M3）：打包 venv / PyInstaller 工作目录与产物
+.build-venv/
+build/
+dist/
+*.egg-info/
+# 反编译临时目录缺省名（调用方应显式指入项目 workspace，防逃逸，§7）
+.ghidra-tmp/
+
+# 运行时数据
+workspaces/
+# 情报全局库老位置（2026-10-27 起归位 data/intel/；保留一行兜住迁移降级残留）
+config/intel/
+# 全局运行时数据归口（campaign.db / intel / decompiler-cache / proxy / sample-store）
+# 锚定项目根：勿写成 data/——会误伤随包资源目录 packs/data/、tools/data/
+/data/
+# 服务日志归口（workspace-hygiene D2；*.log 已全局覆盖，此处防非日志文件）
+logs/
+# Agent 产物总库（per-project 在 workspaces/ 下；项目根历史遗物见 .trash，D3）
+artifacts/
+# packs 编辑备份与回收站（.history/trash），API 写入自动生成
+packs/**/.history/
+*.db
+*.db-wal
+*.db-shm
+
+# 工具按需安装目录（DESIGN.md §7 tools/installed/）
+tools/installed/
+# 工具二进制/运行时规范位（toolchain-registry：本体不进 git，桌面打包经 build_exe.py 随包旁挂）
+# tools/bin/gmhttp.exe 由 scripts/build_gmhttp.py 构建（2026-10-07 国密 sidecar）
+tools/bin/
+tools/runtime/
+tools/venv/
+
+# 临时产物
+*.tmp
+*.log
+# 根目录治理（2026-10-07）：pytest 参数被误当目录名建出的工作区 / 调试临时目录
+/--collect-only/
+/tmp-*/
+
+# 工具与编辑器产物 / 运行时治理状态（不入库，2026-09-21）
+.claudian/
+.obsidian/
+Cyber-pro/
+mcp-servers/.playwright-mcp/
+packs/.proposals/
+webui/webui/
+.history/
+# 外部素材库（收编源材料，第三方许可，绝不整库入库）
+开源优秀项目/
+# 知识库素材（第三方 CTF skills 等，含嵌入式仓库 src-strike；2026-10-26）
+Knowledge/
+# docs 文档目录（2026-10-10 起 plans 子目录、2026-10-16 起整个目录）：设计稿/分析文档不再入库，仅本地保留
+docs/
+# AI 工作区（本地专属：记忆、临时产物、会话状态，勿入版本控制；2026-10-26 整目录）
+.workbuddy-ai/
+# pytest 临时目录（--basetemp 产物，含大量测试残留；2026-10-20）
+.tmp_pytest*/
+# 临时验证目录（验证脚本产物，2026-10-26）
+.tmpverify/
+# 本地调试探针脚本与临时输出（勿入库）
+.tmp_*.py
+.tmp_*.txt
+
+# 提交治理（2026-11-03）：以下为本地生成/可重建内容，已从索引移除，勿再入库
+# Node 依赖（npm ci 可重建）
+node_modules/
+# 旧前端构建产物（仅本地保留，当前构建目录 dist/ 已在上面忽略）
+webui/dist_old*/
+# pytest 临时工作区（--basetemp 的另一种命名）
+.pytest-tmp*/
+# 本地调试脚本
+scratch/
+scripts/_tmp_*.py
+# 外部 MCP server 本地安装（jadx-mcp：第三方源码 + jar/zip，不随仓库分发）
+mcp-servers/jadx-mcp/
+# searxng 运行时生成的密钥文件（真实值仅本地保留）
+config/searxng/settings.yml.secret
+config/searxng/settings.yml.relay-secret

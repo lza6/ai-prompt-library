@@ -1,0 +1,13738 @@
+"""core API（DESIGN.md：黑板所有写操作经 core API 单一入口的 HTTP 化）。
+
+职责边界：
+- 只做「HTTP/WS ↔ core 模块调用」的翻译，业务规则全部在 blackboard / tasks /
+  gateway / agent / orchestrator 里，这里零业务逻辑。
+- 黑板写路径 = Blackboard 方法；Agent 无裸 shell 约束在 gateway 层强制，API 不放水。
+- 长耗时动作（跑 Agent、orchestrator tick）→ 后台线程 Job，立即返回 job_id 轮询。
+
+本模块是唯一允许 import fastapi 的地方（核心引擎保持零依赖）。
+"""
+
+import asyncio
+import base64
+import difflib
+import hashlib
+import json
+import logging
+import mimetypes
+import os
+import re
+import shutil
+import subprocess
+import sqlite3
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Literal
+from urllib.parse import quote
+
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.websockets import WebSocketState
+from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from core import autonomy
+from core import phases as phases_mod
+from core.browser import BrowserConfig, BrowserPool, BrowserError
+from core.proxy import ProxyConfig, ProxyPool, ProxyError
+from core.proxy.pool import auto_fetch_targets, protocol_counts
+from core.browser.pool import browser_available, chromium_available
+from core.browser.replay import Intruder, ReplayClient, ReplayOptions
+from core.agent import AgentConfig, AgentSession
+from core.agent.execution import ExecutionContext
+from core.blackboard.assets import (_is_ip, CHALLENGE_TYPE, clean_host,
+                                    import_assets, register_asset,
+                                    register_challenge)
+from core.coverage import attach_effective_status, level_two_stats
+from core.team import TeamStore
+from core.blackboard.graph import board_graph, session_graph
+from core.blackboard.attackpath import build_attack_path
+from core.blackboard.intentgraph import build_intent_graph
+from core.blackboard.intents import list_intents, reopen_intent
+from core.blackboard import traces
+from core.blackboard.store import Blackboard, BlackboardClosedError
+# 系统注入消息的标签真源（2026-10-24）：所有 `〔…〕` 前缀必须经此生成，
+# 否则 `store.list_messages` 的 origin 判定认不出、前端当人类发言渲染。
+from core.chat.origin import LABEL_FLAG_LEDGER, tag as origin_tag
+from core import assetimport
+from core import fofa as fofa_mod
+from core.integrations import feishu as feishu_mod
+from core.intel import config as intel_config
+from core.intel import vault as intel_vault
+from core.intel import reader as reader_mod
+from core.intel import reader_ai as reader_ai_mod
+from core.intel.intel_service import (
+    compose_weekly_plan as intel_weekly_plan,
+    learning_profile as intel_learning_profile,
+    run_refresh as intel_run_refresh,
+    week_start as intel_week_start,
+)
+from core.intel.store import IntelStore
+from core.intel.searxng import SearXNG
+from core.intel.ranking import normalize_day, ranking_score, spam_score, window_start
+from core.intel.search import search_intel
+from core.intel import search as intel_search_module
+from core.websearch import WebSearchError
+from core.llm import ModelRouter, ProviderError, ProviderStore, probe_credentials
+from core.llm.providers import CONFIG_PATH as PROVIDERS_CONFIG_PATH
+from core.llm.routing import AVAILABLE_MODELS, KNOWN_ROLES
+from core.orchestrator import Orchestrator, OrchestratorConfig
+from core.orchestrator import state as orch_state
+from core.orchestrator import judgments
+from core.projects import Project, ProjectStore, list_workspace_tree
+from core.runtime import (
+    MAX_CMD_TIMEOUT,
+    ExecutionGateway,
+    HostDetector,
+    resolve_default_timeout,
+    write_runtime_config,
+)
+from core.runtime.backends import DockerBackend
+from core.runtime.policy import RUNTIME_LEVELS
+from core.runtime.sessioncontainers import SessionContainerManager
+from core.sample_packages import SamplePackageError, SamplePackageStore
+from core.skills import proposals as proposals_mod
+from core.skills import refs as refs_mod
+from core.skills import writing
+from core.skills.doctor import diagnose
+from core.skills.experts import (
+    allowed_roles as expert_allowed_roles,
+)
+from core.skills.experts import (
+    _parse_expert as _parse_expert_yaml,
+    directions_effective,
+    expert_exists,
+    list_experts,
+    load_expert,
+)
+from core.skills.profiles import BOARD_VIEWS, load_profile, load_track_profiles, profile_snapshot
+from core.skills.registry import SkillRegistry, parse_frontmatter
+from core.skills.router import SkillRouter
+from core.skills.taxonomy import (
+    LEGACY_DOMAIN_MAP,
+    kb_root,
+    list_directions,
+    list_packs,
+    load_task_types,
+    platform_rules_dir,
+    rating_dir,
+    redline_path,
+    skill_dir,
+    skill_group,
+    track_dir,
+)
+from core.skills.proposals import ProposalError, ProposalStateError
+from core.skills.writing import pack_write_lock
+
+log = logging.getLogger("core.api")
+
+# 原生线程存活探测（Windows）：chat 轮次的后台线程可能被硬杀（TerminateThread），
+# 此时 Python 的 ``Thread.is_alive()`` 因线程状态簿记未更新而**仍报 True**（实测
+# exit_code 259→7 而 is_alive 恒 True）——故存活判据必须以 OS 退出码为准：
+# STILL_ACTIVE(259)=在跑；其它退出码=已终止/被硬杀；句柄消失(OpenThread 失败)=已回收。
+_STILL_ACTIVE = 259
+_THREAD_QUERY_LIMITED_INFORMATION = 0x0800
+
+
+def _native_thread_alive(native_id: int) -> bool:
+    """OS 线程是否仍在运行（Windows 用 GetExitCodeThread 判线程退出码）。
+
+    判据（实测校准）：活线程 → 退出码 259(STILL_ACTIVE)；正常退出/被
+    TerminateThread 硬杀 → 退出码非 259；线程彻底回收 → OpenThread 失败
+    （ERROR_INVALID_PARAMETER），此时**视为已死**（活线程在本进程内必可打开）。
+    非 Windows / ctypes 异常 → 保守返 True（宁可漏扫，交给重启清扫兜底）。"""
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32  # 仅 Windows 存在
+        k32.OpenThread.restype = ctypes.c_void_p
+        handle = k32.OpenThread(_THREAD_QUERY_LIMITED_INFORMATION, False,
+                                int(native_id))
+        if not handle:
+            return False  # 句柄打不开 = 线程已终止并回收
+        try:
+            code = ctypes.c_ulong(0)
+            ok = k32.GetExitCodeThread(ctypes.c_void_p(handle),
+                                       ctypes.byref(code))
+            if not ok:
+                return True  # 查询失败：保守当作存活
+            return code.value == _STILL_ACTIVE
+        finally:
+            k32.CloseHandle(ctypes.c_void_p(handle))
+    except Exception:  # noqa: BLE001 —— 非 Windows / ctypes 缺失：保守存活
+        return True
+
+
+# 批 5（§6.8）：L2 自动 tick 最小间隔；测试可 monkeypatch 为 0 走全链。
+# 触发点踩在间隔内时不丢弃，而是起一个 wait job 睡满后重入闸门（防链搁浅）。
+AUTO_TICK_MIN_INTERVAL = 10.0
+
+# A5（§6.4）：L2 自动优先级重排去抖窗口。人/子代理连发任务 30s 内合并成一轮
+# planner；手动按钮不受此限。踩窗口同样起 wait job 睡满重入，触发不丢。
+REPLAN_MIN_INTERVAL = 30.0  # 已随任务机制退役（2026-10-06）；保留常量防外部引用报错
+
+# 工作区卫生体检膨胀阈值（workspace-hygiene D6）：候选目录（.tmp/scratch/spill/
+# browser-profile）超过 100MB 报 warning、超 500MB 升 error；模块级常量供测试
+# monkeypatch（测试造 KB 级小文件配低阈值）。
+HYGIENE_BLOAT_MB = 100.0
+HYGIENE_BLOAT_ERROR_MB = 500.0
+
+# FOFA 中转配置文件路径（cyberspace-mapping M2）：模块级常量供测试 monkeypatch
+# （真实 config/fofa.json 含 key，不入库，测试绝不触达）。
+FOFA_CONFIG_PATH = fofa_mod.CONFIG_PATH
+
+# SearXNG settings 落点（**配置**，不随 intel 运行数据走 data/）：情报库已归位
+# `data/intel/`，此处必须显式钉死 `config/searxng/settings.yml`，不能再从
+# `intel_dir` 的父目录派生——否则 settings 会被拖到 `data/searxng/`，与
+# `scripts/serve.py` 里的同一常量分叉（两处必须指向同一份文件）。
+SEARXNG_SETTINGS_PATH = Path("config") / "searxng" / "settings.yml"
+
+#: 阅读器正文缓存有效期（秒）。7 天：技术文章的正文基本不变，重抓一次要
+#: 走 20~35 秒的渲染兜底路径，缓存过期太快就退化回「每点一次等半分钟」。
+#: 用户仍可用 `refresh=true` 强制重抓。
+READER_CACHE_TTL_S = 7 * 24 * 3600
+
+#: 阅读器配图代理的体积上限（字节）。正文配图通常几百 KB，8MB 足够覆盖
+#: 长文里的大截图，同时挡住「拿这个端点当大文件转发器」的用法。
+READER_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+#: 浏览器主动导入正文 HTML 的上限；只接收用户手动提交的单篇知乎文章页面。
+READER_IMPORT_MAX_BYTES = 12 * 1024 * 1024
+#: 配图代理路径。前端 markdown 里的图片会被改写成 `<该路径>?url=<原文地址>`。
+READER_IMAGE_PATH = "/api/intel/read/image"
+
+
+def _chat_hit_note_text(text: str, att_refs: list[dict]) -> str:
+    """Render a role-neutral notice for a human message sent during a chat turn."""
+    parts = [
+        "## 人类中途插话（当前轮次仍在执行）",
+        "",
+        "这是人在你当前运行轮次中发来的补充，**不是新一轮任务**。请把它作为",
+        "最新信息或约束，结合已完成和正在进行的工作调整后续步骤；不要无故丢弃",
+        "原任务上下文，也不要把这条消息当成要求从零重启。当前工具调用不会被",
+        "中断；如有并行子任务，它们可能继续运行并稍后返回结果。",
+        "",
+    ]
+    if text:
+        parts.append(text)
+    for attachment in att_refs:
+        name = attachment.get("name") or "附件"
+        size = attachment.get("size") or 0
+        rel = str(attachment.get("path") or "").replace("\\", "/").lstrip("/")
+        shown = f"/workspace/{rel}" if rel else ""
+        parts.append(f"- 📎 {shown}（{name}，{size} B）")
+    return "\n".join(parts)
+
+
+def proxy_reader_images(markdown: str) -> str:
+    """把正文里的图片地址改写成走本平台代理。
+
+    只改图片（`![...](...)`），普通链接保持原样——链接是给用户点开看原文的，
+    走代理反而看不到站点上下文。`data:` 内联图与已经代理过的地址原样保留
+    （幂等：响应层会对缓存命中与刚抓取两条路径都调用一次）。
+    """
+    if not markdown or "![" not in markdown:
+        return markdown
+
+    def _sub(m: re.Match) -> str:
+        alt, src = m.group(1), m.group(2).strip()
+        if not src or src.startswith(("data:", READER_IMAGE_PATH)):
+            return m.group(0)
+        return f"![{alt}]({READER_IMAGE_PATH}?url={quote(src, safe='')})"
+
+    return re.sub(r"!\[([^\]]*)\]\(([^)\s]+)\)", _sub, markdown)
+
+
+def _sse(payload: dict) -> str:
+    """SSE 单帧（data-only，无 id 游标——阅读器问答是一次性流，不需要续传）。"""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _usage_dict(usage: object) -> dict:
+    """把 Usage 归一化成可 JSON 化的 dict；None/异常一律空 dict（不影响正文）。"""
+    if usage is None:
+        return {}
+    out = {}
+    for key in ("input_tokens", "output_tokens", "cache_read_tokens",
+                "cache_write_tokens"):
+        value = getattr(usage, key, None)
+        if isinstance(value, (int, float)):
+            out[key] = value
+    return out
+
+# ---- 附件上传配额（2026-10-25 提到模块级） ----
+#
+# 原先藏在 create_app 里当局部名，导致：① 测试无法直接引用（只能写死 64MB 魔数，
+# 常量一调测试就假绿）；② 前端 `ATTACHMENT_CHUNK_BYTES` 没有可对照的单一真相源。
+# 与建会话时的分片数校验强绑定，必须是同一个数。
+#
+# 单请求上限：只有小于它的文件还走一次 body 到位那条路（快，但无进度、不可续传）。
+ATTACHMENT_MAX_BYTES = 64 * 1024 * 1024
+# 分片大小：附件一律可切这么一片逐片 PUT。单片小到任何网关都不会拦。
+# **服务端建会话时按它校验 total_chunks**，前端改这里必须同步改
+# `webui/src/lib/api.ts` 的 ATTACHMENT_CHUNK_BYTES，否则 422。
+ATTACHMENT_CHUNK_BYTES = 16 * 1024 * 1024
+# 总量护栏：只防「磁盘被写爆」，不承担产品限额职责（64GiB 对附件=实际无限）。
+ATTACHMENT_MAX_TOTAL_BYTES = 64 * 1024 * 1024 * 1024
+# 放弃的上传会话留存时长：刷新页面/关标签会留下半截分片，过期清掉。
+ATTACHMENT_UPLOAD_TTL_SECONDS = 7 * 24 * 3600
+
+
+def _loads_meta(art: dict) -> dict:
+    """artifacts.meta TEXT → dict（_row_to_dict 不解析 JSON 列；旧数据无 meta）。"""
+    m = art.get("meta")
+    if isinstance(m, dict):
+        return m
+    try:
+        return json.loads(m) if m else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+# ---------------- 请求模型 ----------------
+
+class ProjectIn(BaseModel):
+    name: str
+    track: str = "ctf"                       # 场景轨（单选）
+    capabilities: list[str] = Field(default_factory=list)  # 能力包（多选）
+    experts: list[str] = Field(default_factory=list)  # 绑定专家（expert-pool M2；M3 起创建页提交，空=存量直通）
+    profile: str | None = None               # 场景档 id（M4a：五件套快照物化，D6 物化即弃）
+    inherit_from: str | None = None          # 知识继承源项目 id/slug（M4b：只增不覆盖，源只读）
+    config: dict = Field(default_factory=dict)
+    domain: str | None = None                # 兼容旧客户端：pentest/ctf 透明映射
+
+
+class ConfigPatchIn(BaseModel):
+    """PATCH 项目 config：顶层键浅合并；本批只消费 autonomy 段（§6.8）。"""
+    config: dict = Field(default_factory=dict)
+
+
+class ExpertsPatchIn(BaseModel):
+    """换将（expert-pool M2）：绑定专家清单整体替换；空清单=解绑存量直通。"""
+    experts: list[str] = Field(default_factory=list)
+
+
+class TeamMemberIn(BaseModel):
+    member_key: str
+    label: str = ""
+    responsibility: str = ""
+    role: str = ""
+    provider: str = ""
+    model: str = ""
+    runtime: str = ""
+    threat_class: str = "trusted"
+    max_steps: int | None = None
+
+
+class TeamCreateIn(BaseModel):
+    name: str
+    goal_text: str = ""
+    members: list[TeamMemberIn] = Field(default_factory=list)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class TeamPatchIn(BaseModel):
+    name: str | None = None
+    goal_text: str | None = None
+    members: list[TeamMemberIn] | None = None
+    config: dict[str, Any] | None = None
+
+
+class TeamStartIn(BaseModel):
+    preflight_revision: str
+    confirmations: dict[str, bool] = Field(default_factory=dict)
+
+
+class TeamCancelIn(BaseModel):
+    run_id: str
+    reason: str = ""
+
+
+class ExpertSaveIn(BaseModel):
+    """专家池写模型（expert-pool M3，packs/experts/ 单文件池 CRUD）。
+    全字段提交式覆写（表单即最终态）。能力白名单三件套 skills/tools/mcp_servers
+    三态：缺键/null = 不限制（不落键），[] = 明确一个都不启用（落 `key: []`），
+    非空 = 白名单。knowledge（kb 方向）沿用两态：null 或 [] 都表示不限方向，
+    因此空列表不落键。variants={track: {field: value}} 序列化为
+    variant_<track>_<field> 平铺键。
+
+    ``task_types`` 已退役（2026-10-21）：任务认领机制 2026-10-06 退役后，
+    该字段在运行时**零消费**（`ToolDispatcher.allowed_task_types` 只赋值不读、
+    `expert_skills`/路由均不看）。此处保留字段仅为**兼容旧客户端的请求体**
+    （收到即忽略、不落键），全字段覆写时该键自然被清掉——这是刻意行为。
+
+    ``protected`` 不在表单里（设置页只读展示「受保护」标签），因此**必须原样
+    回传**：漏传等于每次保存都把 ``protected: true`` 抹掉，`_generalist` 从
+    「拒删」退化成普通专家（2026-10-21 实测：UI 保存一次后 DELETE 返 200）。
+    这类「表单未暴露字段」一律要加进 `_dump_expert_yaml` 并显式带值，
+    否则全字段覆写就是静默的数据丢失。
+
+    ``intent_free`` 同理（2026-10-21 实测同类回归）：它只由 `worker.yaml` 声明、
+    设置页也没有对应控件，但 `core/chat/runtime.py` 真的消费它（免「意图先行
+    闸」与「发现必挂意图」）。**当时没有走这条通道，UI 保存一次就把
+    `worker.yaml` 的 `intent_free: true` 抹掉了**——worker 从此每次调工具都被
+    要求先声明意图。凡是「yaml 有、表单没有、代码在读」的键都属于这个家族，
+    新增时两处（`_expert_view` 读 + `_dump_expert_yaml` 写）必须同时加，
+    漏了读端等于前端拿不到值、也就无法原样回传。
+    """
+    name: str | None = None
+    description: str | None = None
+    persona: str | None = None
+    tracks: list[str] | None = None
+    skills: list[str] | None = None
+    knowledge: list[str] | None = None
+    # 退役字段：接受但忽略（见类 docstring），不再校验、不再序列化。
+    task_types: list[str] | None = None
+    tools: list[str] | None = None
+    mcp_servers: list[str] | None = None
+    max_steps: int | None = None
+    # 受保护标记（仅 _generalist）。缺省 None = 不落键；True = 拒删。
+    protected: bool | None = None
+    # 免意图闸（仅 worker）。缺省 None = 不落键；True = 跳过意图先行闸与
+    # 「发现必挂意图」。None 与 False 都表示「落键无意义」，序列化端只落 true。
+    intent_free: bool | None = None
+    variants: dict[str, dict[str, Any]] | None = None
+
+
+class ExpertCreateIn(ExpertSaveIn):
+    id: str
+
+
+class ReopenIn(BaseModel):
+    """C1：放回/「已解决，放回继续」的人类补充说明（写进任务行 result_note 落审计）。
+    C6：drop_scene=True = 丢弃现场从零重做（unlink 任务键断点快照与 C10 transcript）。"""
+    note: str = ""
+    drop_scene: bool = False
+
+
+class CancelTaskIn(BaseModel):
+    """M4 C1：人工取消任务的原因（task.cancelled 事件审计用）。"""
+    reason: str = ""
+
+
+class DirectiveIn(BaseModel):
+    """C2 指挥编排器：人类一次性目标指令（自动触发一轮编排，最高优先落实）。"""
+    text: str
+
+
+class OrchChatIn(BaseModel):
+    """对话化编排器（M1，§6.4）：与编排器对话（插队轮，busy 409 不排队）。"""
+    text: str
+
+
+class PhaseGoalIn(BaseModel):
+    """阶段目标（M2，§4.3）：确认落盘 meta.phase_goal；text 为空 = 清空重议。"""
+    text: str = ""
+    criteria: list[str] = []
+    phase: str | None = None
+
+
+class OrchPersonaIn(BaseModel):
+    """编排器拟人身份（M3，§4.4）：display_name 贯穿前端，persona 只注入对话轮。"""
+    display_name: str = ""
+    persona: str = ""
+
+
+class PhaseTransitionIn(BaseModel):
+    """分阶段工作流（M2）：人工流转阶段（目标限当前阶段剧本 next 清单内）。"""
+    to: str
+    reason: str = ""
+
+
+class AcceptanceIn(BaseModel):
+    """验收条目结构化形态（独立验证 M1）：text + 可选 verify 规格（原样透传
+    publish，发布期由 validate_verify_spec 校验，未知键/缺键 422）。"""
+    text: str
+    verify: dict | None = None
+
+
+class TaskIn(BaseModel):
+    objective: str
+    task_type: str = "generic"
+    role: str = ""                     # v14：建议认领角色（''=不限；认领即换装）
+    target_session: str = ""           # v0.71 弃用（任务即窗口：发布即自动建专属窗，
+                                       # 绑定移交 _bind_task_window；字段保留兼容旧前端但忽略）
+    scope: str = ""
+    noise_budget: str | None = None   # 缺省 = 轨注册表该类型的默认噪声
+    priority: int = 2
+    conflict_keys: list[str] | None = None
+    parent_id: str | None = None
+    refs: list[str] | None = None   # 任务依据的 finding id（显式层；正文 find-id 自动抽取）
+    workset: list[str] | None = None   # 机制 1.1 工作集软声明（advisory，不阻塞认领）
+    attachment_ids: list[str] = []     # 2026-09-19 附件随发：kind=attachment 的 artifact id
+    acceptance: list[str | AcceptanceIn] | None = None
+    # ⑤ 验收条目（存 context.reconcile；全收口才可 complete）。独立验证 M1：条目
+    # 支持 str 或 {text, verify}——verify 规格由验证器在 complete 时自动判定
+    # （core/verify.py 六策略），Agent 自报 met/failed 被拒（宁严勿松）
+    force: bool = False                # 机制 1.1：True 跳过发布去重（人类"仍要发布"确认后）
+
+
+class InboxRead(BaseModel):
+    """标记会话收件箱已读：ids=None/缺省 = 全部已读；否则只标给定私信行。"""
+    ids: list[str] | None = None
+
+
+class TaskPatch(BaseModel):
+    """任务编辑（PATCH，exclude_unset：不传的字段不动）。open/failed 全字段可改；
+    claimed（执行中）仅放行 role（v0.71 任务即窗口：中途改角色立即热换装）。"""
+    objective: str | None = None
+    task_type: str | None = None
+    noise_budget: str | None = None
+    priority: int | None = None
+    conflict_keys: list[str] | None = None
+    role: str | None = None
+    preferred_runtime: str | None = None  # v23：任务默认运行时（''=重置；open/failed 可改）
+
+
+class FindingIn(BaseModel):
+    # 渗透发现用 vuln_class；逆向发现可留空——类别在 evidence.category 五类里
+    vuln_class: str = ""
+    title: str
+    target_asset_id: str | None = None
+    severity: Literal["info", "low", "medium", "high", "critical"] = "info"  # F11 白名单
+    rating_basis: str = ""  # F11 判级依据（注入评级口径时必填）
+    impact: str = ""  # 收录格式三件套·危害描述（v20，不进门禁）
+    remediation: str = ""  # 收录格式三件套·修复建议（v20，不进门禁）
+    summary: str = ""
+    affected_assets: str = ""
+    test_environment: str = ""
+    reproduction_steps: str = ""
+    verification_result: str = ""
+    risk_assessment: str = ""
+    pocs: list[dict] = Field(default_factory=list)
+    status: str = "unverified"
+    category: Literal["vuln", "intel"] | None = None  # C6 分两类；缺省按 vuln_class/severity 自动判
+    evidence: dict = Field(default_factory=dict)
+    dedup_key: str | None = None
+
+
+class AssetIn(BaseModel):
+    type: str = "auto"  # auto=按值自动识别（E6）；识别不出 422 提示手选
+    value: str
+    meta: dict = Field(default_factory=dict)
+    parent_id: str | None = None  # 资产树挂载（DESIGN.md §5.2）：domain/service/url 挂 host 下
+
+
+class AssetPatchIn(BaseModel):
+    """PATCH /api/assets/{aid}：parent_id / meta 二选一或同传；
+    exclude_unset 区分「不传（不动）」与「传 null（摘挂）」。"""
+    parent_id: str | None = None
+    meta: dict | None = None
+
+
+class ChallengeIn(BaseModel):
+    """POST /projects/{pid}/challenges：人工建题（challenge-asset v38；表单 v47）。
+
+    ``name`` 可空：空名时按 ``brief``/``entry_hint``/``entries`` 的内容指纹生成
+    稳定 value（AI 之后改 ``title`` 只动展示层，不改变题目身份）。
+    """
+    name: str = Field("", max_length=200)
+    title: str = Field("", max_length=500)        # 一句话简述（空名时 AI 可后填）
+    description: str = Field("", max_length=500)  # 兼容旧字段 = title
+    brief: str = Field("", max_length=8000)       # 题面原文（hit）
+    entry_hint: str = Field("", max_length=1000)  # 入口提示（文本）
+    direction: str = Field("", max_length=64)     # 题目方向：web/pwn/crypto/reverse/misc
+    tags: list[str] = Field(default_factory=list, max_length=12)
+    flag_format: str = Field("", max_length=40)   # flag{} / ctf{} …（提示不是约束）
+    flag_count: int | None = Field(None, ge=1, le=50)
+    # 每条 flag 各一句题面提示（按序号对齐 flag_count，2026-10-21）。
+    # 「需要 xxx 管理员后台密码为 flag」「分析流量得到 xxx 版本，版本号为 flag」
+    # 这类句子是 agent 判断「这条是不是我的方向」的唯一依据。
+    flag_hints: list[str] = Field(default_factory=list, max_length=50)
+    entries: list[dict] = Field(default_factory=list, max_length=50)  # 入口点子资产
+    thread_id: str = ""          # 可选：建完就把该线程绑到这道题上
+
+
+class ChallengePatchIn(BaseModel):
+    """PATCH /api/challenges/{aid}：字段均可单传；None=不动，空串=清该键。"""
+    name: str | None = Field(None, min_length=1, max_length=200)
+    title: str | None = Field(None, max_length=500)
+    description: str | None = Field(None, max_length=500)
+    brief: str | None = Field(None, max_length=8000)
+    entry_hint: str | None = Field(None, max_length=1000)
+    direction: str | None = Field(None, max_length=64)
+    tags: list[str] | None = Field(None, max_length=12)
+    flag_format: str | None = Field(None, max_length=40)
+    flag_count: int | None = Field(None, ge=1, le=50)
+    flag_hints: list[str] | None = Field(None, max_length=50)
+
+
+class ChallengeFlagIn(BaseModel):
+    """POST /api/challenges/{aid}/flags：人工录入一条 flag（judged_by=human）。"""
+    flag: str = Field(min_length=1, max_length=2000)
+    source: str = Field("", max_length=2000)
+    verdict: str = Field("accepted")   # accepted / pending / rejected
+    # 这条对应题面第几条（0 基；-1=未绑定，台账显示「未标注题面」）。
+    # 有它才能把「题面要求」一并告诉正在跑的 agent（flag-hint，2026-10-21）。
+    hint_index: int = Field(-1, ge=-1, le=49)
+
+
+class ChallengeFlagDecideIn(BaseModel):
+    """PATCH /api/challenges/{aid}/flags/{fid}：人工裁决（确认/否决/撤销）。"""
+    verdict: str = Field(..., pattern="^(pending|accepted|rejected)$")
+    reason: str = Field("", max_length=500)
+
+
+class ChallengeFlagHintIn(BaseModel):
+    """PATCH /api/challenges/{aid}/flags/{fid}/hint：人工改题面绑定。"""
+    hint_index: int = Field(..., ge=-1, le=49)
+
+
+class ChallengeAbandonIn(BaseModel):
+    """POST /api/challenges/{aid}/abandon：标记放弃 / 撤销放弃。"""
+    abandoned: bool = True
+
+
+class EngineIn(BaseModel):
+    """PUT .../binaries/{sha}/engine：样本反编译引擎模式（ida / ghidra）。"""
+    engine: str
+
+
+class SampleTargetSelectIn(BaseModel):
+    target_ids: list[str] = Field(default_factory=list, max_length=10000)
+
+
+class SampleTargetAnalyzeIn(BaseModel):
+    engine: str = "ida"
+
+
+class SampleApkOpenIn(BaseModel):
+    tool: Literal["jeb", "jadx"]
+    path: str = Field(min_length=1, max_length=4096)
+    package_id: str = Field(pattern=r"^pkg-[0-9a-f]{16}$")
+    version_id: str = Field(pattern=r"^ver-[0-9a-f]{16}$")
+
+
+class SamplePackageMoveIn(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+    target_path: str = Field(default="", max_length=4096)
+
+
+class SampleUploadCreateIn(BaseModel):
+    filename: str = Field(min_length=1, max_length=4096)
+    total_size: int = Field(gt=0)
+    total_chunks: int = Field(gt=0, le=1_000_000)
+    source_type: str = "auto"
+
+
+class AttachmentUploadCreateIn(BaseModel):
+    """POST .../attachments/uploads：附件分片续传建会话（2026-10-25）。
+
+    与 SampleUploadCreateIn 分开是刻意的：样本包会话建完要跑 `import_source`
+    （解压/扫盘/生成 manifest），附件只是把字节原样落到工作区，产物语义完全不同，
+    共用一张 metadata 会让两边的 `complete` 分支互相误判。
+    """
+
+    filename: str = Field(min_length=1, max_length=4096)
+    total_size: int = Field(gt=0)
+    total_chunks: int = Field(gt=0, le=10_000_000)
+    sha256: str | None = Field(default=None, max_length=64)
+
+
+class SampleLinkIn(BaseModel):
+    """POST .../sample-packages/link：把外部文件夹**原地**登记为分析包（不复制）。
+
+    directory 必须是绝对路径。服务端会 resolve 后校验（存在/是目录/不是盘根/
+    不落在项目内部目录），并通过 `/workspace/dirs` 的树形浏览供前端点选。
+    """
+    directory: str = Field(min_length=1, max_length=4096)
+
+
+class WorkspacePathIn(BaseModel):
+    """POST .../workspace/path：设置/清除执行工作区目录（2026-10-30）。
+
+    directory 必须是绝对路径（校验同 SampleLinkIn）；null/空串 = 清除。
+    `thread_id` 缺省 = 项目级（写 meta.workspace）；给定 = **线程级**（v55，
+    2026-11-02），只影响该主控线程及其子专家线程，清除后回退项目级。
+    """
+    directory: str | None = Field(default=None, max_length=4096)
+    thread_id: str | None = Field(default=None, max_length=64)
+
+
+class FofaConfigIn(BaseModel):
+    """PUT /api/fofa/config：key 传空串/缺省 = 不修改（防回显误覆盖）；"""
+    base_url: str | None = None
+    key: str | None = None
+
+
+class FeishuConfigIn(BaseModel):
+    """PUT /api/integrations/feishu：webhook_url 含 `*`（脱敏回显）/缺省 = 不
+    修改；secret 空串/缺省/`****` = 不修改，clear_secret=True 才真清空。"""
+    enabled: bool | None = None
+    webhook_url: str | None = None
+    secret: str | None = None
+    clear_secret: bool = False
+    min_severity: str | None = None
+    projects: list[str] | None = None
+    notify_on_escalation: bool | None = None
+    include_poc: bool | None = None
+    rate_limit_per_min: int | None = None
+    timeout_s: int | None = None
+    retry: int | None = None
+    base_url: str | None = None
+
+
+class FofaSearchIn(BaseModel):
+    """POST /api/projects/{pid}/fofa/search：FOFA 语法原样（如
+    `domain="example.com"`）；size 单次消耗等量配额，前端提示后选。"""
+    query: str
+    size: int = 100
+    page: int = 1
+
+
+class AssetImportIn(BaseModel):
+    """POST /api/projects/{pid}/assets/import：mapping 给出 → rows 为表格二维
+    数组先 normalize_rows；mapping 缺省 → rows 为已归一化行 dict（FOFA 勾选/
+    手工 JSON 导入）。"""
+    source: str = "manual"  # xlsx/csv/fofa/manual
+    rows: list[Any] = Field(default_factory=list)
+    mapping: list[str] | None = None
+
+
+class FuncCreateIn(BaseModel):
+    """POST /api/projects/{pid}/funcs：为「仅在 headless 缓存里、func_kb 无行」
+    的函数建行（人写笔记前的补建）。address 接受 int 或 hex 字符串（64 位地址
+    不能走 JS Number，服务端 int(str, 0) 可吃任意大 hex）。"""
+    binary_sha256: str
+    address: int | str
+    name: str
+    analysis: str = ""
+
+    @field_validator("binary_sha256")
+    @classmethod
+    def _sha(cls, v: str) -> str:
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", v):
+            raise ValueError("binary_sha256 必须是 64 位 hex")
+        return v.lower()
+
+    @field_validator("address")
+    @classmethod
+    def _addr(cls, v: int | str) -> int:
+        try:
+            return int(str(v), 0)
+        except ValueError as e:
+            raise ValueError("address 需为整数或 0x 前缀的 hex 字符串") from e
+
+
+class FuncPatchIn(BaseModel):
+    """PATCH funcs/{id}：改名 / 追笔记 / risk_tags 全量替换（null 与不传=不动）。"""
+    name: str | None = None
+    note: str | None = None
+    risk_tags: list[str] | None = None
+
+
+class FindingPatchIn(BaseModel):
+    """PATCH findings/{id}：状态机 + evidence 浅层 merge + F10 人工修订 + C6 分类。"""
+    status: str | None = None
+    evidence: dict | None = None
+    title: str | None = None
+    severity: str | None = None
+    vuln_class: str | None = None
+    category: str | None = None
+    rating_basis: str | None = None  # F11：None=不动，空串=清空
+    impact: str | None = None  # 收录格式三件套·危害描述：None=不动，空串=清空
+    remediation: str | None = None  # 收录格式三件套·修复建议：None=不动，空串=清空
+    summary: str | None = None
+    affected_assets: str | None = None
+    test_environment: str | None = None
+    reproduction_steps: str | None = None
+    verification_result: str | None = None
+    risk_assessment: str | None = None
+    pocs: list[dict] | None = None
+
+
+class ChainIn(BaseModel):
+    """POST chains：人工建链（P2 不做 Agent 建链）。"""
+    name: str
+    goal: str = ""
+
+
+class ChainPatchIn(BaseModel):
+    name: str | None = None
+    goal: str | None = None
+    status: str | None = None
+
+
+class BlueprintModuleIn(BaseModel):
+    """POST blueprints：模块条目（R4 逆向开发蓝图）。"""
+    name: str
+    desc: str = ""
+    func_addresses: list[str] = []
+    spec: str = ""
+    notes: str = ""
+    status: str = "pending"
+
+
+class BlueprintIn(BaseModel):
+    """POST blueprints：人工/人类代录建蓝图（Agent 走 bb_blueprint_create 工具）。"""
+    name: str
+    goal: str = ""
+    binary_sha256: str = ""
+    modules: list[BlueprintModuleIn] = []
+    content_md: str = ""
+    feature_tree_id: str = ""
+
+
+class BlueprintPatchIn(BaseModel):
+    """PATCH blueprints：人类流转 status（draft→reviewed→ready→building→built 白名单）
+    / 改名 / 改 goal / 补正文。Agent 无此入口（工具不暴露 status）。"""
+    name: str | None = None
+    goal: str | None = None
+    status: str | None = None
+    content_md: str | None = None
+    content_append: str | None = None
+
+
+class BlueprintModulePatchIn(BaseModel):
+    """PATCH blueprint 模块：人类修订模块卡片（深析写回走 Agent 工具）。"""
+    desc: str | None = None
+    spec: str | None = None
+    notes: str | None = None
+    func_addresses: list[str] | None = None
+    status: str | None = None
+
+
+class ChainLinkIn(BaseModel):
+    node_type: str
+    node_id: str
+    edge_note: str = ""
+
+
+class LogicBlockIn(BaseModel):
+    """POST logic-blocks：人工建业务逻辑块（Agent 走 bb_logic_block_* 工具）。"""
+    name: str
+    description: str = ""
+    binary_sha256: str = ""
+    seq: int = 0
+    feature_node_id: str = ""  # v36 挂到功能树某节点下钻
+
+
+class LogicBlockPatchIn(BaseModel):
+    """PATCH logic-blocks：人类修订块名/描述/排序（Agent 补描述走工具）。"""
+    name: str | None = None
+    description: str | None = None
+    seq: int | None = None
+    feature_node_id: str | None = None  # v36 挂到功能树某节点下钻
+
+
+class LogicBlockFuncIn(BaseModel):
+    """POST logic-blocks/{lbid}/funcs：挂接函数。address 吃 int/0x hex/十进制串
+    （前端以 hex 串为准，JS Number 无法安全表示 64 位地址）。"""
+    address: int | str
+    role: str = ""
+
+
+class LogicBlockFuncPatchIn(BaseModel):
+    """PATCH funcs 挂接：改角色注（address 经 query 传）。"""
+    role: str
+
+
+class LinkNoteIn(BaseModel):
+    edge_note: str
+
+
+class WritebackItemIn(BaseModel):
+    """POST binaries/{sha}/writeback 单条：func_kb 命名/注释回写 .i64。
+
+    address 吃 int/0x hex/十进制串（64 位地址不能走 JS Number）；name/comment 至少一条。
+    """
+    address: int | str
+    name: str | None = None
+    comment: str | None = None
+
+    @field_validator("address")
+    @classmethod
+    def _addr(cls, v: int | str) -> int:
+        try:
+            n = int(str(v), 0)
+        except ValueError as e:
+            raise ValueError("address 需为整数或 0x 前缀的 hex 字符串") from e
+        if n < 0:
+            raise ValueError("address 不可为负数")
+        return n
+
+    @model_validator(mode="after")
+    def _has_payload(self):
+        if not (self.name or self.comment):
+            raise ValueError("每条至少提供 name 或 comment")
+        if self.name is not None and not self.name.strip():
+            self.name = None
+        if self.comment is not None and not self.comment.strip():
+            self.comment = None
+        if self.name and len(self.name) > 200:
+            raise ValueError("name 过长（上限 200）")
+        if self.comment and len(self.comment) > 8000:
+            raise ValueError("comment 过长（上限 8000）")
+        if not (self.name or self.comment):
+            raise ValueError("每条至少提供 name 或 comment")
+        return self
+
+
+class WritebackIn(BaseModel):
+    items: list[WritebackItemIn] = Field(min_length=1, max_length=500)
+
+
+class ImportExportIn(BaseModel):
+    """POST binaries/{sha}/import-export：纳入外部 headless 全量导出 JSON。
+
+    path 为服务端可读路径（本机文件；大样本 JSON 走路径而非 HTTP 上传体）。
+    """
+    path: str = Field(min_length=1, max_length=4096)
+
+
+class ImportIdaDbIn(BaseModel):
+    """POST binaries/{sha}/import-ida-db：纳入外部 IDA 数据库（.i64/.idb）后库内重导。"""
+    path: str = Field(min_length=1, max_length=4096)
+
+
+class SkillUpdateIn(BaseModel):
+    content: str  # SKILL.md 全文（含 frontmatter）
+
+
+class SkillCreateIn(BaseModel):
+    """新建 cc 风格自包含技能：正文是完整执行手册，资源放在技能目录内。"""
+    name: str
+    description: str = ""
+    keywords: list[str] = Field(default_factory=list)
+    features: list[str] = Field(default_factory=list)
+    file_features: list[str] = Field(default_factory=list)
+    platforms: list[str] = Field(default_factory=list)
+    formats: list[str] = Field(default_factory=list)
+    vuln_classes: list[str] = Field(default_factory=list)
+    task_types: list[str] = Field(default_factory=list)
+
+
+class SkillEnabledIn(BaseModel):
+    enabled: bool
+
+
+class FileContentIn(BaseModel):
+    content: str  # 红线等单文件全文
+
+
+class SkillFileWriteIn(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    content: str = ""
+    is_dir: bool = False
+
+
+class SkillFileRenameIn(BaseModel):
+    path: str = Field(min_length=1, max_length=1024)
+    new_path: str = Field(min_length=1, max_length=1024)
+
+
+class FileOpenIn(BaseModel):
+    """本地文件动作（会话流文件卡的「打开方式」）：resolve=只解析绝对路径 /
+    open=系统默认程序打开 / reveal=文件管理器定位 / content=读文本。"""
+    path: str = Field(min_length=1, max_length=4096)
+    action: Literal["resolve", "open", "reveal", "content"]
+
+
+class RoutePreviewIn(BaseModel):
+    """路由试算器：track+capabilities 定候选集，role 再窄化；domain 仅旧客户端兼容。"""
+    query: str = ""
+    track: str | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    role: str | None = None
+    features: list[str] = Field(default_factory=list)
+    file_features: list[str] = Field(default_factory=list)
+    labels: list[str] = Field(default_factory=list)
+    include_disabled: bool = False
+    domain: str | None = None
+
+
+# ---- kb 本地基线（C2） ----
+
+class KbWriteIn(BaseModel):
+    path: str
+    content: str
+
+
+class KbRenameIn(BaseModel):
+    path: str
+    new_path: str
+
+
+# ---- 统一提案（C4） ----
+
+class ProposalIn(BaseModel):
+    """提一条变更提案（只落 pending）。target.kind=kb 时给 cap/path[/new_path]；
+    kind=skill 时给 skill_kind/owner/name。"""
+    target: dict
+    mode: str
+    content: str | None = None
+    summary: str
+    reason: str
+    origin: str = "human"
+    project: str | None = None
+    session: str | None = None
+    task: str | None = None
+    evidence: str = ""
+    source_refs: list[dict[str, str]] = Field(default_factory=list, max_length=20)
+
+    @field_validator("origin")
+    @classmethod
+    def _origin_ok(cls, v: str) -> str:
+        if v not in {"agent", "review", "human"}:
+            raise ValueError("origin 仅 agent|review|human")
+        return v
+
+
+class ProposalDecisionIn(BaseModel):
+    decided_by: str = "human"
+    note: str = ""
+
+    @field_validator("decided_by")
+    @classmethod
+    def _by_ok(cls, v: str) -> str:
+        if v not in {"human", "demo-script(auto)"}:
+            raise ValueError("decided_by 仅 human 或显式 demo-script(auto)")
+        return v
+
+
+class ProposalReviseIn(BaseModel):
+    by: str = "human"
+    changes: dict = Field(default_factory=dict)
+    note: str = ""
+
+
+class McpServerIn(BaseModel):
+    name: str
+    url: str = ""                          # http 传输用；stdio 留空
+    transport: str = "streamable-http"     # streamable-http | stdio
+    enabled: bool = True
+    domains: list[str] = Field(default_factory=list)
+    command: str | None = None             # stdio 用：可执行命令
+    args: list[str] = Field(default_factory=list)  # stdio 用：命令参数
+
+
+class McpConfigIn(BaseModel):
+    servers: list[McpServerIn]
+
+
+class ChatThreadIn(BaseModel):
+    agent_id: str
+    title: str | None = None
+    # 线程级模型覆写（v37，2026-10-13）：建线程时即可指定；空=跟随全局 executor
+    provider: str | None = None
+    model: str | None = None
+    # CTF 题目归属（v38，2026-10-14）：线程绑定 challenge 资产 id
+    challenge_asset_id: str | None = None
+    # 联网搜索开关（v43，web-search-toggle）：建线程即开；主控开 = spawn 的
+    # 子代理默认继承（call_expert / ARTEX Worker）。缺省关。
+    web_search: bool = False
+    # 线程级思考强度（v48，thinking-effort，2026-10-21）：七档，''=跟随供应商配置
+    thinking_effort: str | None = None
+
+
+class ChatMessageIn(BaseModel):
+    text: str
+    refs: dict[str, list[str]] | None = None  # 人类引用指定 {skills:[], mcps:[]}
+    attachment_ids: list[str] = Field(default_factory=list)  # 附件随发（kind=attachment）
+
+
+# ---------------- packs 管理辅助（设置页：角色 / Skill / 红线 / MCP） ----------------
+
+# 名称白名单（防穿越）。`\w` 是 Unicode-aware 的——中文/日文等词字符一律放行，
+# 与 `writing._SKILL_NAME_RE` 同一口径（2026-10-19 统一：此前两处一 ASCII 一
+# Unicode，导致设置页能建中文技能名而提案通道判非法）。
+_NAME_RE = re.compile(r"^[\w][\w.-]{0,63}$")
+MCP_CONFIG_PATH = Path("config/mcp.json")     # 与 llm.json 同级（cwd = 项目根）
+
+# MCP server 允许声明的领域；http server 只连本机 loopback（红线，见 decompiler._is_loopback_url）
+_MCP_TRANSPORTS_HTTP = ("streamable-http", "http", "http-stream")
+_MCP_DOMAIN_WHITELIST = {"pentest", "reverse", "binary"}
+
+# 诊断失败日志扫描上限（diagnostics-log，2026-10-14）：会话清单按失败归属计数
+# 时一次拉多少条失败事件（与 failog._SCAN_CAP 同口径，超出部分的计数截断）。
+_DIAG_FAIL_SCAN = 2000
+
+
+def _load_mcp_config() -> dict:
+    """读 config/mcp.json；缺失/损坏给空配置（调用方回默认端点，绝不 500）。"""
+    try:
+        if MCP_CONFIG_PATH.is_file():
+            data = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _pack_history_backup(path: Path, *, min_interval: float | None = None) -> Path | None:
+    """写入前留修改历史：.history/<UTC时间戳>_<文件名>（设置页可编辑文件的回滚依据）。
+    返回备份路径（原文件不存在则无备份）。
+
+    ``min_interval``（秒）：与上一个历史版本间隔不足时**跳过备份**。自动保存
+    （改动即存）会把每次击键变成一次 PUT，不设闸的话 `.history` 会被同一段
+    编辑刷出上百个版本，把「历史」退化成「撤销栈」——回滚面板里全是中间态，
+    真正想找回的「昨天那一版」反而被挤出视野。只在 auto 保存路径上传入该值；
+    手动保存 / 回滚仍走不节流分支（它们本就是低频的、值得留痕的语义动作）。
+    """
+    if not path.is_file():
+        return None
+    with pack_write_lock():  # 同秒 .n 避让与 packs 写锁同一临界区，防并发备份互相覆盖
+        hist = path.parent / ".history"
+        hist.mkdir(parents=True, exist_ok=True)
+        if min_interval is not None:
+            # 拿「最新一个版本的 mtime」做闸，而不是内存时间戳：进程重启 / 多客户端
+            # 同时编辑都不会让闸失效（真相在盘上）。取整个目录最新而非只看本文件的
+            # 版本，因为目录里还有别的专家的备份，混着来对闸无意义——所以只比本文件的。
+            newest = 0.0
+            pat = re.compile(
+                rf"(?:{_HIST_TS}(?:\.\d+)?_{re.escape(path.name)}"
+                rf"|{re.escape(path.name)}\.{_HIST_TS}\.bak)$")
+            for f in hist.iterdir():
+                if f.is_file() and pat.fullmatch(f.name):
+                    newest = max(newest, f.stat().st_mtime)
+            if newest and (time.time() - newest) < min_interval:
+                return None
+        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        dest = hist / f"{ts}_{path.name}"
+        n = 1
+        while dest.exists():  # 同秒多次写入避让，绝不覆盖既有版本（回滚往返也依赖它）
+            dest = hist / f"{ts}.{n}_{path.name}"
+            n += 1
+        shutil.copy2(path, dest)
+    return dest
+
+
+# 历史版本两种命名：API 写入用 <ts>[.n]_<file>；import_kb owners 覆盖用 <file>.<ts>.bak
+_HIST_TS = r"\d{8}T\d{6}Z"
+
+# 「改动即存」的历史节流窗口（秒）：自动保存路径下，同一文件两条历史版本至少间隔
+# 这么久。60s 的依据——回滚面板的粒度是「一次编辑会话」，而一次连续输入（含中途
+# 停顿想一下）通常在 1 分钟内；窗口内不落新版本也不会丢数据，因为被跳过的中间态
+# 本来就只是「上一个版本的半成品」，最终态一定会被写盘（最后一个 PUT 必然过闸或
+# 成为"最新版"本身）。手动保存 / 回滚不受此限。
+_AUTO_HISTORY_MIN_INTERVAL = 60.0
+
+
+def _yaml_flag(value: Any) -> bool:
+    """专家 yaml 里的「三态布尔」读成真布尔（True/False）。
+
+    **不能直接 ``bool(v)``**：`_parse_inline_value` 只把整数/列表/null 转成
+    Python 类型，其余原样返回**字符串**——所以盘上写 ``protected: false``
+    读出来是字符串 `"false"`，`bool("false") is True`，语义整个反过来。
+    这个坑在序列化端已规避（只落 `true`、不落 `false`），但读端同样必须
+    按字面量解析，否则将来谁手改一次 yaml 就静默反转语义。
+
+    约定：`true`/`yes`/`1`/`on` → True；`false`/`no`/`0`/`off`/`none`/`null`
+    及一切空值 → False；真布尔原样返回。其余无法判定的按 False（保守：
+    拒删/免闸这类能力不该因为一个拼错的词就被打开）。
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    s = str(value).strip().lower()
+    return s in {"true", "yes", "1", "on"}
+
+
+def _leading_comments(text: str) -> str:
+    """取文件**头部连续注释块**（空行与 `#` 行，直到第一个数据行）。
+
+    用途：全字段覆写时保留专家 yaml 顶部的说明注释。`_dump_expert_yaml` 是按
+    结构化字段重新拼出整个文件的，注释没有对应的模型字段，天然会被丢掉——
+    `triage.yaml` 就因此丢过一段「删文件会让 doctor 报两条 error」的告警注释。
+
+    自动保存（2026-10-21「改动即存」）把这个缺陷从「点保存才发生」放大成
+    「在设置页打一个字就发生」，所以必须补上。只取**头部连续块**而非全文所有
+    注释：字段之间的行内注释位置依赖排版，重新拼装后放回去也是错位，不如不动
+    （那种情况仍会丢，但至少顶部的「文件是什么、为什么存在」不会丢）。
+
+    返回带结尾换行的块（没有注释则返回空串），可直接拼在正文前。
+    """
+    head: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            head.append(line.rstrip())
+            continue
+        break
+    # 去掉块尾的空行（它们不属于注释，拼回去会多出空白）
+    while head and not head[-1].strip():
+        head.pop()
+    if not head:
+        return ""
+    return "\n".join(head) + "\n"
+
+
+def _trash_move(src: Path) -> Path:
+    """删除不物理抹除：移入同级 .history/trash/<名>.<UTC时间戳>[.n]（文件带 .bak 后缀）。
+
+    同秒二次删除（如同名角色删了又建再删）用序号避让，绝不覆盖既有回收件。"""
+    with pack_write_lock():  # 同秒 .n 避让与 packs 写锁同一临界区
+        trash = src.parent / ".history" / "trash"
+        trash.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        is_dir = src.is_dir()
+        tail = "" if is_dir else ".bak"
+        dest = trash / f"{src.name}.{ts}{tail}"
+        n = 1
+        while dest.exists():
+            dest = trash / f"{src.name}.{ts}.{n}{tail}"
+            n += 1
+        shutil.move(str(src), str(dest))
+    return dest
+
+
+def _history_versions(path: Path) -> list[dict]:
+    """列某现行文件的全部历史版本（兼容两种备份命名），按时间倒序。"""
+    hist = path.parent / ".history"
+    if not hist.is_dir():
+        return []
+    pat_api = re.compile(rf"({_HIST_TS})(?:\.\d+)?_{re.escape(path.name)}$")
+    pat_bak = re.compile(rf"{re.escape(path.name)}\.({_HIST_TS})\.bak$")
+    out: list[dict] = []
+    for f in hist.iterdir():
+        if not f.is_file():
+            continue
+        m = pat_api.fullmatch(f.name) or pat_bak.fullmatch(f.name)
+        if not m:
+            continue
+        st = f.stat()
+        out.append({"version": f.name, "ts": m.group(1),
+                    "size": st.st_size,
+                    "mtime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(st.st_mtime))})
+    out.sort(key=lambda v: v["ts"], reverse=True)
+    return out
+
+
+# ---------- CTF 题目（challenge-asset，v38，2026-10-14）模块级辅助 ----------
+# 提到模块级（不依赖 create_app）以便 store 层测试直接验证：题目清单计数与
+# 存量惰性补建都是**纯黑板逻辑**，与 FastAPI 应用对象无关。
+
+def _backfill_challenges(proj) -> dict:
+    """存量 CTF 项目惰性补建题目节点（幂等，落 config 标记）。
+
+    老 CTF 项目在本题目前没有题目行——findings 的 target_asset_id 全为空，
+    落在 UI 的「项目级（未挂载具体资产）」兜底组里，看不出一道题挖了啥。补建
+    后把这些发现归到题目节点下，遗留数据的归属即可见。
+
+    **只在真有遗留数据时补建**（2026-10-20 修复）：本函数的唯一目的是给
+    「无主发现」与「游离根资产」找归属。新建的空 CTF 项目同样满足「CTF 轨 +
+    无 challenge 行 + 未标记」三条，此前会凭空补建一道**以项目名命名**的题
+    （`author="system"`）——用户实测项目名「hxbai测试」混进题目列表，正是它。
+    没有任何可归拢数据时补建是纯污染，故直接标记后返回。
+
+    触发条件（四者同时满足才动）：CTF 轨 + 无任何 challenge 行 +
+    `config.challenge_backfill_done` 未标记 + **存在待归拢数据**。
+    **不重复触发**——用户之后主动删光题目不会被补回来（那是明确意图，不是
+    遗留状态）。非 CTF 轨直接 no-op。
+
+    落 `challenge.backfill` 审计事件（含题目 id 与归拢的发现数）。
+    """
+    try:
+        if proj.track != "ctf":
+            return {}
+        bb = proj.bb
+        if list(bb.list_assets(proj.id, type_=CHALLENGE_TYPE)):
+            return {}
+        cfg = dict(proj.meta.get("config") or {})
+        if cfg.get("challenge_backfill_done"):
+            return {}
+        # 先算「有没有遗留数据要归拢」——**必须在建题之前**，否则空项目也会
+        # 走进建题分支，留下那道幽灵题。
+        # 归拢存量「项目级」发现（target_asset_id 为空 → 挂到本题下）
+        rows = bb.conn.execute(
+            "SELECT id FROM findings WHERE project_id=? AND"
+            " (target_asset_id IS NULL OR target_asset_id='')",
+            (proj.id,)).fetchall()
+        # 归拢游离根资产（parent_id 空且非 challenge）→ 挂到题目下当附件。
+        # 旧 CTF 项目把附件/目标直接登记成根资产（type=binary 等），题目节点缺失时
+        # 它们"无主"——只归拢空 target 的发现会让补建的题目变空壳，而挂在旧根资产上
+        # 的发现仍游离（2026-10-14 用户实测「发现无法按题目过滤」的根因）。
+        roots = bb.conn.execute(
+            "SELECT id FROM assets WHERE project_id=? AND parent_id IS NULL"
+            " AND type != ?",
+            (proj.id, CHALLENGE_TYPE)).fetchall()
+        if not rows and not roots:
+            # 没有遗留数据 → 不建题，但**要落标记**，否则每次读题目清单都重跑
+            # 这两条查询。标记语义是「本项目的存量迁移已判定完毕」，不是
+            # 「补建成功」。
+            try:
+                ProjectStore(proj.path.parent).update_config(
+                    proj.id, {"challenge_backfill_done": True}, project=proj)
+            except Exception:  # noqa: BLE001 —— 标记失败只是下次重查
+                log.exception("challenge 补建标记落库失败 project=%s", proj.id)
+            return {}
+        name = (proj.name or "").strip() or "未命名题目"
+        r = register_challenge(bb, proj.id, name, author="system")
+        cid = str(r.get("id") or "")
+        if not cid:
+            return {}
+        moved = 0
+        adopted = 0
+        with bb._tx():
+            for row in rows:
+                bb.conn.execute(
+                    "UPDATE findings SET target_asset_id=? WHERE id=?",
+                    (cid, row["id"]))
+                moved += 1
+            for row in roots:
+                bb.conn.execute(
+                    "UPDATE assets SET parent_id=? WHERE id=?",
+                    (cid, row["id"]))
+                adopted += 1
+        try:
+            # 本函数是模块级（store 层测试直调），拿不到 create_app 里的 store 局部
+            # 变量——按项目目录反推 store 根（Project.path = <root>/<slug>）现建一个。
+            # 走 update_config 而非直接改 meta：config 归一化（autonomy/kb_iteration/
+            # ctf 等）与 project.json+黑板双写都由它负责。
+            ProjectStore(proj.path.parent).update_config(
+                proj.id, {"challenge_backfill_done": True}, project=proj)
+        except Exception:  # noqa: BLE001 —— 标记失败不阻断补建结果
+            log.exception("challenge 补建标记落库失败 project=%s", proj.id)
+        try:
+            bb.append_event(proj.id, "challenge.backfill",
+                            {"asset_id": cid, "name": name,
+                             "findings_moved": moved, "assets_adopted": adopted},
+                            author="system")
+        except Exception:  # noqa: BLE001
+            pass
+        return {"asset_id": cid, "name": name, "findings_moved": moved,
+                "assets_adopted": adopted}
+    except Exception:  # noqa: BLE001 —— 补建失败绝不让题目清单 500
+        log.exception("challenge 存量补建失败 project=%s", proj.id)
+        return {}
+
+def _running_intents_by_challenge(proj, challenge_ids: list[str]) -> dict[str, int]:
+    """每道题目下当前 claimed/running 的 Intent 数（题目状态派生用）。
+
+    Intent 的 ``asset_ids`` 指向题目子树内的任意资产（题目根或附件），故按
+    **子树**归属：一个 Worker 在打某题的附件，也算这道题在跑。
+    """
+    from core.blackboard.artex_intents import list_intents
+    from core.blackboard.attackpath import _subtree_ids
+    ids = [str(c) for c in (challenge_ids or []) if str(c)]
+    if not ids:
+        return {}
+    try:
+        assets = proj.bb.list_assets(proj.id)
+        subtree_of = {cid: _subtree_ids(assets, cid) for cid in ids}
+        intents = list_intents(proj.bb, proj.id, limit=2000)
+    except Exception:  # noqa: BLE001 —— 读失败按「没有在跑」处理
+        return {}
+    counts: dict[str, int] = {}
+    for intent in intents:
+        if str(intent.get("status") or "") not in ("claimed", "running"):
+            continue
+        for aid in (intent.get("asset_ids") or []):
+            sid = str(aid)
+            for cid, subtree in subtree_of.items():
+                if sid in subtree:
+                    counts[cid] = counts.get(cid, 0) + 1
+    return counts
+
+
+def _solved_notice(proj, challenge_id: str, flag_row: dict, *,
+                   is_controller: bool) -> str:
+    """拼「人工确认了一条 flag」通知正文（flag-hint，2026-10-21 重写）。
+
+    **必须把「已拿到哪条 flag + 它对应的题面提示」原样交给 agent，由它自己
+    判断该不该收尾**（用户裁决）：
+    - 多 flag 题（如 6 条）确认第 1 条时，题目**远未解出**。旧实现只要
+      `verdict == "accepted"` 就发「这题已经拿到正确 flag，不用再探索了」，
+      子 agent 收到就收尾——正在找的第 2~6 条全被放弃。用户看到的正是
+      「确认一条 flag，子进程就被取消」。
+    - 而一条 flag 的原文（`flag{1a2b}`）对「这条是不是我在找的方向」几乎
+      没有指示性。题面通常给的是「需要 xxxx 管理员后台密码为 flag」「分析
+      流量得到 xxx 版本，版本号为 flag」——**这类提示才是指路的那句话**。
+      所以必须把提示一起发过去，让 agent 自己比对：是 → 收尾；不是 →
+      继续干，别重复提交这一条。
+
+    因此本函数不再写「不用再探索了」，改为**陈述事实 + 给判据**：
+    已确认哪些条（含提示）、还差几条、你该怎么判断、哪些情况别做。
+    """
+    name = challenge_id
+    try:
+        asset = proj.bb.get_asset(challenge_id) or {}
+        name = str(asset.get("value") or asset.get("name") or challenge_id)
+    except Exception:  # noqa: BLE001
+        pass
+    token = str((flag_row or {}).get("flag") or "").strip()
+    # 台账全貌：已确认清单（带提示）+ 配额 + 是否真的解出
+    st: dict = {}
+    briefs: list[dict] = []
+    try:
+        from core.blackboard.challenge_flags import (
+            accepted_flag_briefs, challenge_state)
+        st = challenge_state(proj.bb, proj.id, challenge_id)
+        briefs = accepted_flag_briefs(proj.bb, proj.id, challenge_id)
+    except Exception:  # noqa: BLE001 —— 读不到台账就退回最简文案
+        log.exception("拼通知正文：读台账失败 challenge=%s", challenge_id)
+    quota = int(st.get("quota") or 0)
+    got = int(st.get("accepted") or 0)
+    solved = bool(st.get("solved"))
+    remaining = max(0, quota - got)
+
+    head = [f"{origin_tag(LABEL_FLAG_LEDGER)}题目「{name}」的 flag 台账有更新。", ""]
+    if briefs:
+        head.append(f"**已确认 {got}/{quota} 条**（人工核对过，这些不用再找了）：")
+        for b in briefs:
+            # 序号可能为空（未绑定题面）——不能 f-string 成「第 None 条」。
+            seq = b.get("index")
+            line = (f"  - 第 {seq} 条：`{b['flag']}`" if seq
+                    else f"  - `{b['flag']}`（未标注题面）")
+            if b.get("hint"):
+                line += f"\n    题面要求：{b['hint']}"
+            head.append(line)
+    else:
+        head.append(f"- 刚确认：`{token}`")
+    if not solved and remaining:
+        head.append(f"- **还差 {remaining} 条**，本题尚未解出。")
+    elif solved:
+        head.append("- **本题已解出**（已确认条数达到配额）。")
+    head.append("")
+
+    if solved:
+        if is_controller:
+            return "\n".join(head + [
+                "**这一轮请尽快收尾**，按下面顺序做完就停：",
+                "1. 立刻**停止派新方向**（不要再 ctf_dispatch / call_expert）；",
+                "2. 把手上已识别的结论写回（已解出的路径、验证过的证据、"
+                "未登记的发现）——这些是复盘材料，别让它们随轮次消失；",
+                "3. 用一句话说明「本题已解出，收工」。",
+                "",
+                "已经在跑的方向不必等它们跑完，也不要为了「收齐」再等一轮。",
+            ])
+        return "\n".join(head + [
+            "**你正在跑的方向不必再做完了**——人工已经确认全部答案，继续深挖"
+            "是重复劳动。按下面顺序做完就停：",
+            "1. **不要再启动新的探测/扫描/脚本**，把当前这一步收个尾就够"
+            "（正在跑的长命令可以不等它结束）；",
+            "2. 把**手上已有的中间结论写回**（已走通的路径、验证过的证据、"
+            "还没登记成 finding 的发现）——这些是复盘材料，别让它们随轮次消失；",
+            "3. 用一句话说明「本题已解出，我的方向到此为止」并结束。",
+            "",
+            "不需要为了「做完整」再补一轮，也不要重新验证已经确认的 flag。",
+        ])
+
+    # ---- 未解出：**不收工**，让 agent 自己按提示判断方向 ----
+    # 这段是本轮修复的核心。绝不能写「不用再探索了」——题目还要继续做。
+    judge = [
+        "**先判断：上面已确认的那条，是不是你正在找的方向？**",
+        "判断依据是那一条后面的「题面要求」，不是 flag 原文——flag 串本身"
+        "看不出方向。",
+        "",
+        "① **是你的方向**（你正在做的就是要拿这条）→ 这条已经拿到，"
+        "**不要重复提交同一串**（`ctf_submit_flag` 会拒收）。"
+        "把已走通的路径与证据写回，然后**转向本题还没拿到的其他面**，"
+        "别在已经完成的方向上继续深挖。",
+        "② **不是你的方向**（你在攻别的面）→ **照原计划继续做**，"
+        "本条通知不影响你。你要找的是剩下的 "
+        f"{remaining} 条之一。",
+        "③ **拿不准** → 继续做手上的事；不要为了「对齐」先停下来问。",
+        "",
+        "无论哪种情况：**不要因为这条通知就整体收尾**——本题还差 "
+        f"{remaining} 条。",
+    ]
+    if is_controller:
+        judge.append("")
+        judge.append(
+            "作为主控：已确认的方向**不要再派 Worker**；其余方向照常派。"
+            "等台账拿满配额（或你判断已经无面可攻）再 `ctf_conclude` 收尾。")
+    return "\n".join(head + judge)
+
+
+def _challenge_summary(proj, rows: list[dict]) -> list[dict]:
+    """给题目行附「附件子资产数 / 发现数 / 意图数 / 附件清单 / flag 与状态」。
+
+    附件 = 题目子树内的 **非 challenge** 资产（压缩包抽出的文件树、URL、单文件）。
+    计数走**子树**（不是直接子节点）——附件本身还能再挂一层。
+    发现/意图按 target_asset_id 落在题目子树内计。
+
+    状态（``state``）是 **flag 台账的派生值**（challenge-flag-ledger v47），
+    不独立存储——否则会出现「状态说已解但 flag 表是空的」。
+    """
+    if not rows:
+        return []
+    pid = proj.id
+    assets = proj.bb.list_assets(pid)
+    findings = proj.bb.list_findings(pid)
+    intents = list_intents(proj.bb, pid)
+    # 子树 id 集合（父不存在 → 断链的退回根，题目根节点无此风险）
+    parent_of = {a["id"]: a.get("parent_id") for a in assets}
+    by_id = {a["id"]: a for a in assets}
+
+    def _in_subtree(root_id: str, aid: str) -> bool:
+        walker, seen = aid, set()
+        while walker and walker not in seen:
+            seen.add(walker)
+            if walker == root_id:
+                return True
+            walker = parent_of.get(walker)
+        return False
+
+    challenge_ids = [c["id"] for c in rows]
+    running_by = _running_intents_by_challenge(proj, challenge_ids)
+    try:
+        from core.blackboard.challenge_flags import challenge_flag_summary
+        flag_state = challenge_flag_summary(proj.bb, pid, challenge_ids, running_by)
+    except Exception:  # noqa: BLE001 —— 旧库无 flag 表时不阻断题目列表
+        flag_state = {}
+
+    out = []
+    for c in rows:
+        cid = c["id"]
+        atts = [a for a in assets
+                if a["id"] != cid and _in_subtree(cid, a["id"])]
+        fcount = sum(1 for f in findings
+                     if _in_subtree(cid, f.get("target_asset_id")))
+        icount = 0
+        for it in intents:
+            anchors = [it.get("target_asset_id")]
+            for b in (it.get("basis_refs") or []):
+                if isinstance(b, str) and b.startswith("asset"):
+                    anchors.append(b.split(":", 1)[-1])
+            if any(_in_subtree(cid, x) for x in anchors if x):
+                icount += 1
+        meta = dict(c.get("meta") or {})
+        st = flag_state.get(cid) or {}
+        out.append({
+            **c,
+            "description": str(meta.get("title") or ""),
+            "title": str(meta.get("title") or ""),
+            "brief": str(meta.get("brief") or ""),
+            "entry_hint": str(meta.get("entry_hint") or ""),
+            "direction": str(meta.get("direction") or ""),
+            "tags": list(meta.get("tags") or []),
+            "flag_format": str(meta.get("flag_format") or ""),
+            "flag_count": int(st.get("quota") or meta.get("flag_count") or 1),
+            # 每条 flag 的题面提示（flag-hint，2026-10-21）。前端编辑表单要回填、
+            # 台账弹层要按行显示「这条对应哪句题面」——否则确认完一条之后，
+            # 人和 agent 都只能看到一串 flag 原文，看不出它是哪个方向来的。
+            "flag_hints": [str(x or "") for x in (meta.get("flag_hints") or [])],
+            "state": str(st.get("state") or "untouched"),
+            "solved": bool(st.get("solved")),
+            "accepted_flags": int(st.get("accepted") or 0),
+            # 候选（pending，AI 判定通过待人工确认）——**不计 solved**（方案 A，
+            # 2026-10-20）。前端要单独显示，否则「2/1」会被读成「已拿满」。
+            "candidate_flags": int(st.get("candidate") or 0),
+            "rejected_flags": int(st.get("rejected") or 0),
+            "running_workers": int(st.get("running") or 0),
+            "abandoned": bool(st.get("abandoned")),
+            # 主控主动收尾（ctf_conclude）：不再派工，但**不是**解出。
+            "concluded": bool(st.get("concluded")),
+            "over_quota": bool(st.get("over_quota")),
+            "flags": list(st.get("flags") or []),
+            "attachment_count": len(atts),
+            "attachments": [{"id": a["id"], "type": a.get("type"),
+                             "value": a.get("value")} for a in atts[:50]],
+            "finding_count": fcount,
+            "intent_count": icount,
+        })
+    return out
+
+
+def _resolve_managed_file(app: Any, file_rel: str) -> Path:
+    """历史端点的 packs 相对路径解析：只许 capabilities/tracks 下、逐段白名单、
+    resolve 后必须仍在 packs_root 内（防穿越双保险）。"""
+    if not file_rel or "\x00" in file_rel:
+        raise HTTPException(422, "非法文件路径")
+    rel = Path(file_rel)
+    if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+        raise HTTPException(422, "非法文件路径：只接受 packs 内相对路径")
+    if rel.parts[0] not in {"kb", "experts"}:
+        raise HTTPException(422, "非法文件路径：只接受 kb/ 或 experts/ 下文件")
+    for seg in rel.parts:
+        _check_name(seg, "路径段")
+    root = Path(app.state.packs_root).resolve()
+    path = (root / rel).resolve()
+    if os.path.commonpath([str(root), str(path)]) != str(root):
+        raise HTTPException(422, "非法文件路径：越出 packs 根")
+    return path
+
+
+_SKILL_FRONTMATTER_LIST_KEYS = (
+    "keywords", "features", "file_features", "platforms",
+    "formats", "vuln_classes", "task_types",
+)
+
+
+def _dump_new_skill(name: str, body: "SkillCreateIn") -> str:
+    """新建 cc 风格自包含技能模板。
+
+    SKILL.md 负责完整工作流；references/scripts/examples/assets 是可选的
+    同目录资源，Agent 通过 skill_open(name, path=...) 按需读取。
+    """
+    lines = ["---", f"name: {name}"]
+    if body.description:
+        lines.append(f"description: {body.description}")
+    for key in _SKILL_FRONTMATTER_LIST_KEYS:
+        vals = [v.strip() for v in getattr(body, key) if v.strip()]
+        if vals:
+            lines.append(f"{key}: " + ", ".join(vals))
+    lines.append("mode: self-contained")
+    lines += [
+        "---", "",
+        f"# {name}", "",
+        "> 这是一个自包含技能：把可复用的详细方法、判断标准和收尾要求写在本目录。",
+        "> 大型资料放入 `references/`，可执行辅助程序放入 `scripts/`，示例放入 `examples/`。",
+        "", "## 适用场景", "",
+        "- （明确本技能何时使用、输入是什么、范围是什么）", "",
+        "## 执行流程", "",
+        "1. （先写准备和前置条件）",
+        "2. （写可验证的执行步骤、分支和停止条件）",
+        "3. （写证据、产物和验收标准）", "",
+        "## 资源", "",
+        "- 需要细节时，用 `skill_open(name=\"" + name + "\", path=\"references/<文件>\")` 读取本技能目录内的资料。",
+        "- 脚本只作为辅助，运行前检查参数、范围和输出位置。", "",
+        "## 红线与收尾", "",
+        "- 只在授权范围内行动；证据和产物落项目黑板，不写入技能目录。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _set_skill_enabled(path: Path, enabled: bool) -> Path | None:
+    """enabled 快速开关：只动 frontmatter 的 enabled 行，正文与其它字段原样保留。
+    返回切换前的 .history 备份路径（None=文件先前不存在，不会发生）。
+
+    无该行且要禁用时插在 name 行之后；启用时把值改回 true（缺省语义即启用，
+    但显式 true 比删行更能在 .history 里留下可读痕迹）。"""
+    raw = path.read_text(encoding="utf-8")
+    if not raw.startswith("---"):
+        raise HTTPException(422, "技能文件缺少 frontmatter，无法切换 enabled")
+    parts = raw.split("---", 2)
+    if len(parts) < 3:
+        raise HTTPException(422, "技能文件 frontmatter 不闭合")
+    head, body = parts[1], parts[2]
+    lines = head.splitlines()
+    hit = False
+    for i, line in enumerate(lines):
+        if re.match(r"^enabled\s*:", line):
+            lines[i] = f"enabled: {'true' if enabled else 'false'}"
+            hit = True
+    if not hit and not enabled:
+        idx = next((i for i, line in enumerate(lines)
+                    if re.match(r"^name\s*:", line)), -1)
+        lines.insert(idx + 1, "enabled: false")
+    new_head = "\n".join(lines)
+    if head.startswith("\n") and not new_head.startswith("\n"):
+        new_head = "\n" + new_head
+    if head.endswith("\n") and not new_head.endswith("\n"):
+        new_head += "\n"
+    with pack_write_lock():
+        backup = _pack_history_backup(path)
+        path.write_text(f"---{new_head}---{body}", encoding="utf-8")
+    return backup
+
+
+def _check_name(value: str, label: str) -> None:
+    if not _NAME_RE.fullmatch(value):
+        raise HTTPException(422, f"非法{label}: {value}")
+
+
+def _cap_path(app: Any, cap: str, *parts: str) -> Path:
+    """packs/kb/<方向>/... 路径校验（各段过白名单，防穿越）。"""
+    _check_name(cap, "方向")
+    for p in parts:
+        _check_name(p, "名称")
+    return (kb_root(app.state.packs_root) / cap).joinpath(*parts)
+
+
+def _track_path(app: Any, track: str, *parts: str) -> Path:
+    """packs/kb/<track>/... 路径校验（各段过白名单，防穿越）。"""
+    _check_name(track, "场景轨")
+    for p in parts:
+        _check_name(p, "名称")
+    return track_dir(app.state.packs_root, track).joinpath(*parts)
+
+
+class AgentIn(BaseModel):
+    role: str = "_generalist"
+    session_name: str | None = None
+    model: str | None = None  # per-session 覆盖 executor 模型（DESIGN.md §8）；None=供应商默认
+    provider: str | None = None  # 供应商名（config/providers.json）；None=全局默认供应商
+    max_steps: int = 200  # E8：默认步数预算（角色 yaml 取 min 可更严；request_steps 可自助 +200）
+    # worker 启动制（F9）：人手开窗默认不接任务（armed=False，点「跑任务队列」启动）；
+    # 编排/审批开窗走 armed=True 路径。armed=True 且 L1/L2 未暂停才触发触发点 C。
+    armed: bool = False
+
+    @field_validator("max_steps")
+    @classmethod
+    def _check_max_steps(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("max_steps 须为正整数")
+        return v
+
+
+class LlmProviderIn(BaseModel):
+    name: str
+    base_url: str
+    format: str = "openai-chat-completions"
+    api_key: str = ""        # 读出脱敏；保存空串=保持原 key
+    models: list[str] = Field(default_factory=list)
+    enabled: bool = True
+    # 每模型最大上下文（token，可选；非法/未勾选项由 _validate 静默剔除）
+    model_context: dict[str, int] = Field(default_factory=dict)
+    # 思考链开关（2026-09-30，设置页勾选框）：None=不写字段（跟随网关缺省——
+    # base_url 含 ark 默认开，其余默认关）；True/False=显式写入 thinking 字段。
+    # 此前该字段被本模型白名单抹掉（设置页保存一次即丢），思考链静默消失
+    thinking: bool | None = None
+    # 思考强度（七档）：设置页下拉会带上；此前本模型漏声明 → 请求体被静默丢弃，
+    # 用户选完强度下次打开又变回 high（与 system_delivery 同一类白名单坑）。
+    thinking_effort: str | None = None
+    proxy: str | None = None  # 供应商专属 HTTP/HTTPS 代理；缺省沿用系统代理环境
+    # 视觉能力（vision 通道）：None=未声明，True/False=显式支持/不支持。
+    vision: bool | None = None
+    # system 送达方式（system-delivery，2026-10-28）：auto/field/inline；None=不改。
+    # 少声明一个字段 = 设置页保存一次即抹掉（后端 _validate 是白名单），
+    # thinking/system_in_user/vision 都栽过同一坑——这里必须显式接住。
+    system_delivery: str | None = None
+    system_in_user: bool | None = None    # 历史兼容开关（等价 inline/field）
+
+
+class ProvidersIn(BaseModel):
+    providers: list[LlmProviderIn]
+    default_provider: str | None = None  # 用户可选的全局默认供应商（须为启用中的供应商）
+    # 全局缺省送达方式（providers.json 顶层 system_delivery_default）：None=不改。
+    system_delivery_default: str | None = None
+
+
+class DiscoverIn(BaseModel):
+    name: str | None = None       # 已保存供应商
+    base_url: str | None = None   # 未保存的新供应商：直接用地址+key 发现
+    api_key: str | None = None
+    format: str = "openai-chat-completions"
+    proxy: str | None = None
+
+
+class TestModelIn(BaseModel):
+    name: str | None = None       # 已保存供应商：用其 base_url/key（api_key 字段可覆盖）
+    base_url: str | None = None   # 未保存的新供应商：直接给地址+key 测
+    api_key: str | None = None
+    format: str = "openai-chat-completions"
+    model: str
+    proxy: str | None = None
+
+
+class SwitchLlmIn(BaseModel):
+    provider: str
+    model: str | None = None
+
+
+class WebSearchIn(BaseModel):
+    """线程级联网搜索开关（v43，web-search-toggle）。"""
+    enabled: bool = True
+
+
+class EffortIn(BaseModel):
+    """线程级思考强度（v48，thinking-effort，2026-10-21）。
+
+    七档：minimal/low/medium/high/xhigh/max/ultra；``""`` = 清除覆写回跟随供应商。
+    非法值 422 不落盘——档位是有限集合，静默接受坏值会让 UI 显示与实际下发不一致。
+    """
+    effort: str = ""
+
+
+class TickIn(BaseModel):
+    allowed_roles: list[str] | None = None
+    max_sessions: int = 4
+    digest_every: int = 3
+    max_steps: int = 12
+    # auto-attack 研判轮（2026-09-28）：只分析不派活，产出落 orch.auto_attack.analyzed
+    analyze_only: bool = False
+    budget_ticks: int | None = None  # 研判时人类预选的链轮数预算（回显进 analyzed 事件）
+
+
+class ArtexPlanIn(BaseModel):
+    goal: str
+    task_id: str = ""
+    asset_ids: list[str] = []
+    allowed_experts: list[str] | None = None
+    start_engine: bool = False
+
+
+class ArtexControlIn(BaseModel):
+    action: Literal["pause", "resume", "cancel", "retry"]
+
+
+class ArtexScopeIn(BaseModel):
+    """任务范围资产锚定（artex-coverage）：asset_ids 非空则锚定/摘除；
+    asset_ids 空且 action=anchor 时只读返回覆盖度。"""
+    asset_ids: list[str] = []
+    remove: bool = False
+    note: str = ""
+
+
+class ArtexWorkerControlIn(BaseModel):
+    action: Literal["kill", "steer"]
+    message: str = ""
+
+
+class ApprovalDecisionIn(BaseModel):
+    decision: str  # approved / rejected
+
+    @field_validator("decision")
+    @classmethod
+    def _check(cls, v: str) -> str:
+        if v not in {"approved", "rejected"}:
+            raise ValueError("decision 只能是 approved / rejected")
+        return v
+
+
+class SessionResumeIn(BaseModel):
+    """E8：恢复暂停会话的可选参数——引导语随快照注入；步数增补仅对
+    预算暂停（reason=budget）生效，缺省自动 +200（与 request_steps 同增量）。"""
+    note: str | None = None
+    extra_steps: int | None = None
+
+
+class SessionNoteIn(BaseModel):
+    text: str = ""                     # 2026-09-19 起可空：纯附件引导（attachment_ids 非空）
+    attachment_ids: list[str] = []     # 附件随发：kind=attachment 的 artifact id
+
+
+class SessionRoleIn(BaseModel):
+    role: str                          # 会话中心化：换人目标专家 id（§4.4）
+
+
+class IntelFeedItem(BaseModel):
+    name: str = ""
+    url: str
+
+
+class IntelFeedsIn(BaseModel):
+    feeds: list[IntelFeedItem]
+
+
+class IntelProfileIn(BaseModel):
+    directions: dict[str, float] | None = None
+    stage: str | None = None
+    vault: dict | None = None  # E10：透传给 save_profile 归一化（path/enabled）
+    keywords: list[dict | str] | None = None
+    search: dict | None = None
+
+
+class IntelVaultIn(BaseModel):
+    path: str = ""
+    enabled: bool = False
+
+
+class IntelArticlePatch(BaseModel):
+    read: bool | None = None
+    starred: bool | None = None
+
+
+# ---------------- Job 注册表（长耗时动作） ----------------
+
+class JobRegistry:
+    def __init__(self):
+        self._jobs: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _record(job_id: str, kind: str, meta: dict | None) -> dict:
+        return {"id": job_id, "kind": kind, "status": "running",
+                "result": None, "error": None, "submitted_at": time.time(),
+                "meta": meta or {}}
+
+    def submit(self, kind: str, fn: Callable[[], Any], *, meta: dict | None = None,
+               on_done: Callable[[dict], Any] | None = None) -> str:
+        job_id = uuid.uuid4().hex[:12]
+        with self._lock:
+            self._jobs[job_id] = self._record(job_id, kind, meta)
+        self._spawn(job_id, fn, on_done)
+        return job_id
+
+    def submit_unique(self, kind: str, fn: Callable[[], Any], *,
+                      meta: dict | None = None,
+                      on_done: Callable[[dict], Any] | None = None
+                      ) -> tuple[str, bool]:
+        """幂等提交：同 kind 已有 running Job → 复用其 id，不重复起线程。
+
+        返回 ``(job_id, created)``。页面卸载重建（切页回来）、连点、多窗口都会
+        重复 POST 同一个动作；抓取类 Job 重入会并发打同一批源、重复入池打分。
+        查重与登记在同一把锁内完成，避免两个请求同时看不到对方而各起一份。
+        """
+        with self._lock:
+            for j in self._jobs.values():
+                if j["status"] == "running" and j["kind"] == kind:
+                    return j["id"], False
+            job_id = uuid.uuid4().hex[:12]
+            self._jobs[job_id] = self._record(job_id, kind, meta)
+        self._spawn(job_id, fn, on_done)
+        return job_id, True
+
+    def _spawn(self, job_id: str, fn: Callable[[], Any],
+               on_done: Callable[[dict], Any] | None) -> None:
+        def runner():
+            try:
+                result = fn()
+                with self._lock:
+                    self._jobs[job_id].update(status="done", result=result)
+            except Exception as e:  # noqa: BLE001 —— 失败也要可轮询
+                with self._lock:
+                    self._jobs[job_id].update(status="error", error=f"{type(e).__name__}: {e}")
+            # 状态翻完后再回调（批 5 续链评估靠它：worker 在 tick 收尾期间秒退时
+            # A 触发会因 tick job 仍 running 而跳过，由 tick 自己的 on_done 兜底）
+            if on_done is not None:
+                try:
+                    on_done(self.get(job_id))
+                except Exception:  # noqa: BLE001 —— 回调异常不得影响 job 状态
+                    log.exception("job on_done 回调失败 job=%s", job_id)
+
+        threading.Thread(target=runner, daemon=True, name=f"job-{job_id}").start()
+        return job_id
+
+    def get(self, job_id: str) -> dict | None:
+        with self._lock:
+            return dict(self._jobs.get(job_id)) if job_id in self._jobs else None
+
+    def all_jobs(self) -> list[dict]:
+        with self._lock:
+            return [dict(j) for j in self._jobs.values()]
+
+
+# ---------------- App 工厂 ----------------
+
+def _proxy_maintenance_tick(app: FastAPI) -> dict:
+    """代理池自动巡检一轮（同步，可直测）：验证全部 → 按阈值补抓。
+
+    2026-10-11：后台线程每 ``maintenance_interval_s`` 调一次。
+    ① 若有 ``proxy-fetch``/``proxy-validate`` 在跑（说明手动/上轮 Job 未完）→ 本轮跳过，
+    不并发；② 提交 ``proxy-validate`` Job 并**等其完成**；③ 数 ``protocol_counts``，
+    按 ``auto_fetch_targets`` 逐协议提交 ``proxy-fetch``，受 ``auto_fetch_cooldown_s``
+    节流（app.state.proxy_fetch_cooldown 记协议→上次触发时刻）。
+
+    返回本轮摘要（供测试/日志）：``{skipped, validated, fetched:[协议组…]}``。
+    """
+    pool = app.state.proxy_pool
+    jobs = app.state.jobs
+    # ① 已有代理 Job 在跑 → 跳过（不并发；复用全局 Job 判定）
+    for j in jobs.all_jobs():
+        if (j.get("status") == "running"
+                and j.get("kind") in ("proxy-fetch", "proxy-validate")):
+            return {"skipped": "busy", "validated": 0, "fetched": []}
+    if not pool.read_pool():                       # 空池无可验证：直接走阈值补抓
+        return _proxy_auto_fetch(app, pool)
+    # ② 验证全部，等其 Job 落地
+    progress: dict = {"phase": "queued", "done": 0, "total": 0,
+                      "eta_seconds": None, "message": "自动巡检…"}
+    jid = jobs.submit(
+        "proxy-validate",
+        lambda: pool.validate(on_progress=progress.update),
+        meta={"progress": progress, "auto": True})
+    deadline = time.monotonic() + 3600.0           # 上限 1h（防线程永久卡；正常远早于此）
+    while time.monotonic() < deadline:
+        job = jobs.get(jid)
+        if job is None or job.get("status") != "running":
+            break
+        time.sleep(1.0)
+    # ③ 阈值补抓
+    out = _proxy_auto_fetch(app, pool)
+    out["validated"] = 1
+    return out
+
+
+def _proxy_auto_fetch(app: FastAPI, pool) -> dict:
+    """按阈值提交补抓 Job（受冷却节流）；返回 ``{skipped, validated, fetched}``。"""
+    cfg = pool.config
+    counts = protocol_counts(pool.read_pool(), cfg.prune_latency_ms)
+    targets = auto_fetch_targets(counts, cfg)
+    now = time.monotonic()
+    cooldown: dict = app.state.proxy_fetch_cooldown
+    fetched: list[list[str]] = []
+    for protos in targets:
+        key = ",".join(protos)
+        last = cooldown.get(key, 0.0)
+        if cfg.auto_fetch_cooldown_s > 0 and now - last < cfg.auto_fetch_cooldown_s:
+            continue                               # 冷却中：跳过该组
+        cooldown[key] = now
+        progress: dict = {"phase": "queued", "done": 0, "total": 0,
+                          "eta_seconds": None, "message": "自动补抓…"}
+        app.state.jobs.submit(
+            "proxy-fetch",
+            lambda p=protos, pr=progress: pool.fetch(p, on_progress=pr.update),
+            meta={"progress": progress, "auto": True})
+        fetched.append(protos)
+    if fetched:
+        log.info("代理池自动补抓：counts=%s → 提交 %s", counts, fetched)
+    return {"skipped": None, "validated": 0, "fetched": fetched}
+
+
+def create_app(
+    workspace_root: str = "workspaces",
+    packs_root: str = "packs",
+    tools_root: str | None = "tools",
+    *,
+    executor_llm: Any | None = None,
+    planner_llm: Any | None = None,
+    providers_config: str = PROVIDERS_CONFIG_PATH,
+    intel_dir: str | Path = "data/intel",
+    mission_poll_interval: float = 60.0,
+    sediment_proposals: bool = True,
+    static_dir: str | Path | None = None,
+    session_containers: bool = True,
+    proxy_maintenance: bool = True,
+    delivery_probe: bool = True,
+    proxy_config_path: str = "config/proxy.json",
+) -> FastAPI:
+    """executor_llm / planner_llm 缺省时按供应商配置（config/providers.json）+
+    llm.json 文件级覆写构建 provider；测试可注入假 provider。
+    两者都为 None 且无法构建 → Agent 相关端点返回 503。
+    mission_poll_interval：mission 自动派生兜底轮询秒数（0=不启动，测试用）。
+    sediment_proposals：v0.65 done 自动提案开关——剧本式 planner 的测试必须关
+    （复盘 chat 会额外消费 planner 剧本项导致编排错位）。
+    static_dir：vite build 产物目录（webui/dist）——非 None 时挂 SPA 同源静态托管
+    （desktop-app-shell M2，DESIGN §1）：真实文件直出、其余 GET 回 index.html
+    （history fallback）；/api、/docs、/openapi.json 不受兜底影响。
+    proxy_maintenance：代理池自动巡检线程开关（2026-10-11，默认开；测试关）。
+    delivery_probe：保存供应商后自动跑 system 送达探测（system-delivery，默认开）。
+      它会**真发一次** canary 请求（单家 8s、整批上限 24s），故测试必须关——
+      否则每个 save 用例都在等网络超时。"""
+
+    app = FastAPI(title="obsius core API", version="0.1")
+    app.state.delivery_probe = bool(delivery_probe)
+
+    def _add_shutdown_handler(handler) -> None:
+        """兼容当前 Starlette/FastAPI：旧版提供 add_event_handler，新版仅暴露 router 生命周期列表。"""
+        add_handler = getattr(app, "add_event_handler", None)
+        if callable(add_handler):
+            add_handler("shutdown", handler)
+        else:
+            app.router.on_shutdown.append(handler)
+
+    def _persist_live_snapshots_on_shutdown() -> list[str]:
+        """v0.64 优雅停机钩子：对所有在跑任务且未暂停的会话即时落断点快照
+        （pause_snapshot_now，尾部 sanitize）——没点暂停就被关的后端，重启后
+        同样由清扫归位 paused + 豁免其 claimed 任务，点「继续」断点续跑。
+        行状态不动（worker 线程随进程消亡，清扫按 resume_snapshot 指针归位）。
+        返回落盘成功的 sid 列表；挂 app.state 供测试直调。"""
+        done: list[str] = []
+        for agent in app.state.agents.values():
+            try:
+                if (agent.dispatcher.current_task_id is not None
+                        and not agent.paused and agent.pause_snapshot_now()):
+                    done.append(agent.session["id"])
+            except Exception:  # noqa: BLE001
+                log.exception("停机快照落盘失败（会话 %s）",
+                              agent.session.get("id"))
+        return done
+
+    app.state.shutdown_persist = _persist_live_snapshots_on_shutdown
+    _add_shutdown_handler(_persist_live_snapshots_on_shutdown)
+
+    @app.exception_handler(BlackboardClosedError)
+    async def _bb_closed_handler(request, exc):  # noqa: ANN001
+        # 删除窗口内在飞的读/写请求（连接被 close_all 关闭）→ 409 而非 500
+        return JSONResponse(status_code=409,
+                            content={"detail": "项目正在删除中，请稍后刷新"})
+
+    store = ProjectStore(workspace_root)
+    app.state.store = store
+    # 项目根（与 store.root 同源，绝对路径）：测试与内部辅助按它定位项目目录。
+    app.state.workspace_root = store.root
+    app.state.sample_packages = SamplePackageStore(workspace_root)
+    # ⑥ 战役记忆全局库（data/campaign.db，workspace-hygiene D1 归位全局运行时数据；
+    # 仿 intel 全局 DB 先例）。落 workspace_root 同级 data/（workspaces/ 契约只收项目），
+    # 构造内含老位置 workspaces/campaign.db 惰性迁移；测试传 tmp workspace_root 时库
+    # 落 tmp 同级，保持 hermetic。
+    from core.blackboard.campaign import CampaignMemory
+    app.state.campaign = CampaignMemory(
+        Path(workspace_root).parent / "data" / "campaign.db")
+    # 全局反编译缓存（data/decompiler-cache/<sha>.json，仿全局 data/ 先例）：IDA/Ghidra
+    # 一次全量导出按 sha256 落全局，跨项目同一样本免重跑 headless（大样本加速 P1）。
+    app.state.decompiler_cache_dir = \
+        Path(workspace_root).parent / "data" / "decompiler-cache"
+    app.state.projects: dict[str, Project] = {}      # pid -> Project（连接复用）
+    # ARTEX Engine 注册表：按项目管理常驻 Frontier/Worker 调度器。
+    # 默认不主动创建，只有控制器/测试显式请求时才启动，避免无 Intent 项目产生线程。
+    from core.blackboard.artex_engine import SETTLE_DRAIN_GRACE_S, ArtexEngine
+    app.state.artex_engines: dict[str, ArtexEngine] = {}
+
+    def _stop_artex_engine(pid: str, timeout: float = 5.0) -> dict:
+        engine = app.state.artex_engines.pop(pid, None)
+        # 模型缓存随引擎一起放掉（2026-10-20）：Engine 没了，下次重建会重新
+        # 按「主控线程当前覆写」解析，缓存旧实例只会让重建后仍用老模型。
+        (getattr(app.state, "artex_worker_llm", None) or {}).pop(pid, None)
+        if engine is None:
+            return {"drained": True, "active_workers": 0}
+        result = engine.drain(timeout)
+        engine.stop(timeout=timeout)
+        return result
+
+    def _stop_all_artex_engines() -> None:
+        for pid in list(app.state.artex_engines):
+            _stop_artex_engine(pid)
+
+    def _artex_worker_llm_for(pid: str):
+        """ARTEX Worker 该用哪个模型：**跟随 ARTEX 主控线程**，不是全局默认。
+
+        2026-10-20 用户实测：主控换成 A 供应商后，子代理（Worker）还在用
+        默认供应商——同一任务里主控和它派出去的手下用的是两个模型，
+        上下文长度/工具调用能力/计费口径全不一致。
+
+        根因：`_get_artex_engine` 建 handler 时取 `_llms()`（全局 executor
+        路由），而主控对话用的是**线程级覆写**（`chat_threads.provider/model`，
+        v37），两者互不相干。Engine 又是项目级长期驻留的，模型一旦在构造期
+        绑死就不会再变。
+
+        解析顺序（前者优先）：
+        ① `app.state.artex_worker_llm[pid]` —— 本进程最近一次主控操舵传进来的
+           实例（主控刚用过的那个，含运行时切换）；
+        ② 该项目最近一条 `artex-controller` 线程的模型覆写（进程重启后 Engine
+           重建时仍能对上，不至于又退回默认）；
+        ③ None —— 调用方回退全局 executor（项目还没有主控线程时的唯一合理值）。
+        """
+        from core.chat.runtime import ARTEX_CONTROLLER_ID
+        cached = (getattr(app.state, "artex_worker_llm", None) or {}).get(pid)
+        if cached is not None:
+            return cached
+        proj = app.state.projects.get(pid)
+        if proj is None:
+            return None
+        try:
+            row = proj.bb.conn.execute(
+                "SELECT provider, model, thinking_effort FROM chat_threads"
+                " WHERE agent_id=? ORDER BY rowid DESC LIMIT 1",
+                (ARTEX_CONTROLLER_ID,)).fetchone()
+        except Exception:  # noqa: BLE001 —— 读库失败不该阻断引擎启动
+            log.exception("读取 ARTEX 主控线程模型失败 pid=%s", pid)
+            return None
+        if row is None:
+            return None
+        # provider 空 = 该主控跟随全局 → 返回 None，调用方仍走 _llms()（同款口径）
+        llm_obj, err = _thread_llm(row["provider"] or "", row["model"] or "",
+                                   row["thinking_effort"] or "")
+        if err:
+            log.warning("ARTEX 主控模型覆写构建失败，回退全局 executor: pid=%s %s",
+                        pid, err)
+        return llm_obj
+
+    def _get_artex_engine(pid: str, handler=None, worker_llm=None, **kwargs):
+        """获取或创建项目 Engine；未注入 handler 时接入真实 ChatTurn Worker。
+
+        ``worker_llm``（2026-10-20）：调用方（ARTEX 主控线程）本轮实际使用的
+        LLM 实例。传进来即记入 ``app.state.artex_worker_llm[pid]``，后续 Intent
+        的 Worker 一律跟随它；不传则按 ``_artex_worker_llm_for`` 的兜底顺序解析。
+        """
+        if pid in app.state.projects_closing:
+            raise HTTPException(409, "项目正在删除中，请稍后刷新")
+        # 每次调用都更新缓存（不只首次建引擎时）——主控换模型后，下一个 Intent
+        # 就该用新模型，不该等到 Engine 重建。
+        if worker_llm is not None:
+            if getattr(app.state, "artex_worker_llm", None) is None:
+                app.state.artex_worker_llm = {}
+            app.state.artex_worker_llm[pid] = worker_llm
+        engine = app.state.artex_engines.get(pid)
+        if engine is None:
+            proj = app.state.projects.get(pid)
+            if proj is None:
+                proj = store.open_project(pid)
+                app.state.projects[pid] = proj
+            if handler is None:
+                from core.chat.artex_worker import make_worker
+                exec_llm, _ = _llms()
+                # Worker 模型：跟随主控（见 _artex_worker_llm_for），解析不到
+                # 才回退全局 executor。`llm_provider` 让每个 Intent 重新解析，
+                # 而不是把模型绑死在 Engine 构造期。
+                handler = make_worker(
+                    bb=proj.bb,
+                    # 初值也要走解析（不是只有 worker_llm 一条路）：Engine 由
+                    # API 直接启动（没有主控操舵）时 worker_llm 为 None，此时
+                    # 仍应按「主控线程的模型覆写」取，最后才回退全局 executor。
+                    llm=worker_llm or _artex_worker_llm_for(pid) or exec_llm,
+                    llm_provider=(lambda _pid=pid: _artex_worker_llm_for(_pid)),
+                    project_id=pid,
+                    packs_root=app.state.packs_root,
+                    track=proj.track,
+                    capabilities=directions_effective(
+                        app.state.packs_root, proj.track, proj.experts,
+                        fallback=proj.capabilities),
+                    artifacts_dir=proj.artifacts_dir,
+                    exec_workspace=_exec_workspace(proj),
+                    browser_pool=app.state.browser_pool,
+                    containers=app.state.session_containers,
+                    recovery=_environment_recovery(proj),
+                )
+            artex_cfg = (proj.meta.get("config") or {}).get("artex") or {}
+            from core.blackboard.artex_exploration import record_intent_result
+            from core.blackboard.artex_runtime import evaluate_task
+            def _record_exploration(intent: dict, reason: str) -> None:
+                if reason == "finished":
+                    record_intent_result(proj.bb, pid, intent)
+                    task_id = str(intent.get("task_id") or "")
+                    if task_id:
+                        evaluate_task(proj.bb, pid, task_id, reason="intent_finished")
+            on_intent_finished = _record_exploration
+            if bool(artex_cfg.get("auto_replan", False)):
+                max_replans = max(1, int(artex_cfg.get("max_replans", 5)))
+                replan_cooldown = max(0.0, float(artex_cfg.get("replan_cooldown_s", 2.0)))
+                replan_max_new = max(1, int(artex_cfg.get("replan_max_new", 3)))
+                max_intents = max(1, int(artex_cfg.get("max_intents", 50)))
+                replan_lock = threading.Lock()
+                replan_active: set[str] = set()
+                replan_last_started: dict[str, float] = {}
+
+                def _run_replan(intent: dict, source_id: str, task_id: str,
+                                completed_count: int) -> None:
+                    try:
+                        proj.bb.append_event(pid, "artex.replan.started", {
+                            "source_intent_id": source_id, "task_id": task_id,
+                            "trigger": "intent.finished"})
+                        _exec, planner = _llms()
+                        from core.blackboard.artex_exploration import list_nodes
+                        from core.blackboard.artex_planner import plan_followup
+                        facts = list_nodes(proj.bb, pid, task_id=task_id, kind="fact")
+                        findings = list_nodes(proj.bb, pid, task_id=task_id,
+                                              kind="finding")
+                        result = plan_followup(
+                            bb=proj.bb, project_id=pid, llm=planner,
+                            task_id=task_id, track=proj.track,
+                            allowed_experts=expert_allowed_roles(
+                                app.state.packs_root, proj.track, proj.experts),
+                            asset_ids=intent.get("asset_ids") or [],
+                            facts=facts, findings=findings,
+                            max_new=replan_max_new, max_intents=max_intents)
+                        proj.bb.append_event(pid, "artex.replan.completed", {
+                            "source_intent_id": source_id, "task_id": task_id,
+                            "intent_count": result.get("added", 0),
+                            "goal_covered": bool(result.get("goal_covered")),
+                            "skipped": result.get("skipped", 0),
+                            "budget_exhausted": bool(result.get("budget_exhausted")),
+                            "reason": result.get("reason", ""),
+                            "replan_index": completed_count + 1})
+                    except Exception as exc:  # noqa: BLE001
+                        proj.bb.append_event(pid, "artex.replan.failed", {
+                            "source_intent_id": source_id, "task_id": task_id,
+                            "error": str(exc)[:500]})
+                    finally:
+                        with replan_lock:
+                            replan_active.discard(source_id)
+
+                def _replan_after_finish(intent: dict, reason: str) -> None:
+                    _record_exploration(intent, reason)
+                    if reason != "finished" or intent.get("status") != "completed":
+                        return
+                    # 任意 Intent 完成都可唤醒 Planner（同一任务内持续扩展 frontier）；
+                    # LLM 规划放入独立线程，不能阻塞 Engine 收尾。
+                    source_id = str(intent.get("id") or "").strip()
+                    if not source_id:
+                        return
+                    now_mono = time.monotonic()
+                    prior = proj.bb.recent_events(
+                        pid, limit=500,
+                        kinds=["artex.replan.started", "artex.replan.completed"])
+                    with replan_lock:
+                        if source_id in replan_active:
+                            return
+                        if now_mono - replan_last_started.get(source_id, 0.0) < replan_cooldown:
+                            return
+                        if any(str((event.get("payload") or {}).get("source_intent_id") or "") == source_id
+                               for event in prior):
+                            return
+                        completed_count = sum(1 for event in prior
+                                              if event.get("kind") == "artex.replan.completed")
+                        if completed_count >= max_replans:
+                            return
+                        task_id = str(intent.get("task_id") or "artex-task")
+                        replan_active.add(source_id)
+                        replan_last_started[source_id] = now_mono
+                    threading.Thread(
+                        target=_run_replan,
+                        args=(intent, source_id, task_id, completed_count),
+                        name=f"artex-planner-{source_id[:12]}", daemon=True).start()
+
+                on_intent_finished = _replan_after_finish
+
+            def _settle_task(task_id: str, reason: str) -> dict:
+                """任务到点的终局规划轮（artex-taskclock，上游 runFinalPlannerRound）。
+
+                用**任务超时收尾词**做最后一次目标判定：只判「哪些目标已被证据
+                证明达成」，不派新方向（此时派的也不会再被执行）。走
+                ``plan_followup(final=True)`` 而不是自己拼提示词——目标证据硬闸
+                （``verify_goals_met``）与 goal_covered 派生口径必须同源，否则
+                终局判定会绕过证据链盖章。
+                """
+                _exec, planner = _llms()
+                from core.blackboard.artex_exploration import list_nodes
+                from core.blackboard.artex_planner import plan_followup
+                from core.blackboard.artex_runtime import evaluate_task
+                facts = list_nodes(proj.bb, pid, task_id=task_id, kind="fact")
+                findings = list_nodes(proj.bb, pid, task_id=task_id, kind="finding")
+                result = plan_followup(
+                    bb=proj.bb, project_id=pid, llm=planner,
+                    task_id=task_id, track=proj.track,
+                    allowed_experts=expert_allowed_roles(
+                        app.state.packs_root, proj.track, proj.experts),
+                    facts=facts, findings=findings, final=True)
+                try:
+                    evaluate_task(proj.bb, pid, task_id, reason="task_settled")
+                except Exception:  # noqa: BLE001 —— 状态推导失败不拦收尾留痕
+                    pass
+                return result
+
+            engine = ArtexEngine(
+                proj.bb, pid, handler,
+                auto_recover=artex_cfg.get("auto_recover", True),
+                recover_after_seconds=artex_cfg.get("recover_after_seconds", 300),
+                max_attempts=artex_cfg.get("max_attempts", 3),
+                # 全局并发（默认 15）：必须显著大于题目级上限（默认 5），否则
+                # 单题上限永远打不满。CTF 轨「5 × 3 道并发题 + 余量」。
+                max_workers=int(artex_cfg.get("max_workers", 15) or 15),
+                task_deadline_s=float(artex_cfg.get("task_deadline_s", 0) or 0),
+                max_intents=int(artex_cfg.get("max_intents", 50) or 50),
+                # 收尾宽限（artex-taskclock）：真实 ChatTurn Worker 撞预算后会**自己**
+                # 进收尾阶段（settlement，默认再跑 10 轮落库）。这段时间必须给，
+                # 否则 Engine 的兜底硬超时会在 Worker 刚进收尾时就 future.cancel()
+                # 硬砍——「夹逼→主动收尾」退化回「硬砍→什么都没捞回」。
+                settle_grace_s=SETTLE_DRAIN_GRACE_S,
+                on_intent_finished=on_intent_finished,
+                settler=_settle_task,
+                **kwargs)
+            app.state.artex_engines[pid] = engine
+        return engine
+
+    def _start_artex_engine(pid: str, handler=None, **kwargs):
+        """获取项目 Engine 并显式启动其 Frontier 轮询线程。"""
+        engine = _get_artex_engine(pid, handler, **kwargs)
+        engine.start()
+        return engine
+
+    app.state.get_artex_engine = _get_artex_engine
+    app.state.start_artex_engine = _start_artex_engine
+    app.state.stop_artex_engine = _stop_artex_engine
+    app.state.stop_all_artex_engines = _stop_all_artex_engines
+    _add_shutdown_handler(_stop_all_artex_engines)
+    # 删除中的项目闸门：删除窗口内 _project 拒绝重入（防 pop 缓存后被轮询/open_project
+    # 重建 Blackboard 实例重新锁死 db）；WS tick 见到即自行退出。
+    app.state.projects_closing: set[str] = set()
+    app.state.agents: dict[str, AgentSession] = {}   # sid -> AgentSession
+    # 批 5（§6.8）：本进程已启动的 L2 自动链 pid 集合——重启=急停，DB chain_active
+    # 持久但无此标记的链不得自动续（_maybe_auto_tick 落 orch.chain_stopped{restart}）。
+    app.state.active_chains: set[str] = set()
+    app.state.jobs = JobRegistry()
+    app.state.inventory = HostDetector().probe(tools_root=tools_root)
+    app.state.tools_root = tools_root  # gateway-config-view：probe 刷新端点复用
+    # 项目级受控环境恢复器缓存（pid -> EnvironmentRecovery）：跨会话/子专家共享，
+    # 使同一环境故障在项目内只尝试一次白名单恢复（去重计数在实例内）。
+    app.state.environment_recovery: dict[str, Any] = {}
+    # packs_root 必须**在构造时绝对化**：默认值 "packs" 是相对路径，而进程 cwd
+    # 会在运行期变化（测试里 `monkeypatch.chdir(tmp_path)`、用户从别的目录启动）。
+    # 不绝对化时，`list_packs` 会去读 `<新 cwd>/packs` → 轨道清单变空
+    # （症状：`非法场景轨: ctf（合法: []）`、专家全池消失），且要等到下一次
+    # 相对路径解析才暴露，极难归因。锚定在「创建时的 cwd」= 调用方语义。
+    app.state.packs_root = str(Path(packs_root).resolve())
+    app.state.llm_store = ProviderStore(providers_config)
+    # 请求体留痕（diagnostics-request-body，2026-10-17）：把 LLM 层转储回调接到
+    # 诊断存储（按项目/会话写 JSONL，开关在 config/llm_dump.json，默认关）。
+    # 进程级单例；关闭时 sink 首行即返回，零文件开销。
+    def _llm_failover_sink(kind: str, payload: dict, project_id: str,
+                           session_id: str) -> None:
+        """兜底记录 → 项目黑板事件（provider-failover，2026-10-21）。
+
+        归属口径必须**分别对齐两条链**，否则诊断页「定位会话」点不动：
+        chat 线程 = `session_id=None` + `payload.thread_id` + `author=chat-<tid12>`
+        （同 `ChatTurn._emit`）；任务链 = `session_id=<sid>` + `author=<sid>`。
+        项目没打开时直接返回——记录已在 `logs/llm_failover.jsonl` 里，不会丢。
+        """
+        proj = app.state.projects.get(project_id)
+        if proj is None:
+            return
+        sid = session_id or ""
+        is_chat = False
+        if sid:
+            try:
+                from core.chat import store as chat_store
+                is_chat = chat_store.get_thread(proj.bb, sid) is not None
+            except Exception:  # noqa: BLE001 —— 归属失败按任务链处理
+                is_chat = False
+        if is_chat:
+            proj.bb.append_event(project_id, kind, {**payload, "thread_id": sid},
+                                 session_id=None, author=f"chat-{sid[-12:]}")
+        else:
+            proj.bb.append_event(project_id, kind, payload,
+                                 session_id=sid or None, author=sid or "llm")
+
+    from core.diagnostics import requests as request_log
+    from core.llm.dump import set_sink as set_llm_dump_sink
+    set_llm_dump_sink(request_log.store)
+    # 跨供应商兜底记录（provider-failover，2026-10-21）：LLM 层不知道项目，靠
+    # `core.llm.dump.scope()` 归属；这里把它接成项目黑板事件，诊断页「模型兜底」
+    # 页签与审计事件流读同一条。JSONL 出口在模块内部无条件写，与本回调无关。
+    from core.diagnostics import llm_failover as failover_log
+    failover_log.set_sink(_llm_failover_sink)
+    # 研究工作台反编译服务（pid -> DecompilerService，项目级复用）；
+    # rev_service_factory 供测试注入假后端（签名 factory(proj) -> service）
+    app.state.rev_services: dict[str, Any] = {}
+    app.state.rev_service_factory = None
+    # IDA 拉取停止信号（sha -> threading.Event，页间检查点；job 结束残留无害，
+    # 下次 submit 覆盖——2026-09-30 断点续拉）
+    app.state.pull_cancel: dict[str, threading.Event] = {}
+    # headless 全量导出协作式停止信号（sha -> threading.Event，大样本 P3）：置位即写
+    # 停止标志文件，Ghidra 脚本在函数边界停下并保留已导出部分（不杀进程）。
+    app.state.export_cancel: dict[str, threading.Event] = {}
+    # 样本分析任务的协作式停止信号，按 package/version/target 隔离。
+    # 删除分析包时先置位，再等待 worker 自然退出。
+    app.state.sample_cancel: dict[str, threading.Event] = {}
+    # 情报面板（E9，全局模块）：惰性建 IntelStore（首访问情报端点才落 data/intel/）；
+    # intel_getter / intel_llm 为测试注入口（None = urllib 真抓 / classifier 路由）。
+    # **装配时先做老位置迁移**（config/intel → data/intel）：必须早于任何对新目录的
+    # 读写，否则 serve 侧先种子 profile.json 会把目录占住、迁移永久跳过。
+    try:
+        from core.intel.store import migrate_default_dir
+        intel_dir = migrate_default_dir(intel_dir)
+    except Exception:  # noqa: BLE001 —— 迁移失败退回原值，不该阻断装配
+        log.exception("情报目录迁移失败，继续用 %s", intel_dir)
+    app.state.intel_dir = str(intel_dir)
+    # 工具层（`intel_vulns`）与 API 层必须读**同一份** intel.db：`create_app` 可传
+    # 自定义 intel_dir（测试/多实例），工具层默认走 data/intel——不对齐就会出现
+    # 「情报面板看得到、Agent 查不到」（intel-pentest-link，2026-10-22）。
+    try:
+        from core.intel import shared as _intel_shared
+        _intel_shared.set_default_dir(intel_dir)
+    except Exception:  # noqa: BLE001 —— 对齐失败不该阻断应用装配
+        log.exception("情报目录与工具层对齐失败（工具将回落默认 data/intel）")
+    app.state.intel: IntelStore | None = None
+    app.state.intel_getter = None
+    app.state.intel_llm = None
+    app.state.intel_search_cache: dict[str, dict] = {}
+    # 阅读器（2026-10-27）：fetch/render/llm 三个注入口（None = 真抓 / 真渲染 /
+    # executor 路由）。`intel_reader_render_enabled=False` 可整体关掉 Playwright
+    # 兜底——打包环境不带 playwright 时靠它避免每次阅读都白等 35 秒超时。
+    app.state.intel_reader_fetch = None
+    app.state.intel_reader_render = None
+    app.state.intel_reader_llm = None
+    app.state.intel_reader_render_enabled = browser_available()
+    # C2 mission 自动派生：per-pid 防空转状态（{pid: {tip, empty}}）+ 判据模板目录
+    app.state.mission_derive: dict[str, dict[str, Any]] = {}
+    # llm.error 事件节流记账（"{pid}:{错误文案}" -> monotonic 时间，2026-09-18）
+    app.state.llm_error_seen: dict[str, float] = {}
+    app.state.judgments_dir = Path("config")
+    # F6 内置浏览器：每项目常驻实例池（懒启动；缺 playwright 全链降级不 500，
+    # config/browser.json 缺失=全默认）；爆破批次 stop 事件表 batch_id -> Event
+    app.state.browser_pool = BrowserPool(
+        workspace_root, bb_getter=lambda p: _project(p).bb,
+        config=BrowserConfig.from_file("config/browser.json"))
+    app.state.intruder_runs: dict[str, threading.Event] = {}
+    # 重发运行表（run_id → stop Event）：单条重发的中断信号（2026-10-07，仿 intruder_runs）
+    app.state.replay_runs: dict[str, threading.Event] = {}
+
+    def _browser_shutdown() -> None:
+        app.state.browser_pool.close_all()
+
+    _add_shutdown_handler(_browser_shutdown)
+
+    # 代理池（fir-proxy 托管，2026-10-07 → 2026-10-11 全局化）：**进程级单 serve + 单池**，
+    # 池记录落 data/proxy/pool.json（全局归位，不落 workspaces）；config/proxy.json 缺失=全默认；
+    # 缺 fir-proxy/依赖时端点返明确错误不 500（proxy_available 能力探测）。
+    # 装配即跑一次旧池合并（首启把各 <项目>/proxy/pool.json 并入全局，幂等）。
+    app.state.proxy_pool = ProxyPool(
+        workspace_root, tools_root or "tools",
+        config=ProxyConfig.from_file(proxy_config_path))
+    app.state.proxy_pool.merge_legacy_pools()
+    # 孤儿 serve 回收（2026-10-12 事故）：后端重启会让上一进程的 serve 变孤儿
+    # （旧实现每项目一个池，历史遗留一批），启动时清掉「父进程已死」的 serve。
+    # 台账重活（扫全进程），凭 proxy_maintenance 开关——测试默认关。
+    if proxy_maintenance:
+        from core.proxy.pool import reap_orphan_serves
+        try:
+            reap_orphan_serves()
+        except Exception:  # noqa: BLE001 —— 回收失败绝不阻断启动
+            log.exception("回收孤儿代理 serve 失败")
+    # 自动巡检（2026-10-11）：每 maintenance_interval_s 验证全部 + 阈值补抓。
+    # 节流表记协议组→上次自动抓取时刻（跨轮记忆）；线程 shutdown 置 Event 停。
+    app.state.proxy_fetch_cooldown = {}
+    _proxy_stop = threading.Event()
+
+    def _proxy_maintenance_loop() -> None:
+        interval = app.state.proxy_pool.config.maintenance_interval_s
+        if not interval or interval <= 0:
+            return                                  # 0=不巡检
+        while not _proxy_stop.wait(interval):
+            try:
+                _proxy_maintenance_tick(app)
+            except Exception:  # noqa: BLE001 —— 巡检异常绝不炸线程/拖垮平台
+                log.exception("代理池自动巡检失败")
+
+    if proxy_maintenance:
+        threading.Thread(target=_proxy_maintenance_loop, daemon=True,
+                         name="proxy-maintenance").start()
+
+    def _proxy_shutdown() -> None:
+        _proxy_stop.set()
+        app.state.proxy_pool.close_all()
+
+    _add_shutdown_handler(_proxy_shutdown)
+
+    # 飞书连接器（feishu-push v1，docs/plans/feishu-connector.md）：确认的中危及
+    # 以上漏洞（category=vuln + status=verified + severity≥min）边沿触发 → 自定义
+    # 机器人 webhook 自动推送。默认 disabled（config/feishu.json 缺失/坏 = 零
+    # 副作用）；订阅点在各项目 Project.bb 懒建处（hub.attach_store 幂等）。
+    from core.integrations.hub import get_default_hub
+    app.state.feishu_hub = get_default_hub()
+    app.state.feishu_hub.start_worker()
+
+    def _feishu_shutdown() -> None:
+        app.state.feishu_hub.shutdown()
+
+    _add_shutdown_handler(_feishu_shutdown)
+
+    # IDA-MCP 实例管理器（2026-09-20 按需拉起+空闲关，DESIGN.md §7）：Agent 点查
+    # decompile/xrefs 时按 (项目, 样本) 拉起无窗口 idat 并连其 MCP 端点，空闲
+    # 10min 自动关，实例上限 2（LRU），shutdown 兜关；db 与 headless 分诊同落盘
+    # （接线时按项目传 db_dir）。无 IDA 环境整体降级 no-op（ensure 恒 None）。
+    from core.tools.ida_mcp_manager import IdaMcpManager
+    app.state.ida_mcp_manager = IdaMcpManager()
+
+    def _ida_mcp_shutdown() -> None:
+        app.state.ida_mcp_manager.shutdown_all()
+
+    _add_shutdown_handler(_ida_mcp_shutdown)
+
+    # 会话级常驻容器管理器（P2/P3，2026-10-07）：L2 docker runtime 复用容器 + 孤儿回收。
+    # 根因修复配套——L2 曾漏 --rm 致每次 run_cmd 留 exited 容器，累积上千拖垮 Docker
+    # Desktop 仪表盘。懒 reaper 首轮做启动对账；shutdown 兜关清空；config/containers.json
+    # 的 session_scoped=false 可一键关闭（全局回落 per-call）。session_containers=False
+    # 供测试禁用（同 mission_poll_interval 惯例：不起 reaper 线程、不触 docker）。
+    app.state.session_containers = SessionContainerManager(
+        DockerBackend(), enabled=session_containers)
+    app.state.session_containers.start()
+
+    def _session_containers_shutdown() -> None:
+        app.state.session_containers.shutdown_all()
+
+    _add_shutdown_handler(_session_containers_shutdown)
+
+    _inventory_refresh_lock = threading.Lock()
+    _inventory_refresh_at = [0.0]
+
+    def _refresh_inventory_after_recovery(result) -> None:
+        """恢复成功后异步重探宿主能力清单（不阻塞原命令重试）。
+
+        probe 最坏 ~20s（docker/wsl 各自超时），必须放后台线程；60s 内最多一次，
+        避免连续恢复把探测线程堆起来。刷新失败只记日志——能力清单是可见性
+        数据，不能反过来影响「恢复已成功」的结论。
+        """
+        now = time.monotonic()
+        with _inventory_refresh_lock:
+            if now - _inventory_refresh_at[0] < 60:
+                return
+            _inventory_refresh_at[0] = now
+
+        def _probe() -> None:
+            try:
+                app.state.inventory = HostDetector().probe(
+                    tools_root=app.state.tools_root)
+                log.info("环境恢复后已刷新宿主能力清单 category=%s",
+                         getattr(result, "category", ""))
+            except Exception:  # noqa: BLE001 —— 刷新失败不影响恢复结论
+                log.exception("环境恢复后刷新能力清单失败")
+
+        threading.Thread(target=_probe, name="env-recovery-probe",
+                         daemon=True).start()
+
+    def _environment_recovery(proj: Project):
+        """项目级受控环境恢复器（懒建 + 缓存，None=不自动安装/构建）。
+
+        workspace 固定为项目目录、registry 取自 app.state.tools_root；恢复动作
+        统一经项目 gateway 执行，因此仍受 runtime/threat_class/scope/workspace/
+        net/approval 约束。缓存使同一故障（category+tool/image）在项目内只尝试
+        一次，不会被多个会话/子专家各装一遍。
+        """
+        if not app.state.tools_root:
+            return None  # 未配置 tools 根：既不做工具探测，也不允许安装
+        cached = app.state.environment_recovery.get(proj.id)
+        if cached is not None:
+            return cached
+        from core.runtime.recovery import EnvironmentRecovery
+        recovery = EnvironmentRecovery(
+            proj.path,
+            tools_root=app.state.tools_root,
+            command_runner=ExecutionGateway(
+                bb=proj.bb, containers=app.state.session_containers).run,
+            bb=proj.bb,
+            on_recovered=_refresh_inventory_after_recovery,
+        )
+        app.state.environment_recovery[proj.id] = recovery
+        return recovery
+
+    def _llms():
+        exec_llm = executor_llm
+        plan_llm = planner_llm
+        if exec_llm is None:
+            try:
+                llm_store: ProviderStore = app.state.llm_store
+                router = ModelRouter()
+
+                def _build(role: str):
+                    # llm.json 覆写（裸模型名→默认供应商；{provider,model}→指定）；无覆写→全局默认
+                    t = router.target_for(role)
+                    if t is None:
+                        return llm_store.build()
+                    prov, model = t
+                    return llm_store.build(prov, model)
+
+                exec_llm = _build("executor")
+                if plan_llm is None:
+                    plan_llm = _build("planner")
+            except Exception as e:  # noqa: BLE001 —— 无 key/无启用供应商时 Agent 端点不可用
+                raise HTTPException(503, f"LLM 未就绪（{e}），Agent/编排端点不可用") from e
+        return exec_llm, plan_llm
+
+    def _project(pid: str) -> Project:
+        if pid in app.state.projects_closing:
+            raise HTTPException(409, "项目正在删除中，请稍后刷新")
+        proj = app.state.projects.get(pid)
+        if proj is None:
+            try:
+                proj = store.open_project(pid)
+            except FileNotFoundError:
+                raise HTTPException(404, f"项目不存在: {pid}")
+            _sweep_restarted_project(proj)
+            app.state.projects[pid] = proj
+        # 候选 flag 唤醒订阅（ctf-flag-wake，2026-10-20）：**每次取项目都幂等补挂**，
+        # 不能只在「新建打开」时挂——API 建项目走的是另一条路径（直接塞进
+        # `app.state.projects`），只在 `proj is None` 分支挂会永远挂不上，表现为
+        # 「手工调唤醒函数有效、真实提交却毫无反应」（实测踩过）。
+        # 幂等靠 `ctf_wake_subs` 的 pid 判重，热路径开销是一次 dict 查。
+        subs = getattr(app.state, "ctf_wake_subs", None)
+        if subs is not None and pid not in subs:
+            try:
+                _attach_ctf_flag_wake(pid, proj)
+            except Exception:  # noqa: BLE001 —— 唤醒失败绝不阻断项目访问
+                log.exception("候选 flag 唤醒订阅失败（不影响项目）: %s", pid)
+        # 后台专家结果补达订阅（expert-bg-wake，2026-10-22）：同样的幂等补挂
+        # ——**只在 `proj is None` 分支挂会永远挂不上**（API 建项目走另一条路径
+        # 直接塞进 app.state.projects），这条教训在 ctf_wake 上已经踩过一次。
+        bg_subs = getattr(app.state, "bg_wake_subs", None)
+        if bg_subs is not None and pid not in bg_subs:
+            try:
+                _attach_bg_expert_wake(pid, proj)
+            except Exception:  # noqa: BLE001 —— 补达失败绝不阻断项目访问
+                log.exception("后台结果补达订阅失败（不影响项目）: %s", pid)
+        return proj
+
+    # ---------- 候选 flag 唤醒（ctf-flag-wake，2026-10-20） ----------
+    #
+    # 子代理提交候选 flag（verdict=pending、judged_by=ai）时唤醒 CTF 解题主控，
+    # 让它说一段话，前端据此挂「复制 / 确认」卡。订阅 `challenge.flag.recorded`
+    # 而不是改 ctf_submit_flag——ToolDispatcher 是纯执行层，拿不到 jobs/线程表，
+    # 也不该拿到；而 record_flag 已经发了这个事件（最短路径、对提交方无感）。
+
+    app.state.ctf_wake_subs: dict[str, Any] = {}
+
+    def _attach_ctf_flag_wake(pid: str, proj) -> None:
+        """订阅一个项目的黑板总线（幂等按 pid）。"""
+        if pid in app.state.ctf_wake_subs:
+            return
+        unsub = proj.bb.bus.subscribe(
+            lambda ev: _on_ctf_flag_event(pid, ev))
+        app.state.ctf_wake_subs[pid] = unsub
+
+    def _on_ctf_flag_event(pid: str, ev: dict) -> None:
+        """总线回调（**同步**，跑在 record_flag 的调用线程里）。
+
+        这里只做「筛 + 丢进 job」，绝不在回调里跑 LLM：回调阻塞会拖住 worker 的
+        `ctf_submit_flag` 返回，而那一轮还在等它的回执。
+        """
+        if str(ev.get("kind") or "") != "challenge.flag.recorded":
+            return
+        payload = ev.get("payload") or {}
+        if str(payload.get("verdict") or "") != "pending":
+            return
+        if str(payload.get("judged_by") or "ai") != "ai":
+            return
+        try:
+            _maybe_ctf_flag_wake(pid, str(payload.get("challenge_id") or ""),
+                                 str(payload.get("flag_id") or ""))
+        except Exception:  # noqa: BLE001 —— 唤醒失败不影响 flag 登记本身
+            log.exception("候选 flag 唤醒提交失败 pid=%s", pid)
+
+    def _maybe_ctf_flag_wake(pid: str, challenge_id: str, flag_id: str) -> str:
+        """唤醒 CTF 解题主控说一句话。返回 submitted/skip:* 便于测试断言。"""
+        from core.chat import ctf_wake
+        from core.chat import store as chat_store
+        if not flag_id or not challenge_id:
+            return "skip:empty"
+        try:
+            proj = _project(pid)
+        except HTTPException:
+            return "skip:gone"
+        bb = proj.bb
+        thread = ctf_wake.find_controller_thread(bb, pid, challenge_id)
+        if thread is None:
+            return "skip:no_controller"
+        tid = str(thread.get("id") or "")
+        # 主控**正在跑** → 不唤醒：worker 是同步 spawn 的，本轮主控自己就会看到
+        # 这条 flag（回执 + 台账）。硬塞第二轮会撞 409，且模型会拿到重复上下文。
+        if tid in _chat_running_set() or thread.get("status") == "running":
+            return "skip:running"
+        if ctf_wake.already_woken(bb, pid, flag_id):
+            return "skip:duplicate"
+        row = ctf_wake.get_flag(bb, pid, flag_id)
+        if row is None or str(row.get("verdict") or "") != "pending":
+            return "skip:not_pending"
+        text = ctf_wake.wake_text(bb, pid, challenge_id, row)
+        if not text:
+            return "skip:notext"
+        # 去重记账**先于**起轮：起轮失败也不重复唤醒（宁少勿扰；用户还能手点）。
+        try:
+            bb.append_event(pid, ctf_wake.WAKE_EVENT, {
+                "thread_id": tid, "challenge_id": challenge_id,
+                "flag_id": flag_id, "flag": str(row.get("flag") or "")[:120]},
+                session_id=None, author="ctf-wake")
+        except Exception:  # noqa: BLE001
+            log.exception("候选 flag 唤醒记账失败 pid=%s fid=%s", pid, flag_id)
+        try:
+            _chat_launch_turn(pid, tid, text)
+        except HTTPException as e:
+            return f"skip:http-{e.status_code}"
+        return "submitted"
+
+    app.state.ctf_flag_wake = _maybe_ctf_flag_wake   # 测试直调口
+    app.state.ctf_flag_wake_attach = _attach_ctf_flag_wake
+
+    # ---------- 后台专家结果补达唤醒（expert-bg-wake，2026-10-22） ----------
+    #
+    # 用户实测：CTF 主控说「等 forensics 回执到达后我做最后判定并收尾」，然后
+    # 轮次就结束了（右下角停止钮变回发送钮）。十几分钟后 forensics 跑完，结果
+    # 只续写进了 DB，**没有任何人去读**。
+    #
+    # 根因是「先返先触发」的后台专家结果只在本轮步边界 drain（
+    # `_drain_probe_overflow`），而那是**实例内存**；主控轮次一收尾实例就没了。
+    # 现有唯一的唤醒通道 `ctf_wake` 只认「候选 flag 落库」，worker 没提交 flag
+    # （纯结论/未命中/取证回执）就完全没有触发器。
+    #
+    # 这里补齐：core 层广播两个事件，本层订阅后按「主控是否真的没读到」决定
+    # 是否起一轮补达。**判据不用延时猜**——见 `core/chat/background_wake.py`。
+
+    app.state.bg_wake_subs: dict[str, Any] = {}
+    # 待补达登记（2026-11-01 唤醒盲区修复）：主控 running 时断候的结果登记于此
+    # （不记账、不唤醒），由池脉冲周期复查兜底——主控 idle 且结果已落库且未
+    # 记账 → 补达唤醒。key = f"{tid}:{tool_use_id}"（批量键带 "batch:" 前缀）。
+    app.state.bg_wake_pending: dict[str, dict] = {}
+
+    def _attach_bg_expert_wake(pid: str, proj) -> None:
+        """订阅一个项目的黑板总线（幂等按 pid，与 ctf_wake 同款模式）。"""
+        if pid in app.state.bg_wake_subs:
+            return
+        unsub = proj.bb.bus.subscribe(
+            lambda ev: _on_bg_expert_event(pid, ev))
+        app.state.bg_wake_subs[pid] = unsub
+
+    def _on_bg_expert_event(pid: str, ev: dict) -> None:
+        """总线回调（**同步**，跑在 worker 线程或主控收尾线程里）。
+
+        只做「筛 + 丢进一次性后台线程」，绝不在回调里起 LLM 轮：
+        - 触发点 1 的回调在 worker 线程里跑，阻塞会拖住 worker 的收尾落库；
+        - 触发点 2 的回调在**主控自己的收尾路径**里跑，起轮必然撞 409（那时
+          `chat_running` 还没摘除该 tid），而且会与自身 finally 死锁。
+        """
+        kind = str(ev.get("kind") or "")
+        if kind not in ("chat.expert.background_done", "chat.background_unread",
+                        "chat.expert.event", "chat.cmd.done"):
+            return
+        payload = ev.get("payload") or {}
+        tid = str(payload.get("thread_id") or "")
+        if not tid:
+            return
+        try:
+            threading.Thread(
+                target=_maybe_bg_expert_wake, name=f"bg-wake-{tid[-8:]}",
+                args=(pid, tid, kind, payload), daemon=True).start()
+        except Exception:  # noqa: BLE001 —— 补达失败不影响主控收尾
+            log.exception("后台结果补达唤醒提交失败 pid=%s tid=%s", pid, tid)
+        # 已穷尽子线程唤醒（ctf-exhausted-wake，2026-11-01 Nan 要求）：黑板上
+        # 新增发现 → 除唤醒主控外，自动唤醒该题目下「已穷尽收尾」的 idle 子
+        # 线程一轮（看新发现是否打开新路）。独立线程，与主控唤醒互不阻塞。
+        if str(payload.get("kind") or "") == "finding":
+            try:
+                threading.Thread(
+                    target=_wake_exhausted_siblings, name=f"exh-wake-{tid[-8:]}",
+                    args=(pid, tid, payload), daemon=True).start()
+            except Exception:  # noqa: BLE001 —— 唤醒失败不影响主路径
+                log.exception("已穷尽子线程唤醒提交失败 pid=%s tid=%s", pid, tid)
+
+    def _bg_wake_compose(proj, tid: str, kind: str, payload: dict):
+        """按 kind 生成补达文案 + 去重记账键（唤醒路径与池脉冲复查共用）。
+
+        无法补达（缺键 / 已记账唤醒过）→ 返回 None。去重键语义与旧逻辑一致：
+        触发点 1/3 单条键；触发点 2 批量逐条键（already_woken 检查用批量拼接键）。
+        """
+        from core.chat import background_wake as bg
+        if kind == "chat.expert.background_done":
+            cid = str(payload.get("tool_use_id") or "")
+            if not cid:
+                return None
+            if bg.already_woken(proj.bb, proj.id, cid):
+                return None
+            text = bg.done_text(
+                expert=str(payload.get("expert") or ""),
+                tool_use_id=cid,
+                result=str(payload.get("result_head") or ""),
+                controller_hint=_bg_wake_hint(proj, tid))
+            return text, [{"thread_id": tid, "tool_use_id": cid,
+                           "expert": str(payload.get("expert") or "")}]
+        if kind == "chat.expert.event":
+            cid = str(payload.get("tool_use_id") or "")
+            if not cid:
+                return None
+            if bg.already_woken(proj.bb, proj.id, cid):
+                return None
+            text = bg.progress_text(
+                kind=str(payload.get("kind") or "deliver"),
+                head=str(payload.get("head") or ""),
+                expert=str(payload.get("expert") or ""),
+                child_tid=str(payload.get("sub_thread_id") or ""),
+                controller_hint=_bg_wake_hint(proj, tid))
+            return text, [{"thread_id": tid, "tool_use_id": cid,
+                           "kind": str(payload.get("kind") or "")}]
+        # 后台命令完成（bg-cmd-done，2026-11-01 Nan 要求）：run_cmd 后台跑完
+        # → 唤醒主控读续写结果（主控正在跑则走 overflow 补达，不会走到这里）。
+        if kind == "chat.cmd.done":
+            cid = str(payload.get("tool_call_id") or "")
+            if not cid:
+                return None
+            if bg.already_woken(proj.bb, proj.id, cid):
+                return None
+            text = (f"〔后台命令完成〕job={str(payload.get('job') or '')}\n"
+                    f"结果已补达：{str(payload.get('result_head') or '')[:200]}\n"
+                    f"（全文见该工具结果 {cid}；继续手头的工作，按需使用这个结果。）")
+            return text, [{"thread_id": tid, "tool_use_id": cid, "cmd": True}]
+        # chat.background_unread：批量键检查、逐条记账
+        pend = [it for it in (payload.get("pending") or []) if isinstance(it, dict)]
+        key = "|".join(sorted(str(it.get("tool_use_id") or "") for it in pend))
+        if not key:
+            return None
+        if bg.already_woken(proj.bb, proj.id, key):
+            return None
+        text = bg.unread_text(pending=pend,
+                              controller_hint=_bg_wake_hint(proj, tid))
+        keys = [{"thread_id": tid, "tool_use_id": str(it.get("tool_use_id") or ""),
+                 "batch": True} for it in pend if it.get("tool_use_id")]
+        return text, keys
+
+    def _bg_wake_pending_register(pid: str, tid: str, kind: str, payload: dict) -> None:
+        """主控 running 时登记断候结果（2026-11-01）：池脉冲周期复查兜底用。
+
+        只登记事实、**不记账**（记账 = 已唤醒过，复查的 already_woken 会拦掉）。
+        批量键（触发点 2）加 "batch:" 前缀 + 排序拼接，复查按同口径回查。
+        """
+        if kind == "chat.background_unread":
+            cid = "batch:" + "|".join(sorted(
+                str(it.get("tool_use_id") or "") for it in (payload.get("pending") or [])
+                if isinstance(it, dict) and it.get("tool_use_id")))
+        else:
+            cid = str(payload.get("tool_use_id") or "")
+        if not cid:
+            return
+        pending = getattr(app.state, "bg_wake_pending", None)
+        if pending is None:
+            pending = {}
+            app.state.bg_wake_pending = pending
+        key = f"{tid}:{cid}"
+        pending[key] = {"pid": pid, "tid": tid, "kind": kind,
+                        "payload": payload, "at": time.time()}
+
+    def _bg_result_persisted(proj, tid: str, cid: str) -> bool:
+        """断候结果是否已真实落库（该 tool_use_id 存在非「[后台继续]」占位的行）。
+
+        占位（`_PROBE_PENDING`）先落库、真实结果以同 id **后写优先**续写——最后
+        一条 tool 行不以占位开头 ⇔ worker 已把真实结果写完。
+        """
+        try:
+            row = proj.bb.conn.execute(
+                "SELECT content FROM chat_messages WHERE thread_id=? AND role='tool'"
+                " AND tool_use_id=? ORDER BY id DESC LIMIT 1",
+                (tid, cid)).fetchone()
+        except Exception:  # noqa: BLE001 —— 读不到按未落库，下周期再看
+            return False
+        if row is None or not (row["content"] or ""):
+            return False
+        return not str(row["content"]).startswith("[后台继续]")
+
+    def _bg_wake_pending_retry(pid: str, proj, tid: str) -> None:
+        """池脉冲周期兜底（2026-11-01 唤醒盲区修复）：主控已 idle + 断候结果已
+        落库 + 未记账 → 补达唤醒。最坏延迟一个池脉冲周期（5 分钟）。
+
+        覆盖盲区：断候若落在轮次尾部，主控收尾后 overflow 随实例销毁，触发点
+        1（worker 完成时主控 running → skip）与触发点 2（收尾时结果未回 → 不广播）
+        双双错过——这里补上周期复查。主控还在跑 / 结果未落库 → 等下一周期。
+        """
+        from core.chat import background_wake as bg
+        from core.chat import store as chat_store
+        pending = getattr(app.state, "bg_wake_pending", None)
+        if not pending:
+            return
+        hits = [(k, v) for k, v in pending.items() if v.get("tid") == tid]
+        if not hits:
+            return
+        thread = chat_store.get_thread(proj.bb, tid)
+        if thread is None:
+            for k, _ in hits:
+                pending.pop(k, None)        # 线程已删 → 丢弃
+            return
+        if str(thread.get("status") or "") == "running":
+            return                          # 还在跑：等它自己的 overflow / 下周期
+        if _thread_recently_stopped(proj, tid):
+            return                          # 人工停止的会话不自动唤醒
+        for k, item in hits:
+            kind = str(item.get("kind") or "")
+            payload = item.get("payload") or {}
+            # 单条断候结果先确认真实落库（worker 没写完就等下一周期）
+            if kind != "chat.background_unread":
+                cid = str(payload.get("tool_use_id") or "")
+                if not cid or not _bg_result_persisted(proj, tid, cid):
+                    continue
+            composed = _bg_wake_compose(proj, tid, kind, payload)
+            if composed is None:
+                pending.pop(k, None)        # 已记账/缺键 → 不再需要兜底
+                continue
+            text, dedupe_keys = composed
+            try:
+                for d in dedupe_keys:
+                    proj.bb.append_event(pid, bg.WAKE_EVENT, d,
+                                         session_id=None, author="expert-bg-wake")
+            except Exception:  # noqa: BLE001 —— 记账失败不阻断唤醒
+                log.exception("后台结果补达复查记账失败 pid=%s tid=%s", pid, tid)
+            pending.pop(k, None)
+            try:
+                _chat_launch_turn(pid, tid, text)
+            except HTTPException:
+                continue                    # 撞闸退场窗口：已记账，宁少勿扰
+
+    def _maybe_bg_expert_wake(pid: str, tid: str, kind: str,
+                              payload: dict) -> str:
+        """后台线程里决定是否唤醒主控。返回 submitted/skip:* 便于测试断言。
+
+        **判断顺序很重要**（每一步都对应一种实测过的失败）：
+
+        1. 主控**还有活轮** → 跳过。它自己的 overflow 通道会在下一个步边界补达，
+           多起一轮就是重复上下文 + 白烧一次 LLM。
+        2. 同一条结果已唤醒过 → 跳过（`tool_use_id` 粒度，事件表记账，重启仍有效）。
+        3. 触发点 2 在主控收尾路径里触发，此刻它**仍**在收尾——必须等它真的
+           退出（`_chat_running_set` 摘除 + status 落 idle）再起轮，否则 409。
+           这里用短退避轮询，而不是「睡 N 秒赌它跑完了」。
+        """
+        from core.chat import background_wake as bg
+        from core.chat import store as chat_store
+        from core.chat.inbox import live_thread_ids
+
+        try:
+            proj = _project(pid)
+        except HTTPException:
+            return "skip:gone"
+
+        # 「主控是不是还会自己读到这些结果」的判据（2026-10-22 实测修正）。
+        #
+        # **只有 DB status 是准的**，另外两个信号都会误判：
+        # - `live_thread_ids()`（箱）比轮次活得久：`run()` 先在 try 里落
+        #   `status="idle"`，箱要到 finally 的 `_release_notice_box()` 才释放。
+        #   实测拿到过「status=idle + 箱还在」的瞬间——拿箱判「在跑」会让唤醒
+        #   静默失效，正是本 bug 的翻版。
+        # - `_chat_running_set()` 活得更久：只在 `_chat_launch_turn` 的 finally
+        #   里 discard，比箱还晚。同理不能当判据（但它会让起轮抛 409，见下）。
+        #
+        # 而 `status="running"` 恰好等价于「`_loop()` 还没返回」——overflow 只在
+        # 步边界 drain，`_loop` 一返回就再也不会 drain 了。所以这个判据与
+        # 「它还会不会自己读」是同一件事，不是近似。
+        thread = chat_store.get_thread(proj.bb, tid)
+        if thread is None:
+            return "skip:gone"
+        # 唤醒门闸（2026-11-01 Nan 要求）：CTF 轨上——
+        # - 题目已有人工确认的 flag（verdict=accepted）→ 不再有「新发现触发唤醒」
+        #   （子 agent 陆续收尾，进入人工确认阶段，别打扰）；
+        # - 题目已 solved（全部确认）→ 不再有任何自动唤醒（写 WP 阶段，避免
+        #   意外机制唤醒子线程/主控）。
+        if proj.track == "ctf":
+            if _ctf_challenge_has_confirmed_flag(proj, tid):
+                if kind == "chat.expert.event" \
+                        and str(payload.get("kind") or "") == "finding":
+                    return "skip:flag-confirmed"
+            if _ctf_challenge_ended(proj, tid):
+                return "skip:challenge-ended"
+        if thread.get("status") == "running":
+            # 真的在跑：它自己的 overflow 通道会在下一个步边界补达。
+            # **必须立刻返回**，不能等——真跑的轮次可能持续几十分钟。
+            # 但 2026-11-01 修复：断候若落在轮次尾部，主控收尾后 overflow 随
+            # 实例销毁，触发点 2 又因时序错过（worker 完成晚于收尾）——这条
+            # 结果再没人读。故登记**待补达**（不记账、不唤醒），由池脉冲周期
+            # 复查兜底（`_bg_wake_pending_retry`），最坏 5 分钟补达。
+            _bg_wake_pending_register(pid, tid, kind, payload)
+            return "skip:running:pending"
+
+        # 到这里 DB 已不是 running，但本轮可能还在退场（`run()` 落完 idle 之后
+        # 还有轮末 kb-iteration 等收尾工作，箱与 running 集合要到 finally 才清）。
+        # 起轮要过 `_chat_launch_turn` 的两道门（running 集合 + status），所以
+        # 先等残留信号清掉；**短退避轮询而不是「睡 N 秒赌」**：赌短了 409、
+        # 赌长了每次唤醒都白等，而「退场完了没」是可以直接观察的事实。
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if tid not in _chat_running_set() and tid not in live_thread_ids():
+                break
+            time.sleep(0.05)
+
+        # 文案 + 去重键统一由 `_bg_wake_compose` 生成（唤醒路径与池脉冲复查
+        # 共用同一套逻辑，避免两处口径漂移）。None = 缺键或已记账唤醒过。
+        composed = _bg_wake_compose(proj, tid, kind, payload)
+        if composed is None:
+            return "skip:empty"
+        text, dedupe_keys = composed
+
+        if not text:
+            return "skip:notext"
+        # 去重记账**先于**起轮：起轮失败也不重复唤醒（宁少勿扰；人还能手点）。
+        #
+        # 触发点 2 的 `dedupe_keys` 是**逐条 tool_use_id**（batch=True，见
+        # `_bg_wake_compose`）：两个触发点的去重键必须同源。记批量键而触发点
+        # 1 查单条 id，同一批结果会被叫醒两轮（一轮来自收尾时、一轮来自 worker
+        # 的完成事件）——主控凭空多跑一轮 LLM。逐条记 id 让两侧互相看得见。
+        try:
+            for d in dedupe_keys:
+                proj.bb.append_event(pid, bg.WAKE_EVENT, d,
+                                     session_id=None, author="expert-bg-wake")
+        except Exception:  # noqa: BLE001
+            log.exception("后台结果补达记账失败 pid=%s tid=%s", pid, tid)
+        # 起轮：**409 要重试**（2026-10-22 实测）。
+        #
+        # 上面的轮询只看得到「集合/箱」两个信号，而 `run()` 落 idle 之后还有
+        # 轮末收尾（kb-iteration 等）才进 finally；这段时间里 `_chat_launch_turn`
+        # 仍会按 running 集合抛 409（实测 `skip:http-409`，而那一刻 DB 明明是
+        # idle）。把 409 当失败返回，等于在这段窗口里静默丢掉唤醒——正是本 bug
+        # 要消灭的形态。所以 409 单独退避重试，其余 HTTP 码照旧如实返回。
+        try:
+            _chat_launch_turn(pid, tid, text)
+        except HTTPException as e:
+            return f"skip:http-{e.status_code}"
+        return "submitted"
+
+    def _bg_wake_hint(proj, tid: str) -> str:
+        """按收件人角色给出「接下来能做什么」（与 core 侧分叉同源）。
+
+        **必须按 agent_id 分叉而不是只看 track**：同一 CTF 项目里可能有
+        worker 线程也带着 `challenge_asset_id`，给 worker 发「走 ctf_dispatch」
+        是纯噪音（它没有该工具，调了必然报错）。
+        """
+        from core.chat import store as chat_store
+        from core.chat.runtime import (AGGRESSIVE_CONTROLLER_ID,
+                                       ARTEX_CONTROLLER_ID,
+                                       CTF_CONTROLLER_ID)
+        try:
+            row = chat_store.get_thread(proj.bb, tid) or {}
+        except Exception:  # noqa: BLE001 —— 读不到就不给提示（不影响补达本身）
+            return ""
+        aid = str(row.get("agent_id") or "")
+        if aid == CTF_CONTROLLER_ID:
+            return ("接下来按 CTF 池纪律走：保持 5 条线程在跑（池子有空位可派同一"
+                    "方向的第二条线程竞速「抽卡」，先拿到 flag 算数）；拿到 flag → "
+                    "`ctf_submit_flag` 登记；"
+                    "方向证伪 → 让负责它的专家把卡点写进收尾摘要，再 "
+                    "`ctf_dispatch` 提新方向（计划外方向可直接 call_expert，代码"
+                    "会补登记，只拦已判死/已解出/被占用的）；某条线程有新进展 → "
+                    "决定是否 `ctf_notify` 同步给相关线程；方向都做完、答案已登记"
+                    " → `ctf_conclude` 收尾；这题确实打不动 → `ctf_abandon`。")
+        if aid == ARTEX_CONTROLLER_ID:
+            return ("接下来用 artex_plan / artex_hint 把结论并进规划，或 "
+                    "artex_goal(action=\"prove\") 标记已达成目标。")
+        if aid == AGGRESSIVE_CONTROLLER_ID:
+            return ("接下来按先返先触发规则处置：`[命中]` → 立即对该方向派深挖"
+                    "专家；`[未命中]` → 放弃该方向，继续派下一批探针。")
+        return ""
+
+    app.state.bg_expert_wake = _maybe_bg_expert_wake   # 测试直调口
+    app.state.bg_expert_wake_attach = _attach_bg_expert_wake
+    app.state.bg_wake_pending_retry = _bg_wake_pending_retry  # 测试直调口
+
+    # ---------- CTF 线程池周期检查（ctf-pool-pulse-wake，2026-10-31） ----------
+    #
+    # Nan 要求：「每过 5 分钟检查一下池子，如果没有满 5 个就让 CTF 主控补；软提示，
+    # 不一定必须要求。」判据是 **running 子线程数 < 目标**——即使线程**总数**到顶
+    # （idle/退役线程占着名额），只要没在跑就该让线程忙起来或 retire 腾名额再派。
+    # 目标 = 分诊未决 1 条 / 分诊决后 5 条（与 runtime `_ctf_pool_target` 同口径）。
+    #
+    # 与 bg-wake 同款分工：这里是**周期轮询**（bg-wake 是事件驱动），因为「池子
+    # 持续没满」没有事件、只能定时看。只发软提示（〔系统补达〕渲染成系统消息），
+    # 主控 running 时跳过（它自己的 ctf_dispatch/review 回执带脉冲）。
+    _POOL_PULSE_INTERVAL_S = 300
+    # 缺口没变化时至少隔两个周期（10 分钟）再提醒一次——running 数变过（主控补过/
+    # 有线程跑完）才立即提醒，否则每 5 分钟刷屏纯打扰。
+    _POOL_PULSE_REMIND_S = 600
+    _POOL_PULSE_EVENT = "chat.pool_pulse"
+    _POOL_PULSE_TARGET = 5
+
+    def _ctf_pool_target(proj, tid: str) -> int:
+        """池目标 = 恒 `_POOL_PULSE_TARGET`（2026-11-01 Nan 要求）。
+
+        分诊已由主控自己做（识别类型 + 解压），不再派分诊子 agent——分诊期间
+        主控在跑、不占子线程名额，跑完直接派满 5 条解题子 agent，故不再区分
+        「分诊未决 1 / 决后 5」。
+        """
+        return _POOL_PULSE_TARGET
+
+    def _pool_pulse_should_skip(proj, pid: str, tid: str, running: int) -> bool:
+        """上次提示后缺口没变化且还没到提醒间隔 → 跳过（防每 5 分钟刷屏）。"""
+        try:
+            row = proj.bb.conn.execute(
+                "SELECT payload, created_at FROM events WHERE project_id=?"
+                " AND kind=? AND json_extract(payload, '$.thread_id')=?"
+                " ORDER BY id DESC LIMIT 1",
+                (pid, _POOL_PULSE_EVENT, tid)).fetchone()
+        except Exception:  # noqa: BLE001 —— 读不到就当没提示过，照常提醒
+            return False
+        if row is None:
+            return False
+        try:
+            payload = json.loads(row["payload"] or "{}")
+            last_running = int(payload.get("running") or -1)
+            last_at = payload.get("at") or 0.0
+        except (ValueError, TypeError):
+            return False
+        if last_running != running:
+            return False                      # 缺口有变化（主控补过/线程跑完）→ 提醒
+        if last_at and time.time() - float(last_at) < _POOL_PULSE_REMIND_S:
+            return True                       # 缺口没变且未到间隔 → 跳过
+        return False
+
+    def _pool_pulse_text(running: int, target: int, total: int, capped: bool) -> str:
+        from core.chat.background_wake import WAKE_TAG
+        lines = [f"{WAKE_TAG}线程池未满：当前 running {running} / 目标 {target} 条"]
+        if capped:
+            lines.append("子线程总数已到上限（8），但**正在跑的不足**——让空闲线程"
+                         "忙起来或清掉腾名额：同专家空闲直接 `call_expert(…, "
+                         "thread_id=…)` 续跑；已完成使命（分诊/判死）的线程系统会"
+                         "自动回收，也可用 `retire_expert` 手动清。")
+        else:
+            lines.append("池子有空缺：`ctf_review` 看方向，补派新方向或给现有方向"
+                         "加一条竞速线程（池子没满可同方向「抽卡」）。")
+        lines.append("**这是软提示，非强制**：所有方向都已探尽或正在收尾时忽略即可。")
+        return "\n".join(lines)
+
+    def _thread_recently_stopped(proj, tid: str) -> bool:
+        """线程最近一次收尾是「中断墓碑」（人工停止/进程重启中断）→ 不自动唤醒。
+
+        **为什么必须有**（2026-10-31 实测 bug）：用户点「停止」后线程落回 idle，
+        池脉冲 5 分钟一查就把它当成「可唤醒的空闲主控」又拉起来——用户明确要停
+        的会话自己又跑了。判据 = 最后一条 assistant 是平台写的中断墓碑
+        （`is_interrupt_note`，如「（已按人类要求停止本轮执行…）」）；之后用户
+        再发消息/正常收尾，最后一条不再是墓碑 → 恢复可唤醒。
+        """
+        try:
+            row = proj.bb.conn.execute(
+                "SELECT content FROM chat_messages WHERE thread_id=?"
+                " AND role='assistant' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+        except Exception:  # noqa: BLE001 —— 读不到按未停止（宁提示别静默）
+            return False
+        if row is None or not (row["content"] or ""):
+            return False
+        from core.chat import store as chat_store
+        return chat_store.is_interrupt_note(str(row["content"]))
+
+    def _ctf_challenge_ended(proj, tid: str) -> bool:
+        """主控绑定题目是否已终态（台账 solved）——已解出/已 conclude 的主控
+        不该再被池脉冲按全局池目标提示（2026-11-01 Nan 实测：drywell 已
+        ctf_conclude，池脉冲仍每 5 分钟提示「线程池未满」，主控自己都吐槽
+        「这条池子提示对本题失效」）。判据与 runtime `_solved_challenge_block`
+        同口径（`challenge_state.solved`），避免两处撕裂。"""
+        try:
+            from core.blackboard.challenge_flags import challenge_state
+            from core.chat import store as chat_store
+            cid = chat_store.resolve_challenge_asset_id(proj.bb, tid)
+            if not cid:
+                return False
+            return bool(challenge_state(proj.bb, proj.id, cid).get("solved"))
+        except Exception:  # noqa: BLE001 —— 读不到按未终态（宁提示不静默）
+            return False
+
+    def _ctf_challenge_has_confirmed_flag(proj, tid: str) -> bool:
+        """该主控绑定题目是否已有人工确认的 flag（verdict=accepted）。
+
+        2026-11-01 Nan 要求：一旦有人工确认的 flag，就不再有「新发现触发唤醒」
+        的机制——子 agent 已陆续收尾，进入人工确认/写 WP 阶段，别让自动唤醒
+        打扰。判定比「题目已 solved」更早触发（多 flag 题确认一条即生效）。
+        """
+        try:
+            from core.chat import store as chat_store
+            cid = chat_store.resolve_challenge_asset_id(proj.bb, tid)
+            if not cid:
+                return False
+            row = proj.bb.conn.execute(
+                "SELECT 1 FROM challenge_flags WHERE challenge_id=? AND verdict='accepted'"
+                " LIMIT 1", (cid,)).fetchone()
+            return row is not None
+        except Exception:  # noqa: BLE001 —— 读不到按无确认 flag（保持唤醒）
+            return False
+
+    def _thread_summary_exhausted(bb, tid: str) -> bool:
+        """该线程最后一条 assistant 收尾摘要是否以「穷尽」收尾（2026-11-01）。
+
+        与 runtime `ChatTurn._subagent_exhausted` 同口径：只认收尾标记（穷尽 /
+        无路可走 / [未命中] 放弃），普通进展文本不算——穷尽 = 该 agent 认为
+        无路可走，需要黑板上新发现唤醒一轮重新评估。
+        """
+        try:
+            rows = bb.conn.execute(
+                "SELECT content FROM chat_messages WHERE thread_id=? AND role='assistant'"
+                " AND content!='' ORDER BY id DESC LIMIT 1", (tid,)).fetchall()
+        except Exception:  # noqa: BLE001 —— 读不到按未穷尽（不唤醒）
+            return False
+        if not rows:
+            return False
+        s = str(rows[0]["content"] or "")
+        return ("穷尽" in s or "无路可走" in s or "已无路" in s
+                or ("[未命中]" in s and "放弃" in s))
+
+    def _wake_exhausted_siblings(pid: str, ctl_tid: str, payload: dict) -> None:
+        """黑板上新增发现 → 唤醒该题目下已穷尽收尾的 idle 子线程一轮（2026-11-01）。
+
+        只作用于：CTF 轨 + 题目还没有人工确认的 flag（确认后进入人工阶段不打扰）、
+        也未 solved。唤醒 = 给子线程起一轮，注入新发现让它评估是否打开新路；
+        若仍判穷尽，收尾后等下一次新发现再评估。去重键 = 发现工具调用 id +
+        子线程（同一发现不会反复唤醒同一条线程）。
+        """
+        from core.chat import store as chat_store
+        from core.chat import background_wake as bg
+        try:
+            proj = _project(pid)
+        except HTTPException:
+            return
+        if proj.track != "ctf":
+            return
+        if _ctf_challenge_has_confirmed_flag(proj, ctl_tid):
+            return
+        if _ctf_challenge_ended(proj, ctl_tid):
+            return
+        try:
+            children = chat_store.list_children(proj.bb, pid, ctl_tid)
+        except Exception:  # noqa: BLE001 —— 读不到就当没有可唤醒对象
+            log.exception("已穷尽子线程清单读取失败 ctl=%s", ctl_tid)
+            return
+        base = str(payload.get("tool_use_id") or "") or "finding"
+        head = str(payload.get("head") or "")[:200]
+        for c in children:
+            sid = str(c.get("id") or "")
+            if not sid or str(c.get("status") or "") != "idle":
+                continue
+            if not _thread_summary_exhausted(proj.bb, sid):
+                continue
+            ckey = f"{base}:exh:{sid}"
+            if bg.already_woken(proj.bb, proj.id, ckey):
+                continue
+            try:
+                proj.bb.append_event(pid, bg.WAKE_EVENT,
+                                     {"thread_id": sid, "tool_use_id": ckey,
+                                      "expert": str(c.get("agent_id") or "")},
+                                     session_id=None, author="expert-bg-wake")
+            except Exception:  # noqa: BLE001 —— 记账失败不阻断尝试
+                log.exception("已穷尽唤醒记账失败 sid=%s", sid)
+            try:
+                _chat_launch_turn(
+                    pid, sid,
+                    f"〔黑板新发现〕题目黑板上出现了新发现（{head}）——检查它是否"
+                    "为你的解题打开新路：相关则继续，不相关则保持收尾，不必重复工作。")
+            except HTTPException:
+                continue  # 409（刚退场/在跑）跳过；下一次新发现再评估
+            except Exception:  # noqa: BLE001 —— 单条唤醒失败不影响其余
+                log.exception("已穷尽子线程唤醒失败 sid=%s", sid)
+
+    def _pool_pulse_check(pid: str, proj) -> None:
+        """检查一个项目里的所有 CTF 主控线程：running < 目标 → 软提示（含运行中的主控）。"""
+        from core.chat import store as chat_store
+        from core.chat.runtime import CTF_CONTROLLER_ID, _MAX_CHILD_THREADS
+        try:
+            threads = chat_store.list_threads(proj.bb, pid, agent_id=CTF_CONTROLLER_ID)
+        except Exception:  # noqa: BLE001 —— 列表读失败跳过该项目
+            return
+        for th in threads:
+            tid = str(th.get("id") or "")
+            if not tid:
+                continue
+            # 该主控关闭了池脉冲开关（前端按钮）→ 跳过
+            if not th.get("pool_pulse_on", True):
+                continue
+            # 最近被人工停止/进程中断 → 用户明确不要它自动跑，不唤醒
+            if _thread_recently_stopped(proj, tid):
+                continue
+            # 题目已终态（solved/concluded，2026-11-01 Nan 实测）：主控已
+            # ctf_conclude 收尾，池脉冲仍按全局池目标提示「线程池未满」纯噪音。
+            # 与手动停止同语义：不再自动打扰，等人类丢新题/新消息再说。
+            if _ctf_challenge_ended(proj, tid):
+                continue
+            try:
+                running = chat_store.count_running_children(proj.bb, pid, tid)
+            except Exception:  # noqa: BLE001 —— 数不出来跳过
+                continue
+            target = _ctf_pool_target(proj, tid)
+            if running >= target:
+                continue
+            if _pool_pulse_should_skip(proj, pid, tid, running):
+                continue
+            try:
+                total = chat_store.count_children(proj.bb, pid, tid)
+            except Exception:  # noqa: BLE001 —— 总数拿不到按未到顶
+                total = 0
+            text = _pool_pulse_text(running, target, total,
+                                    capped=total >= int(_MAX_CHILD_THREADS))
+            running_now = (str(th.get("status") or "") == "running"
+                           or tid in _chat_running_set())
+            if running_now:
+                # **运行中也要告诉它**（2026-10-31 Nan 要求）：投递箱 + 落库 user
+                # 消息（与 ask_expert 对 running 线程的排队投递同口径）——主控在
+                # 下一个可读点读到，不打断当前轮。
+                try:
+                    chat_store.append_message(proj.bb, tid, "user", text)
+                except Exception:  # noqa: BLE001 —— 落库失败不阻断投递
+                    log.exception("ctf 池脉冲投递落库失败 tid=%s", tid)
+                try:
+                    from core.chat import inbox as chat_inbox
+                    chat_inbox.post(tid, text)
+                except Exception:  # noqa: BLE001 —— 投递失败不阻断（落库已兜底）
+                    log.exception("ctf 池脉冲投递箱失败 tid=%s", tid)
+            else:
+                try:
+                    _chat_launch_turn(pid, tid, text)
+                except HTTPException:
+                    continue                       # 起轮撞闸（退场窗口）→ 下个周期再看
+            try:
+                proj.bb.append_event(
+                    pid, _POOL_PULSE_EVENT,
+                    {"thread_id": tid, "running": running, "target": target,
+                     "at": time.time()},
+                    session_id=None, author="ctf-pool-pulse")
+            except Exception:  # noqa: BLE001 —— 记账失败不影响提示本身
+                log.exception("ctf 池脉冲记账失败 pid=%s tid=%s", pid, tid)
+            # 待补达兜底复查（2026-11-01 唤醒盲区修复）：主控收尾后 worker 才
+            # 完成的结果，触发点 1/2 双双错过——这里借池脉冲周期兜底唤醒。
+            # 必须放在所有 continue 之后：开关关/人工停止/池已满等跳过语义一致。
+            try:
+                _bg_wake_pending_retry(pid, proj, tid)
+            except Exception:  # noqa: BLE001 —— 复查失败不影响池脉冲本身
+                log.exception("ctf 待补达复查失败 pid=%s tid=%s", pid, tid)
+
+    def _pool_pulse_loop() -> None:
+        while not app.state.pool_pulse_stop.wait(_POOL_PULSE_INTERVAL_S):
+            try:
+                for pid, proj in list(app.state.projects.items()):
+                    try:
+                        _pool_pulse_check(pid, proj)
+                    except Exception:  # noqa: BLE001 —— 单项目失败不拖垮整轮
+                        log.exception("ctf 池脉冲检查失败 pid=%s", pid)
+            except Exception:  # noqa: BLE001 —— 循环兜底，永不退出
+                log.exception("ctf 池脉冲周期检查异常")
+
+    app.state.pool_pulse_stop = threading.Event()
+    app.state.pool_pulse_thread = threading.Thread(
+        target=_pool_pulse_loop, name="ctf-pool-pulse", daemon=True)
+    app.state.pool_pulse_thread.start()
+
+    def _pool_pulse_shutdown() -> None:
+        app.state.pool_pulse_stop.set()
+
+    _add_shutdown_handler(_pool_pulse_shutdown)
+    app.state.pool_pulse_check = _pool_pulse_check   # 测试直调口
+    app.state.pool_pulse_target = _ctf_pool_target   # 纯逻辑直调口（测试）
+    app.state.pool_pulse_skip = _pool_pulse_should_skip
+    app.state.pool_pulse_text = _pool_pulse_text
+    app.state.pool_pulse_stopped = _thread_recently_stopped
+    app.state.pool_pulse_challenge_ended = _ctf_challenge_ended  # 纯逻辑直调口（测试）
+    app.state.pool_pulse_attach = lambda pid, proj: None  # 无事件订阅，直调口即可
+
+
+    def _sweep_restarted_project(proj: Project) -> None:
+        """重启纪律（§3）：单进程部署下进程重启=内存态清零，项目在本进程首次
+        打开时归位陈旧状态——① 孤儿 claimed 任务统一 fail(awaiting_human
+        「后端重启，任务中断」，看板出「待人工/放回继续」，不自动重跑；
+        v0.64 豁免：持有落盘暂停快照的会话其 claimed 任务保留，等「继续」
+        断点续跑)；② 排水未竟（close_pending）的会话补关窗（关窗请求是人
+        下达的，照常执行）；③ 陈旧 running/blocked 会话行按 meta 归位：有落盘
+        快照回 paused 可续跑、指针悬空（文件缺）清指针回 idle；paused 是合法
+        持久态不动；④ 重启即急停（2026-09-28）：全部 worker_armed 一律解除
+        ——armed 是常驻自动接活的持久开关，不清则 kick 链把陈旧会话当待命窗
+        重新拉起（青灯常亮+后台烧 LLM）；人工「跑任务队列/▶继续」重新点亮；
+        ⑤ 会话继续钮（2026-09-28）：有落盘快照（现场可续）的会话**一律**归位
+        paused（不限 running/blocked）——idle+快照+claimed 组合此前落盲区
+        （灰点无继续钮、任务无续跑钮、跑队列撞暂停闸空退，现场卡死）。"""
+        bb = proj.bb
+        # v0.64 暂停快照豁免：claimed 任务属于「resume_snapshot 指针 + 快照文件
+        # 双双在场」的会话（暂停/预算/停机自动暂停）时不 fail——保留 claimed 等
+        # 「▶ 继续」从断点续跑（run_next_task 快照分支要求 status=="claimed"）。
+        # 指针在但文件缺失视为无快照：不豁免、行归 idle，防「paused 但载不回
+        # 快照、任务悬挂」的死态。
+        snap_dir = Path(proj.path) / "snapshots"
+        keep: set[str] = set()
+        for row in bb.list_sessions(proj.id):
+            if row.get("status") == "closed":
+                continue
+            meta = json.loads(row["meta"]) if isinstance(row["meta"], str) \
+                else (row["meta"] or {})
+            ptr = meta.get("resume_snapshot")
+            if ptr and (snap_dir / str(ptr)).is_file():
+                keep.add(row["id"])
+        for row in bb.list_sessions(proj.id):
+            if row.get("status") == "closed":
+                continue
+            meta = json.loads(row["meta"]) if isinstance(row["meta"], str) \
+                else (row["meta"] or {})
+            try:
+                # 2026-09-28 重启即急停：worker_armed 是「常驻自动接活」持久开关，
+                # 进程重启后内存 worker 全灭，残留 armed 会让任何 kick 触发点把
+                # 陈旧 running 会话当待命窗重新拉起（页签青灯常亮 + 后台自动烧
+                # LLM）——一律解除武装；恢复=人工「跑任务队列」/「▶继续」（两者
+                # 都会重新点亮 armed，恢复流程不受影响）
+                if meta.get("worker_armed"):
+                    bb.set_session_meta(row["id"], {"worker_armed": False})
+                if meta.get("close_pending"):
+                    bb.close_session(row["id"])
+                    continue  # 已关窗，不再归位
+                # 2026-09-28 会话继续钮（清扫归位盲区修复）：有落盘快照（现场可续）
+                # 的会话一律归位 paused——此前只对 running/blocked 行按快照归位，
+                # idle+快照+claimed 任务的组合（重启前已 idle 但留有暂停快照，
+                # fail_interrupted_claims 按快照豁免保留 claimed）落进盲区：会话
+                # 灰点无「▶继续」、任务 claimed 无「⚡续跑」、跑任务队列又撞
+                # rehydrate 暂停闸空退，现场白白卡死。归 paused 后前端自然显示
+                # 「已暂停」+「▶继续」，resume_session 载快照从断点续跑
+                ptr = meta.get("resume_snapshot")
+                if ptr and (snap_dir / str(ptr)).is_file():
+                    bb.set_session_status(row["id"], "paused")
+                elif row.get("status") in {"running", "blocked"}:
+                    if ptr:  # 指针悬空（文件缺失）→ 清掉再归 idle
+                        bb.set_session_meta(row["id"], {"resume_snapshot": None})
+                    bb.set_session_status(row["id"], "idle")
+            except ValueError:
+                continue  # 并发首开时已被另一路径归位
+        # ⑥ chat 僵尸轮清扫（2026-09-30 误报修复）：原挂在 GET /api/projects/{pid}
+        # 每次调用都执行且不核对 chat_running——执行中刷新页面会把活轮误判僵尸、
+        # 落「⚠ 进程重启，本轮执行中断」误报。挪进本钩子（本进程首次打开该项目
+        # 才执行一次，重启语义正确），并传 _chat_running_set() 双保险：集合内的
+        # 活轮跳过不杀（_chat_running_set 定义在下方，运行时查找无前向问题）
+        from core.chat import store as chat_store
+        recovered = chat_store.recover_running_threads(proj.bb, _chat_running_set())
+        if recovered:
+            log.info("chat 僵尸线程清扫: %s", recovered)
+
+    def _rev_service(proj: Project):
+        """研究工作台的 headless 反编译服务（项目级复用）。
+
+        项目独立目录：缓存在 artifacts/decompiler-cache，IDA 库在 artifacts/decompiler-db，
+        Ghidra 临时工程在 artifacts/ghidra-tmp（均不进 samples/ 的 untrusted 只读语义）。
+        headless 是可信解析（只解析不执行样本），走 host + 网关审计，超时 900s。
+        """
+        cached_svc = app.state.rev_services.get(proj.id)
+        if cached_svc is not None:
+            return cached_svc
+        factory = app.state.rev_service_factory
+        if factory is not None:
+            svc = factory(proj)
+        else:
+            from core.tools.decompiler import (
+                build_headless_service, gateway_runner, resolve_headless_timeout,
+                select_mcp_endpoint)
+
+            gateway = ExecutionGateway(bb=proj.bb)
+            runner = gateway_runner(
+                gateway, project_id=proj.id, session_id="rev-workbench",
+                author="human", timeout=resolve_headless_timeout(),
+                workspace=_exec_workspace(proj))
+            svc = build_headless_service(
+                proj.artifacts_dir / "decompiler-cache",
+                runner=runner,
+                global_cache_dir=app.state.decompiler_cache_dir,
+                ida_db_dir=proj.artifacts_dir / "decompiler-db",
+                ghidra_tmp_dir=proj.artifacts_dir / "ghidra-tmp",
+                resident_ghidra_worker=True,
+                # MCP 实时桥：config/mcp.json 逆向域 http server，无配置默认
+                # http://127.0.0.1:13337/mcp 懒探活（Ctrl-Alt-M 起插件即亮灯）
+                mcp_endpoint=select_mcp_endpoint(_load_mcp_config()),
+            )
+        app.state.rev_services[proj.id] = svc
+        return svc
+
+    # ---------- 逆向工作台辅助（研究轨 rev profile，DESIGN.md §12） ----------
+
+    SAMPLE_MAX_BYTES = 256 * 1024 * 1024
+    # 大样本阈值（2026-09-29 用户口径）：>20MB headless 全量导出（自动分析+
+    # 全量反编译）耗时可能很久——前端「开始分析」二次确认并建议走 IDA 拉取
+    SAMPLE_LARGE_BYTES = 20 * 1024 * 1024
+    # 自动分析体积上限（单一真相源 core/tools/decompiler.py，2026-10-13 用户口径）：
+    # ≥10MB 样本 headless 全量分析会拖垮时间——「开始分析」与 Agent 点查（IdaMcpManager）
+    # 都拒自动分析，引导改走「从 IDA 拉取函数」（前端同口径 SAMPLE_AUTO_MAX_BYTES）。
+    from core.tools.decompiler import SAMPLE_AUTO_MAX_BYTES
+    DEBUGLOG_MAX_BYTES = 16 * 1024 * 1024
+    # 附件配额见模块级 ATTACHMENT_MAX_BYTES / ATTACHMENT_CHUNK_BYTES 等常量
+    # （2026-10-25 上提：测试要能引用同一份真相，前端分片大小也要跟它对齐）。
+    PACKER_ENTROPY = 7.2
+    _BAD_NAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+    _WIN_RESERVED = re.compile(r"(?i)^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)")
+
+    def _utc_now() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def _safe_upload_name(raw: str) -> str:
+        """上传文件名清洗：basename + 去非法字符/控制符/NUL + Windows 保留名 + 限长。"""
+        name = os.path.basename((raw or "").replace("\\", "/")).strip()
+        name = _BAD_NAME_CHARS.sub("_", name).strip(" .")
+        if not name or _WIN_RESERVED.match(name):
+            raise HTTPException(422, f"非法文件名: {raw!r}")
+        if len(name) > 120:
+            p = Path(name)
+            name = p.stem[: 120 - len(p.suffix)] + p.suffix
+        return name
+
+    def _inside(proj: Project, *parts: str) -> Path:
+        """项目内相对路径 → resolve；越界 422（防穿越，样本/产物共用）。"""
+        base = Path(proj.path).resolve()
+        target = (base / Path(*parts)).resolve()
+        if not target.is_relative_to(base):
+            raise HTTPException(422, f"路径越界: {parts}")
+        return target
+
+    def _spool_upload(file: UploadFile, max_bytes: int) -> tuple[tempfile.SpooledTemporaryFile, str, int]:
+        """流式落临时文件 + 边写边算 sha256；超限 413、空文件 422。"""
+        h = hashlib.sha256()
+        size = 0
+        spool = tempfile.SpooledTemporaryFile(max_size=1 << 22)
+        while True:
+            chunk = file.file.read(1 << 20)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_bytes:
+                spool.close()
+                raise HTTPException(413, f"文件超过 {max_bytes // (1024 * 1024)}MB 上限")
+            h.update(chunk)
+            spool.write(chunk)
+        if size == 0:
+            spool.close()
+            raise HTTPException(422, "空文件")
+        spool.seek(0)
+        return spool, h.hexdigest(), size
+
+    def _triage_running(pid: str, sha: str) -> bool:
+        return any(
+            j["status"] == "running"
+            and j["meta"].get("project_id") == pid
+            and j["meta"].get("triage_sha") == sha
+            for j in app.state.jobs.all_jobs()
+        )
+
+    def _run_binary_triage(pid: str, sha: str, binary_path: Path,
+                           progress: dict | None = None,
+                           stop: threading.Event | None = None) -> dict:
+        """零 LLM 后台分诊：headless 全量导出→缓存；无工具结构化降级（不报错）。
+
+        progress/stop（大样本 P3）：导出带分片进度；stop 置位即协作式停止并保留已导出
+        部分（partial 缓存只展示不发布全局，重跑「开始分析」补全）。
+        """
+        from core.tools.decompiler import DECOMPILE_GUIDANCE
+
+        proj = _project(pid)
+        bb, svc = proj.bb, _rev_service(proj)
+        if not svc.headless_backends():
+            payload = {"sha": sha, "reason": "no-tool", "guidance": DECOMPILE_GUIDANCE}
+            bb.append_event(pid, "binary.triage_failed", payload, author="human")
+            return {"status": "no-tool", **payload}
+        try:
+            data, info = svc.export_to_cache(str(binary_path),
+                                             progress=progress, stop_event=stop,
+                                             engine=_binary_engine(proj, sha))
+        except Exception as e:  # noqa: BLE001 —— Job 失败也要留黑板痕迹
+            bb.append_event(pid, "binary.triage_failed",
+                            {"sha": sha, "reason": "export-failed",
+                             "error": f"{type(e).__name__}: {e}"[:400]},
+                            author="human")
+            raise
+        stopped = bool(info.get("stopped"))
+        funcs = data.get("functions") or []
+        sections = data.get("sections") if isinstance(data.get("sections"), list) else []
+        imports = data.get("imports") if isinstance(data.get("imports"), dict) else {}
+        max_ent = max((s.get("entropy") or 0.0) for s in sections) if sections else None
+        packer = max_ent is not None and max_ent > PACKER_ENTROPY
+        rel_db = _db_rel(proj, sha)
+        asset = bb.find_asset(pid, "binary", sha)
+        if asset:
+            bb.update_asset_meta(asset["id"], {"triage": {
+                "backend": info.get("name"),
+                "function_count": len(funcs),
+                "packer_suspect": packer,
+                "max_entropy": max_ent,
+                "import_modules": len(imports),
+                "import_count": sum(len(v) for v in imports.values()),
+                "db_path": rel_db,
+                "triaged_at": _utc_now(),
+                **({"partial": True} if stopped else {}),
+            }})
+        bb.append_event(pid, "binary.triaged",
+                        {"sha": sha, "backend": info.get("name"),
+                         "function_count": len(funcs), "packer_suspect": packer,
+                         **({"stopped": True} if stopped else {})},
+                        author="human")
+        res = {"status": "stopped" if stopped else "ok", "sha": sha,
+               "function_count": len(funcs), "backend": info.get("name")}
+        if stopped:
+            res["hint"] = (f"已停止：已导出 {len(funcs)} 个函数（部分伪码可能缺失，"
+                           "已保留可见），重新「开始分析」可补全")
+        return res
+
+    def _submit_triage(proj: Project, sha: str, binary_path: Path) -> str:
+        if _triage_running(proj.id, sha):
+            raise HTTPException(409, "该样本正在分诊中")
+        # progress 可变 dict 塞进 job meta（引用共享）→ 前端轮询带出；stop Event 经
+        # export_cancel[sha] 供取消端点置位（协作式停，保留已导出部分）
+        progress: dict = {"done": 0, "total": 0, "phase": "starting",
+                          "stoppable": False}
+        stop = threading.Event()
+        app.state.export_cancel[sha] = stop
+        return app.state.jobs.submit(
+            "binary-triage",
+            lambda: _run_binary_triage(proj.id, sha, binary_path, progress, stop),
+            meta={"project_id": proj.id, "triage_sha": sha, "sha": sha,
+                  "progress": progress},
+        )
+
+    def _rev_job_running(pid: str, sha: str, kind: str) -> bool:
+        """同项目同样本的同类 rev Job 防重（triage/writeback/pull-names）。"""
+        return any(
+            j["status"] == "running" and j["kind"] == kind
+            and j["meta"].get("project_id") == pid and j["meta"].get("sha") == sha
+            for j in app.state.jobs.all_jobs()
+        )
+
+    _DELETE_STOP_TIMEOUT = 60.0
+
+    def _binary_jobs_running(pid: str, sha: str) -> bool:
+        """该样本是否仍有在跑的 Job（分诊 triage_sha / 拉取·写回·导入等 sha）。"""
+        return any(
+            j["status"] == "running"
+            and j["meta"].get("project_id") == pid
+            and (j["meta"].get("sha") == sha or j["meta"].get("triage_sha") == sha)
+            for j in app.state.jobs.all_jobs()
+        )
+
+    def _stop_binary_jobs(pid: str, sha: str) -> None:
+        """请求协作式停止该样本的在跑 Job：置 export_cancel（Ghidra 分诊）与
+        pull_cancel（IDA 拉取页间检查）。IDA headless 全量导出不支持中断——只能等。"""
+        for ev in (app.state.export_cancel.get(sha), app.state.pull_cancel.get(sha)):
+            if ev is not None:
+                ev.set()
+
+    def _run_binary_writeback(pid: str, sha: str, items: list[dict]) -> dict:
+        """func_kb → IDA .i64 写回（零 LLM）。非 ok 状态结构化返回，前端按状态给文案。"""
+        proj = _project(pid)
+        bb, svc = proj.bb, _rev_service(proj)
+        res = svc.writeback(sha, items)
+        if res.get("status") == "ok":
+            bb.append_event(pid, "binary.annotated",
+                            {"sha": sha, "applied": res.get("applied", 0)},
+                            author="human")
+        return res
+
+    def _submit_writeback(proj: Project, sha: str, items: list[dict]) -> str:
+        if _rev_job_running(proj.id, sha, "binary-writeback"):
+            raise HTTPException(409, "该样本正在写回中")
+        return app.state.jobs.submit(
+            "binary-writeback",
+            lambda: _run_binary_writeback(proj.id, sha, items),
+            meta={"project_id": proj.id, "sha": sha},
+        )
+
+    def _run_pull_names(pid: str, sha: str) -> dict:
+        """IDA GUI 手改名 → func_kb：库内重导（不删库）→ 纯函数 diff → patch_func 入史。"""
+        from core.tools.decompiler import diff_pulled_names
+
+        proj = _project(pid)
+        bb, svc = proj.bb, _rev_service(proj)
+        res = svc.refresh_db_cache(sha)
+        if res.get("status") != "ok":
+            return res  # locked / no-db / no-tool / unsupported：无事件，前端提示
+        changed = diff_pulled_names(res["data"], bb.list_funcs(pid, sha))
+        for ch in changed:
+            bb.patch_func(pid, ch["func_id"], name=ch["new_name"], author="ida-pull")
+        pairs = [{"address": c["address"], "old_name": c["old_name"],
+                  "new_name": c["new_name"]} for c in changed]
+        bb.append_event(pid, "binary.names_pulled", {"sha": sha, "changed": pairs},
+                        author="human")
+        return {"status": "ok", "changed": pairs}
+
+    def _submit_pull_names(proj: Project, sha: str) -> str:
+        if _rev_job_running(proj.id, sha, "binary-pull-names"):
+            raise HTTPException(409, "该样本正在同步改名中")
+        return app.state.jobs.submit(
+            "binary-pull-names",
+            lambda: _run_pull_names(proj.id, sha),
+            meta={"project_id": proj.id, "sha": sha},
+        )
+
+    PULL_PAGE = 1000  # list_funcs 每页函数数（每页刷一次进度 + 落一次部分缓存）
+
+    def _run_pull_ida_functions(pid: str, sha: str, progress: dict | None = None,
+                                cancel: threading.Event | None = None) -> dict:
+        """GUI IDA MCP → 轻量缓存（断点续拉，2026-09-30）：count_funcs 先拿总数
+        做进度分母（旧插件无此工具→None，进度退化为无分母）；list_funcs 分页
+        遍历（配惰性分页插件，1000/页），每页 progress 更新（job meta 可变 dict
+        → 前端轮询可见）+ 部分缓存落盘（左栏渐进长出）；停止/翻页失败保住已拉
+        部分（partial 缓存），再点拉取从 next_offset 续传（count_funcs 对账，
+        总数变了自动从头）。diff 回拉在完成与停止时都做（IDA 人工名 > AI 名 >
+        自动名，自动名绝不覆盖）。"""
+        from core.tools.decompiler import MCPBackend, diff_pulled_names
+
+        proj = _project(pid)
+        bb, svc = proj.bb, _rev_service(proj)
+        if svc.mcp is None or not svc.mcp_online():
+            return {"status": "no-mcp",
+                    "hint": "未检测到 IDA MCP server——在 IDA 中打开样本后按 "
+                            "Ctrl-Alt-M 启动插件（仅连本机 127.0.0.1:13337）"}
+        total = svc.mcp.count_funcs()
+
+        # 断点续拉：已有 ida-mcp 部分缓存 → 从 next_offset 继续；总数对账防
+        # 错位（IDA 重分析/连了别的库）——不一致时旧部分不可信，自动从头重拉
+        functions: list[dict] = []
+        offset, restarted = 0, False
+        data = svc.read_cached(sha)
+        if data is not None:
+            meta = data.get("meta") or {}
+            if meta.get("source") == "ida-mcp" and meta.get("partial"):
+                if total is not None and meta.get("total_functions") != total:
+                    restarted = True
+                else:
+                    functions = list(data.get("functions") or [])
+                    offset = int(meta.get("next_offset") or len(functions))
+
+        stopped = False
+        while True:
+            if cancel is not None and cancel.is_set():
+                stopped = True  # 已拉部分上轮已落盘，直接收尾
+                break
+            pages = svc.mcp.call_tool(MCPBackend.T_LIST_FUNCS, {"queries": [
+                {"offset": offset, "count": PULL_PAGE, "filter": ""}]})
+            rows = pages[0].get("data") if isinstance(pages, list) and pages \
+                and isinstance(pages[0], dict) else None
+            if rows is None:
+                if offset == 0 and not functions:
+                    return {"status": "no-mcp",
+                            "hint": "IDA MCP 在线但 list_funcs 不可用"
+                                    "（插件版本过旧？）"}
+                stopped = True  # 中途翻页失败：保住已拉部分
+                break
+            # 本页新增行（前端轮询增量 append 用，≤PULL_PAGE 不胀 meta；断点续拉
+            # 从 offset 起步，本页行即 offset 之后新拉的，前端按 address 去重兜底）
+            page_rows: list[dict] = []
+            for f in rows:
+                try:  # vendor Function 是 hex 字符串；坏行跳过不拖垮整次拉取
+                    fn = {"address": int(str(f.get("addr")), 16),
+                          "name": str(f.get("name") or ""),
+                          "size": int(str(f.get("size") or "0x0"), 16)}
+                    functions.append(fn)
+                    page_rows.append({"address": hex(fn["address"]),
+                                      "name": fn["name"], "size": fn["size"],
+                                      "has_pseudo": False, "n_calls": 0})
+                except (ValueError, TypeError):
+                    continue
+            nxt = pages[0].get("next_offset")
+            done = nxt is None or nxt <= offset or len(functions) > 500_000
+            binary_name = (bb.find_asset(pid, "binary", sha)
+                           or {}).get("meta", {}).get("filename") or ""
+            # 每页落盘：partial 缓存（渐进可见 + 断点）；完成页 partial=False
+            svc.import_ida_mcp_cache(sha, functions, binary_name=binary_name,
+                                     partial=not done, total=total,
+                                     next_offset=None if done else int(nxt))
+            if progress is not None:
+                progress.update(pulled=len(functions), total=total,
+                                rows=page_rows)
+            if done:
+                break
+            offset = int(nxt)
+
+        data = svc.read_cached(sha) or {"functions": functions}
+        changed = diff_pulled_names(data, bb.list_funcs(pid, sha))
+        for ch in changed:
+            bb.patch_func(pid, ch["func_id"], name=ch["new_name"],
+                          author="ida-pull")
+        pairs = [{"address": c["address"], "old_name": c["old_name"],
+                  "new_name": c["new_name"]} for c in changed]
+        bb.append_event(pid, "binary.pulled_from_ida",
+                        {"sha": sha, "function_count": len(functions),
+                         "changed": pairs, "stopped": stopped}, author="human")
+        if stopped:
+            pos = f"{len(functions)}/{total}" if total is not None \
+                else f"{len(functions)}"
+            return {"status": "stopped", "sha": sha, "pulled": len(functions),
+                    "total": total, "changed": pairs,
+                    "hint": f"已停止：已拉 {pos} 个函数（已生效），"
+                            "再次拉取将从断点继续"}
+        res = {"status": "ok", "sha": sha, "function_count": len(functions),
+               "total": total, "changed": pairs}
+        if restarted:
+            res["hint"] = "IDA 库与上次拉取不一致（函数总数变了），已自动从头重拉"
+        return res
+
+    def _submit_pull_ida_functions(proj: Project, sha: str) -> str:
+        if _rev_job_running(proj.id, sha, "binary-pull-ida-functions"):
+            raise HTTPException(409, "该样本正在从 IDA 拉取中")
+        # progress 是可变 dict：塞进 job meta（引用共享），Job 循环里逐页 update
+        # → 前端 GET /api/jobs/{id} 轮询自动带出，零新增端点；cancel Event 页间检查
+        progress: dict = {"pulled": 0, "total": None}
+        cancel = threading.Event()
+        app.state.pull_cancel[sha] = cancel
+        return app.state.jobs.submit(
+            "binary-pull-ida-functions",
+            lambda: _run_pull_ida_functions(proj.id, sha, progress, cancel),
+            meta={"project_id": proj.id, "sha": sha, "progress": progress},
+        )
+
+    def _run_push_names_to_ida(pid: str, sha: str) -> dict:
+        """func_kb 有效命名 → GUI IDA（反向，2026-09-29）：AI/人工分析成果批量
+        rename 写回当前库（自动名不推）；writeback_items 只改 GUI 内存库不落盘
+        ——完成后提示用户在 IDA 里保存（库存活由用户掌控，与 writeback 同纪律）。"""
+        from core.tools.decompiler import is_auto_name
+
+        proj = _project(pid)
+        bb, svc = proj.bb, _rev_service(proj)
+        if svc.mcp is None or not svc.mcp_online():
+            return {"status": "no-mcp",
+                    "hint": "未检测到 IDA MCP server——在 IDA 中打开样本后按 "
+                            "Ctrl-Alt-M 启动插件（仅连本机 127.0.0.1:13337）"}
+        items = [{"address": hex(int(f["address"])), "name": f["name"]}
+                 for f in bb.list_funcs(pid, sha)
+                 if f.get("name") and not is_auto_name(f["name"])]
+        if not items:
+            return {"status": "ok", "applied": 0,
+                    "hint": "func_kb 无有效命名（只有自动名）——无可同步"}
+        res = svc.mcp.writeback_items(items)
+        if res is None:
+            return {"status": "no-mcp", "hint": "IDA MCP 写回失败（离线/拒连）"}
+        bb.append_event(pid, "binary.names_pushed",
+                        {"sha": sha, "applied": res.get("applied", 0)},
+                        author="human")
+        return {"status": "ok", "applied": res.get("applied", 0),
+                "results": res.get("results") or [],
+                "hint": "已写入 IDA 当前库（内存）——请在 IDA 中保存数据库落盘"}
+
+    def _submit_push_names_to_ida(proj: Project, sha: str) -> str:
+        if _rev_job_running(proj.id, sha, "binary-push-names"):
+            raise HTTPException(409, "该样本正在同步命名中")
+        return app.state.jobs.submit(
+            "binary-push-names",
+            lambda: _run_push_names_to_ida(proj.id, sha),
+            meta={"project_id": proj.id, "sha": sha},
+        )
+
+    def _run_import_ida_db(pid: str, sha: str, path: str) -> dict:
+        """外部 IDA 库（.i64/.idb）→ 项目 db_dir + 库内重导为缓存（免 MCP 回拉一整轮）。"""
+        proj = _project(pid)
+        bb, svc = proj.bb, _rev_service(proj)
+        res = svc.import_ida_db(sha, path)
+        if res.get("status") == "ok":
+            bb.append_event(pid, "binary.db_imported",
+                            {"sha": sha, "functions": res.get("functions", 0)},
+                            author="human")
+        return res  # locked/no-tool/unsupported/error：结构化返回，不发事件
+
+    def _submit_import_ida_db(proj: Project, sha: str, path: str) -> str:
+        if _rev_job_running(proj.id, sha, "binary-import-ida-db"):
+            raise HTTPException(409, "该样本正在导入 IDA 库中")
+        return app.state.jobs.submit(
+            "binary-import-ida-db",
+            lambda: _run_import_ida_db(proj.id, sha, path),
+            meta={"project_id": proj.id, "sha": sha},
+        )
+
+    def _run_import_export(pid: str, sha: str, path: str) -> dict:
+        """外部 headless 全量导出 JSON → 本地缓存（免重跑 IDA/Ghidra headless）。"""
+        proj = _project(pid)
+        bb, svc = proj.bb, _rev_service(proj)
+        res = svc.import_export_json(sha, path)
+        if res.get("status") == "ok":
+            bb.append_event(pid, "binary.export_imported",
+                            {"sha": sha, "functions": res.get("functions", 0)},
+                            author="human")
+        return res  # 低契约/读取失败：结构化返回，不发事件
+
+    def _submit_import_export(proj: Project, sha: str, path: str) -> str:
+        if _rev_job_running(proj.id, sha, "binary-import-export"):
+            raise HTTPException(409, "该样本正在导入导出 JSON 中")
+        return app.state.jobs.submit(
+            "binary-import-export",
+            lambda: _run_import_export(proj.id, sha, path),
+            meta={"project_id": proj.id, "sha": sha},
+        )
+
+    def _run_reexport_db(pid: str, sha: str) -> dict:
+        """直读项目内既有 IDA 库重导缓存（不删库、不含改名 diff；大样本后台跑）。
+
+        只回计数，绝不把整份全量导出塞进 job 结果（几十 MB 级，会胀 job 存储）。
+        """
+        proj = _project(pid)
+        bb, svc = proj.bb, _rev_service(proj)
+        res = svc.refresh_db_cache(sha)
+        if res.get("status") == "ok":
+            n = len((res.get("data") or {}).get("functions") or [])
+            bb.append_event(pid, "binary.db_reexported",
+                            {"sha": sha, "functions": n}, author="human")
+            return {"status": "ok", "sha": sha, "functions": n}
+        return {k: v for k, v in res.items() if k != "data"}  # locked/no-db/... 去大字段
+
+    def _submit_reexport_db(proj: Project, sha: str) -> str:
+        if _rev_job_running(proj.id, sha, "binary-reexport-db"):
+            raise HTTPException(409, "该样本正在重导缓存中")
+        return app.state.jobs.submit(
+            "binary-reexport-db",
+            lambda: _run_reexport_db(proj.id, sha),
+            meta={"project_id": proj.id, "sha": sha},
+        )
+
+    def _db_rel(proj: Project, sha: str) -> str | None:
+        """IDA 数据库相对路径（9.x .i64/.idb 按目标位宽，在 decompiler-db/ 下）。"""
+        d = Path(proj.artifacts_dir) / "decompiler-db"
+        for ext in (".i64", ".idb"):
+            p = d / f"{sha}{ext}"
+            if p.exists():
+                return str(p.relative_to(proj.path)).replace("\\", "/")
+        return None
+
+    def _package_store() -> SamplePackageStore:
+        return app.state.sample_packages
+
+    def _project_workspace(proj: Project) -> Path:
+        """项目级执行工作区（2026-10-24 / 2026-10-30 口径）。
+
+        优先级：`meta["workspace"]`（项目级「工作区」设置，仍存在则用之）
+        → 关联目录包（用户自选的大文件夹，即本项目的执行根）→ 项目工作区。
+        目录不可用时逐级回退，存量项目零影响。
+        """
+        ws = str(proj.meta.get("workspace") or "").strip()
+        if ws:
+            try:
+                if Path(ws).is_dir():
+                    return Path(ws)
+            except OSError:
+                pass
+        try:
+            linked = _package_store().exec_workspace(proj.path)
+        except Exception:  # noqa: BLE001 —— 包元数据损坏不得让会话开不起来
+            log.exception("解析执行工作区失败 project=%s", proj.id)
+            linked = None
+        return Path(linked) if linked is not None else Path(proj.path)
+
+    def _thread_workspace(proj: Project, thread: dict | None) -> Path | None:
+        """线程级工作区（v55，2026-11-02）：沿 parent_thread_id 向上找显式设置。
+
+        子专家线程自己不落路径（`workspace=''`），父主控改目录后自动跟随；
+        父链都没有显式值 → None（交回项目级解析）。
+        """
+        from core.chat import store as chat_store
+        cur = thread
+        for _ in range(8):  # 防脏数据成环；spawn 深度本身是 1
+            if not cur:
+                return None
+            ws = str(cur.get("workspace") or "").strip()
+            if ws:
+                try:
+                    p = Path(ws)
+                    if p.is_dir():
+                        return p
+                except OSError:
+                    pass
+            parent = str(cur.get("parent_thread_id") or "").strip()
+            if not parent:
+                return None
+            cur = chat_store.get_thread(proj.bb, parent)
+        return None
+
+    def _exec_workspace(proj: Project, thread: dict | None = None) -> Path:
+        """执行工作区（2026-10-24「选择分析包 = 工作区」；2026-10-30 项目级；
+        2026-11-02 线程级）。
+
+        优先级：线程显式目录 → 父主控线程显式目录（逐级向上）→ 项目级
+        （meta.workspace → 关联目录包 → 项目工作区）。目录不可用时逐级回退。
+
+        只换**执行根**（cwd/scratch/pathguard 边界）；平台自有数据目录（黑板、
+        快照、decompiler 缓存、sample_packages 元数据）仍固定在 `proj.path`——
+        那些是平台不变量，不能随用户目录漂移，也不能被写进用户的原始目录。
+        """
+        if thread is not None:
+            p = _thread_workspace(proj, thread)
+            if p is not None:
+                return p
+        return _project_workspace(proj)
+
+    def _package_target_job_running(pid: str, package_id: str,
+                                    version_id: str, target_id: str) -> bool:
+        return any(
+            job.get("status") == "running"
+            and job.get("kind") == "sample-target-analysis"
+            and job.get("meta", {}).get("project_id") == pid
+            and job.get("meta", {}).get("package_id") == package_id
+            and job.get("meta", {}).get("version_id") == version_id
+            and job.get("meta", {}).get("target_id") == target_id
+            for job in app.state.jobs.all_jobs()
+        )
+
+    def _sample_job_key(package_id: str, version_id: str, target_id: str) -> str:
+        return f"{package_id}/{version_id}/{target_id}"
+
+    def _sample_package_jobs_running(pid: str, package_id: str) -> bool:
+        return any(
+            job.get("status") == "running"
+            and job.get("kind") == "sample-target-analysis"
+            and job.get("meta", {}).get("project_id") == pid
+            and job.get("meta", {}).get("package_id") == package_id
+            for job in app.state.jobs.all_jobs()
+        )
+
+    def _stop_sample_package_jobs(pid: str, package_id: str) -> None:
+        """Request cooperative cancellation for every target analysis in a package."""
+        for job in app.state.jobs.all_jobs():
+            meta = job.get("meta", {})
+            if (job.get("status") == "running"
+                    and job.get("kind") == "sample-target-analysis"
+                    and meta.get("project_id") == pid
+                    and meta.get("package_id") == package_id):
+                key = str(meta.get("sample_cancel_key") or "")
+                event = app.state.sample_cancel.get(key)
+                if event is not None:
+                    event.set()
+
+    def _register_package_binary_asset(proj: Project, package: dict[str, Any],
+                                       target: dict[str, Any],
+                                       sha: str, size: int) -> dict[str, Any]:
+        """把分析包 PE/ELF/Mach-O 目标登记为 legacy binary 工作台的资产（**不复制文件**）。
+
+        包内容树是**项目内内容寻址存储**（`<project>/trees/<manifest_sha256>/`），
+        不可变、同项目内跨包复用——绝不复制进 `samples/`（复制重复占空间，且丢失同包
+        依赖布局）。资产 `meta` 记包坐标 + **包内相对路径**（`path`）；文件定位交
+        `_sample_path` 经包坐标 `resolve_target` 还原为项目内容树绝对路径。AI 侧由
+        `bb_query what=package` 读同包条目/依赖边，解决「exe 依赖同包 DLL 找不到」。
+        """
+        meta = {
+            "filename": Path(str(target.get("path") or "sample.bin")).name,
+            "size": size,
+            "path": str(target.get("path") or ""),   # 包内相对路径（非项目相对）
+            "source": "sample-package",
+            "package_id": package.get("package_id"),
+            "version_id": package.get("version_id"),
+            "target_id": target.get("target_id"),
+        }
+        existing = proj.bb.find_asset(proj.id, "binary", sha)
+        if existing is not None:
+            proj.bb.update_asset_meta(existing["id"], meta)
+            return proj.bb.find_asset(proj.id, "binary", sha) or existing
+        result = proj.bb.upsert_asset(proj.id, "binary", sha, meta=meta, author="human")
+        return proj.bb.find_asset(proj.id, "binary", sha) or {"id": result["id"], **meta}
+
+    def _run_sample_target_analysis(pid: str, package_id: str, version_id: str,
+                                    target_id: str, engine: str,
+                                    progress: dict[str, Any],
+                                    stop: threading.Event | None = None) -> dict[str, Any]:
+        """Run one registered static analyzer and persist only its report."""
+        from core.sample_packages import (
+            analyze_registered_target,
+            sha256_file as package_sha256_file,
+        )
+
+        proj = _project(pid)
+        package_store: SamplePackageStore = _package_store()
+        package, target, binary_path = package_store.resolve_target(
+            proj.path, package_id, version_id, target_id)
+        if stop is not None and stop.is_set():
+            raise RuntimeError("样本分析已取消")
+        actual_sha, actual_size = package_sha256_file(binary_path)
+        if (not package.get("linked")
+                and (actual_sha != target.get("sha256")
+                     or actual_size != int(target.get("size") or -1))):
+            # 上传包的内容树是**不可变**的，sha 对不上只可能是内容树被外部篡改
+            # ——必须拒绝（报告会记错 sha，下游资产/缓存全部错位）。
+            #
+            # 关联目录包（2026-10-24）**故意不校验**（用户口径「不校验，信任快照」）：
+            # 那个目录是用户自己的工作区，文件随时会被改/被工具生成，一改就拒分析
+            # 等于把「选择分析包 = 工作区」变成只读摆设。改为**以实际内容为准**——
+            # 报告与资产都用 actual_sha/size，快照 sha 只留在 manifest 里供对照，
+            # 不会出现「报告 sha 与文件不符」的错位。
+            raise RuntimeError("分析包内容已变化，拒绝分析")
+        analyzers = list(target.get("analyzers") or [])
+        report: dict[str, Any] = {
+            "package_id": package_id,
+            "version_id": version_id,
+            "target_id": target_id,
+            "path": target.get("path"),
+            "sha256": actual_sha,
+            "format": target.get("format"),
+            "platform": target.get("platform"),
+            "analyzers": analyzers,
+            "status": "recognized",
+            "started_at": _utc_now(),
+        }
+        if "binary-static" in analyzers and str(target.get("format") or "") in {"pe", "elf", "mach-o"}:
+            asset = _register_package_binary_asset(
+                proj, package, target, actual_sha, actual_size)
+            report["binary_sha256"] = actual_sha
+            report["binary_asset_id"] = asset.get("id")
+        progress["phase"] = "recognized"
+        plugin_report = analyze_registered_target(binary_path, target)
+        if stop is not None and stop.is_set():
+            raise RuntimeError("样本分析已取消")
+        if plugin_report is not None:
+            report.update({
+                "status": "ok",
+                "completed_at": _utc_now(),
+                **plugin_report,
+            })
+            package_store.write_target_analysis(
+                proj.path, package_id, version_id, target_id, report)
+            proj.bb.append_event(pid, "sample.target.analyzed", {
+                "package_id": package_id, "version_id": version_id,
+                "target_id": target_id, "status": report["status"],
+                "analyzer": plugin_report.get("analyzer"),
+            }, author="human")
+            progress["phase"] = "done"
+            return report
+        if "binary-static" not in analyzers:
+            report.update({
+                "status": "analyzer-unavailable",
+                "message": "目标已识别，但对应静态分析器尚未接入",
+                "completed_at": _utc_now(),
+            })
+            package_store.write_target_analysis(
+                proj.path, package_id, version_id, target_id, report)
+            proj.bb.append_event(pid, "sample.target.analyzed", {
+                "package_id": package_id, "version_id": version_id,
+                "target_id": target_id, "status": report["status"],
+            }, author="human")
+            return report
+        svc = _rev_service(proj)
+        if not svc.headless_backends():
+            report.update({
+                "status": "no-tool",
+                "message": "IDA/Ghidra headless 不可用",
+                "completed_at": _utc_now(),
+            })
+            package_store.write_target_analysis(
+                proj.path, package_id, version_id, target_id, report)
+            proj.bb.append_event(pid, "sample.target.analysis_failed", {
+                "package_id": package_id, "version_id": version_id,
+                "target_id": target_id, "reason": "no-tool",
+            }, author="human")
+            return report
+        progress["phase"] = "headless"
+        try:
+            data, info = svc.export_to_cache(
+                str(binary_path), engine=engine, progress=progress, stop_event=stop)
+        except TypeError as exc:
+            # Keep injected/third-party decompiler adapters that predate the
+            # cooperative control parameters usable.  Real services expose
+            # both keywords; only signature mismatches take this fallback.
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            data, info = svc.export_to_cache(str(binary_path), engine=engine)
+        if stop is not None and stop.is_set():
+            raise RuntimeError("样本分析已取消")
+        sections = data.get("sections") if isinstance(data.get("sections"), list) else []
+        imports = data.get("imports") if isinstance(data.get("imports"), dict) else {}
+        funcs = data.get("functions") if isinstance(data.get("functions"), list) else []
+        report.update({
+            "status": "ok",
+            "backend": info.get("name"),
+            "engine": engine,
+            "function_count": len(funcs),
+            "section_count": len(sections),
+            "import_modules": len(imports),
+            "import_count": sum(len(v) for v in imports.values()),
+            "cache_sha256": actual_sha,
+            "db_path": info.get("db_path"),
+            "completed_at": _utc_now(),
+        })
+        package_store.write_target_analysis(
+            proj.path, package_id, version_id, target_id, report)
+        proj.bb.append_event(pid, "sample.target.analyzed", {
+            "package_id": package_id, "version_id": version_id,
+            "target_id": target_id, "status": report["status"],
+            "function_count": report.get("function_count", 0),
+            "backend": report.get("backend"),
+        }, author="human")
+        progress["phase"] = "done"
+        return report
+
+    def _write_upload_temp(upload: UploadFile, max_bytes: int, *,
+                           allow_empty: bool = False) -> Path:
+        """Stream an untrusted upload to a temporary file without buffering it.
+
+        ``allow_empty``（文件夹/追加上传）：0 字节文件是**合法的目录成员**——压缩包
+        导入路径本就允许空文件（见 sample_packages._extract_zip），多选文件夹里只要
+        有一个空文件（.gitkeep / 空 __init__.py / desktop.ini 等）此前会让**整批**
+        上传 422「空文件」失败。单文件上传仍拒绝空文件（无意义上传）。"""
+        handle = tempfile.NamedTemporaryFile(prefix="sample-upload-", suffix=".part", delete=False)
+        path = Path(handle.name)
+        size = 0
+        try:
+            while True:
+                chunk = upload.file.read(1 << 20)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise HTTPException(413, f"上传文件超过 {max_bytes // (1024 * 1024)}MB 上限")
+                handle.write(chunk)
+            if size == 0 and not allow_empty:
+                raise HTTPException(422, "空文件")
+            handle.close()
+            return path
+        except Exception:
+            handle.close()
+            path.unlink(missing_ok=True)
+            raise
+
+    def _sample_upload_dir(proj: Project, upload_id: str) -> Path:
+        if not re.fullmatch(r"[0-9a-f]{24}", upload_id):
+            raise HTTPException(422, "非法上传会话 ID")
+        return _inside(proj, "sample_uploads", upload_id)
+
+    def _sample_upload_meta(proj: Project, upload_id: str) -> tuple[Path, dict]:
+        root = _sample_upload_dir(proj, upload_id)
+        path = root / "metadata.json"
+        if not path.is_file():
+            raise HTTPException(404, "上传会话不存在")
+        try:
+            return root, json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise HTTPException(409, "上传会话元数据损坏") from exc
+
+    # ---------- 附件分片续传（2026-10-25） ----------
+    #
+    # 与 sample_uploads 平行的**另一套**会话目录（`attachment_uploads/`）：
+    # 两边 complete 的产物不同（一个 import_source 出分析包，一个原样落
+    # artifacts/attachments 注册 artifact），共用目录会让"这个 upload_id 到底
+    # 完成成什么"要靠 metadata 猜。分开后各自 glob 自己的 .part 即可。
+
+    def _attachment_upload_dir(proj: Project, upload_id: str) -> Path:
+        if not re.fullmatch(r"[0-9a-f]{24}", upload_id):
+            raise HTTPException(422, "非法上传会话 ID")
+        return _inside(proj, "attachment_uploads", upload_id)
+
+    def _attachment_upload_meta(proj: Project, upload_id: str) -> tuple[Path, dict]:
+        root = _attachment_upload_dir(proj, upload_id)
+        path = root / "metadata.json"
+        if not path.is_file():
+            raise HTTPException(404, "上传会话不存在")
+        try:
+            return root, json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise HTTPException(409, "上传会话元数据损坏") from exc
+
+    def _write_attachment_upload_meta(root: Path, metadata: dict) -> None:
+        """metadata.json 原子替换：分片 PUT 是并发的，读到半个 JSON 会 409 误判。"""
+        temp = root / "metadata.json.tmp"
+        temp.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, root / "metadata.json")
+
+    def _received_attachment_chunks(root: Path) -> list[int]:
+        return sorted(int(p.stem) for p in (root / "chunks").glob("*.part") if p.stem.isdigit())
+
+    def _purge_stale_attachment_uploads(proj: Project) -> None:
+        """清理过期会话（刷新/关标签会留半截分片）。best-effort，失败不影响上传。"""
+        base = Path(proj.path) / "attachment_uploads"
+        if not base.is_dir():
+            return
+        cutoff = time.time() - ATTACHMENT_UPLOAD_TTL_SECONDS
+        for entry in base.iterdir():
+            try:
+                if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                continue
+
+    def _finalize_attachment(proj: Project, assembled: Path, name: str, sha: str,
+                            size: int) -> dict:
+        """把已合并的临时文件登记为 kind=attachment 的 artifact（去重 → 落盘 → 建行）。
+
+        单请求端点与分片 `complete` **共用这一个出口**，否则两条路的去重语义、
+        文件名清洗、meta 形状会随着后续改动慢慢漂移。
+        """
+        dup = proj.bb.find_artifact_by_sha(proj.id, sha, kind="attachment")
+        if dup is not None:
+            old_meta = _loads_meta(dup)
+            return {"id": dup["id"], "path": dup["path"], "name": name,
+                    "size": int(old_meta.get("size") or size), "sha256": sha}
+        out_dir = _inside(proj, "artifacts", "attachments")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        final = out_dir / f"{sha[:12]}_{name}"
+        with open(assembled, "rb") as src, open(final, "wb") as dst:
+            shutil.copyfileobj(src, dst, 1 << 20)
+        rel = str(final.relative_to(Path(proj.path))).replace("\\", "/")
+        art_id = proj.bb.add_artifact(
+            proj.id, rel, kind="attachment", description=name, sha256=sha,
+            meta={"original_name": name, "size": size}, author="human")
+        return {"id": art_id, "path": rel, "name": name, "size": size, "sha256": sha}
+
+    def _parse_hex_addr(addr: str) -> int:
+        try:
+            return int(addr, 16)
+        except ValueError as e:
+            raise HTTPException(422, f"地址需为 hex: {addr}") from e
+
+    def _hex_func_view(row):
+        """func_kb 出口视图：address int→hex 字符串（JS Number 无 64 位精度，§9 地址纪律）。
+
+        只补响应不改库内表示；入参 int/hex 兼收（FuncCreateIn 校验器）。
+        """
+        if isinstance(row, dict) and isinstance(row.get("address"), int):
+            return {**row, "address": hex(row["address"])}
+        return row
+
+    def _sample_path(proj: Project, sha: str) -> Path | None:
+        """样本文件绝对路径。**项目内样本**=资产 meta.path（相对项目根）；**分析包登记
+        样本**（meta.source=="sample-package"）在**项目内容树** `<project>/trees/`，经
+        包坐标 `resolve_target` 还原。缺路径/越界/包缺失一律返回 None。"""
+        asset = proj.bb.find_asset(proj.id, "binary", sha)
+        meta = (asset.get("meta") or {}) if asset else {}
+        if meta.get("source") == "sample-package" and meta.get("package_id"):
+            try:
+                _, _, path = _package_store().resolve_target(
+                    proj.path, str(meta["package_id"]),
+                    meta.get("version_id"), meta.get("target_id"))
+                return path
+            except Exception:  # noqa: BLE001 —— 包/条目缺失一律当缺失
+                return None
+        rel = meta.get("path")
+        if not rel:
+            return None
+        try:
+            return _inside(proj, rel)
+        except Exception:  # noqa: BLE001 —— 越界/异常一律当缺失
+            return None
+
+    def _binary_engine(proj: Project, sha: str) -> str:
+        """样本配置的反编译引擎（asset meta.engine，缺省 ida；2026-10-01 双模式）。"""
+        from core.tools.decompiler import normalize_engine
+        asset = proj.bb.find_asset(proj.id, "binary", sha)
+        return normalize_engine((asset.get("meta") or {}).get("engine") if asset else None)
+
+    def _purge_sample_files(proj: Project, sha: str,
+                            blob: Path | None = None) -> list[str]:
+        """物理清理单样本的项目内磁盘产物（2026-10-01 样本删除；best-effort）。
+
+        删：samples/<本体>（blob 由调用方在删资产行前解析传入，**仅项目内**——分析包
+        登记样本的 blob 在项目内容树 `<project>/trees/` 或原始物 `<project>/raw/` 里，
+        护栏跳过不删）；decompiler-cache/
+        {sha}.json + {sha}.details/ + {sha}.annotations.json；decompiler-db/<sha>
+        (.i64/.idb + 锁文件)；ghidra-tmp/ghidra-<sha>/。**全局 data/decompiler-cache
+        跨项目共享，不动**。单项失败只记日志不抛——DB 行已删，残留文件不应阻断删除
+        语义。返回已删路径清单。
+        """
+        removed: list[str] = []
+        service = app.state.rev_services.get(proj.id)
+        if service is not None:
+            try:
+                service.close()
+            except Exception:
+                log.exception("关闭反编译 Worker 失败 project=%s", proj.id)
+
+        def _rm(p: Path) -> None:
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                elif p.exists():
+                    p.unlink()
+                if not p.exists():
+                    removed.append(str(p))
+            except OSError as e:
+                log.warning("样本清理失败 %s: %s", p, e)
+
+        if blob is not None:
+            # 护栏：只删**项目内样本本体**——分析包登记样本的文件在项目内容树
+            # `<project>/trees/`（内容寻址、可被同项目其它包复用、不可变）或原始上传物
+            # `<project>/raw/` 里，删它会破坏包内容，绝不动。
+            try:
+                resolved = blob.resolve()
+                project = Path(proj.path).resolve()
+                in_project = (resolved.is_relative_to(project)
+                              and not resolved.is_relative_to(project / "trees")
+                              and not resolved.is_relative_to(project / "raw"))
+            except OSError:
+                in_project = False
+            if in_project:
+                _rm(blob)
+        cache_dir = Path(proj.artifacts_dir) / "decompiler-cache"
+        _rm(cache_dir / f"{sha}.json")
+        _rm(cache_dir / f"{sha}.details")
+        _rm(cache_dir / f"{sha}.disasm")
+        _rm(cache_dir / f"{sha}.analysis.db")
+        _rm(cache_dir / f"{sha}.annotations.json")
+        db_dir = Path(proj.artifacts_dir) / "decompiler-db"
+        for ext in (".i64", ".idb", ".id0", ".id1", ".id2", ".nam", ".til"):
+            _rm(db_dir / f"{sha}{ext}")
+        _rm(Path(proj.artifacts_dir) / "ghidra-tmp" / f"ghidra-{sha}")
+        return removed
+
+    def _require_cache(proj: Project, sha: str) -> dict:
+        data = _rev_service(proj).read_cached(sha)
+        if data is None:
+            raise HTTPException(409, "样本尚未完成 headless 分诊（缓存缺席）")
+        return data
+
+    def _tool_lamp(proj: Project, backend_name: str, cached: bool) -> str:
+        """三态：installed=后端可用；cached=仅缓存可读；off。"""
+        if any(b.name == backend_name for b in _rev_service(proj).headless_backends()):
+            return "installed"
+        return "cached" if cached else "off"
+
+    def _task_type_table(pid: str) -> dict[str, str]:
+        """项目轨的 task_type 注册表（{type: 默认噪声}，含内置 generic）。"""
+        return load_task_types(app.state.packs_root, _project(pid).track)
+
+    def _registered_session_factory(pid: str, exec_llm, plan_llm):
+        """开窗工厂：返回即注册进 app.state.agents（编排开窗与人开窗同路径，
+        杜绝只在 Orchestrator 内存态存活的孤儿窗——孤儿窗点跑队列 404、暂停失效）。
+
+        existing_session 给定时走 rehydrate（服务重启后从黑板 sessions 行附着，
+        不新建行）；角色 yaml 按当盘文件重载，纯内存的暂停快照无法恢复。"""
+        proj = _project(pid)
+        inventory = app.state.inventory
+
+        def factory(role: str, session_name: str | None = None,
+                    existing_session: dict | None = None,
+                    max_steps: int | None = None,
+                    provider: str | None = None,
+                    model: str | None = None) -> AgentSession:
+            from core.tools.decompiler import (
+                build_headless_service, gateway_runner, resolve_headless_timeout)
+
+            gateway = ExecutionGateway(
+                bb=proj.bb, containers=app.state.session_containers)
+            r = load_expert(app.state.packs_root, role, proj.track)
+            # 轨级行为语义（R2，§6.9 mode 退役）：redteam 轨注入红队语义 + ROE 摘要
+            # （ROE 未核验齐全=按 pentest 上限兜底+提示补全）；其余轨注入影响证明级上限。
+            cfg = proj.bb.get_project(pid)["config"] or {}
+            from core.autonomy import roe_complete
+            track = proj.track
+            roe = cfg.get("redteam_roe") or {}
+            mode_prompt = ""
+            if track == "redteam" and roe_complete(roe):
+                mode_prompt = (
+                    "## 行动边界：红队行动（redteam 轨）\n"
+                    "本会话在红队 ROE 授权范围内行动：允许主动利用未认领目标（§6.3 第 3 级"
+                    "在 ROE 范围内放开），以打穿 mission 判据为目标；仍禁：超出 ROE 目标、"
+                    "破坏性毁伤、安全红线（审批/审计照常）。\n"
+                    f"- ROE 授权目标: {roe.get('targets', '-')}\n"
+                    f"- 时间窗口: {roe.get('window', '-')}\n"
+                    f"- 禁止事项: {roe.get('exclusions', '-')}\n"
+                    f"- 授权人: {roe.get('approver', '-')}\n")
+            elif track == "redteam":
+                mode_prompt = (
+                    "## 行动边界：红队行动（redteam 轨，ROE 未核验）\n"
+                    "ROE 四要素尚未填写齐全，本会话行为按渗透测试上限兜底："
+                    "验证上限=影响证明级（如 SQL 注入读敏感表/RCE 一次性回显）；"
+                    "禁驻留/持久化/横向/提权推进；请提醒人类在直播间补全 ROE 以解锁红队行动。")
+            else:
+                mode_prompt = (
+                    "## 行动边界：渗透测试（pentest 轨）\n"
+                    "验证上限=影响证明级（如 SQL 注入读敏感表/RCE 一次性回显）；"
+                    "禁驻留/持久化/横向/提权推进；主动利用未认领目标默认禁止（发现即上报）。")
+            # D10 策略顾问项目级配置（2026-09-24）：缺省段补代码默认；三整数
+            # 透传 AgentConfig；provider/model 覆写本会话 planner（顾问建议/裁决/
+            # 收尾复盘三消费点同时生效）。必须在 factory() 内层——外层会污染
+            # Orchestrator 自身的 plan_llm。
+            from core.autonomy import ADVISOR_DEFAULTS
+            adv = {**ADVISOR_DEFAULTS, **(cfg.get("advisor") or {})}
+            session_plan_llm = plan_llm
+            session_exec_llm = exec_llm
+            if provider or model:
+                try:
+                    session_exec_llm = app.state.llm_store.build(provider or "", model or None)
+                except Exception as e:
+                    raise ValueError(f"供应商/模型不可用: {e}") from e
+            # 覆写回退可见化（2026-09-30）：坏值静默回退保留（绝不开窗失败），但补落
+            # llm.fallback 事件——此前只有后端 log.warning，用户对「本次实际跑的是别
+            # 的模型」完全无感。会话 id 尚未就绪（AgentSession 还没建），先攒记录，
+            # 建好统一带 session_id 落库。
+            llm_fallbacks: list[dict[str, Any]] = []
+            if adv.get("provider") and plan_llm is not None:
+                try:
+                    session_plan_llm = app.state.llm_store.build(
+                        adv["provider"], adv.get("model"))
+                except Exception as e:  # noqa: BLE001
+                    # 供应商后变更（删除/停用/删模型）致坏值 → 静默回退全局 planner，
+                    # 绝不开窗失败
+                    log.warning(
+                        "项目顾问模型覆写构建失败，回退全局 planner: pid=%s %s", pid, e)
+                    session_plan_llm = plan_llm
+                    llm_fallbacks.append({
+                        "source": "advisor",
+                        "requested": {"provider": adv.get("provider"),
+                                      "model": adv.get("model")},
+                        "fallback": {"model": getattr(plan_llm, "model", None)},
+                        "reason": str(e)[:300]})
+            # 项目 executor 覆写（TRAE 新壳 M3，2026-09-25）：cfg.executor_llm
+            # 非空时本项目新开/重附着窗的 executor 按覆写构建，坏值静默回退全局
+            # executor（与 advisor 同口径；在跑窗的即时切换走专用 PUT 端点）。
+            exec_ov = cfg.get("executor_llm") or {}
+            session_exec_llm = exec_llm
+            if isinstance(exec_ov, dict) and str(exec_ov.get("provider") or "").strip():
+                try:
+                    session_exec_llm = app.state.llm_store.build(
+                        str(exec_ov["provider"]).strip(),
+                        str(exec_ov.get("model") or "") or None)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "项目 executor 覆写构建失败，回退全局 executor: pid=%s %s", pid, e)
+                    session_exec_llm = exec_llm
+                    llm_fallbacks.append({
+                        "source": "executor",
+                        "requested": {"provider": str(exec_ov["provider"]).strip(),
+                                      "model": str(exec_ov.get("model") or "") or None},
+                        "fallback": {"model": getattr(exec_llm, "model", None)},
+                        "reason": str(e)[:300]})
+            agent = AgentSession(
+                project_id=pid, bb=proj.bb, gateway=gateway,
+                llm=session_exec_llm, planner_llm=session_plan_llm,
+                enable_sediment=sediment_proposals,
+                packs_root=app.state.packs_root,
+                # expert-pool M2（§4.4）：capabilities=directions_effective 推导值——
+                # 有绑定→专家面（绑定专家 skills 并集∪轨技能的所属包），无绑定→盘上直通；
+                # allowed_roles=绑定专家清单（发布链 publish_task 校验数据源）
+                track=proj.track,
+                capabilities=directions_effective(
+                    app.state.packs_root, proj.track, proj.experts,
+                    fallback=proj.capabilities),
+                role=role,
+                allowed_roles=expert_allowed_roles(
+                    app.state.packs_root, proj.track, proj.experts),
+                session_name=session_name or r.get("name") or role,
+                capability_prompt=(inventory.to_prompt() + "\n" + mode_prompt).strip(),
+                # 角色 yaml 的 tools/max_steps 在 AgentSession 内消费
+                # （只可能更严）；这里只给全局/动态部分
+                # （窗口不设 role 限制：角色 task_types 不再注入，认领无过滤）
+                config=AgentConfig(max_steps=max_steps or 200,
+                                   owner_tags=proj.bb.owner_tags(pid),
+                                   rule_profiles=cfg.get("rule_profiles"),
+                                   stuck_after=adv["stuck_after"],
+                                   stuck_max_extensions=adv["stuck_max_extensions"],
+                                   closing_max_rounds=adv["closing_max_rounds"]),
+                artifacts_dir=proj.artifacts_dir,
+                exec_workspace=_exec_workspace(proj),
+                existing_session=existing_session,
+                campaign=app.state.campaign,
+                # 环境缺失受控恢复（None=tools 根未配置 → 只回填结构化原因）
+                recovery=_environment_recovery(proj),
+            )
+            # 会话 id 就绪后再装配反编译服务（命令经网关审计；Ghidra 批处理为
+            # Agent 主通道，见下方 route-C 说明）。全量概览仍走 headless 导出。
+            agent.dispatcher.decompiler = build_headless_service(
+                proj.artifacts_dir / "decompiler-cache",
+                runner=gateway_runner(gateway, project_id=pid,
+                                      session_id=agent.session["id"],
+                                      author=agent.session["id"],
+                                      timeout=resolve_headless_timeout(),
+                                      workspace=_exec_workspace(proj)),
+                global_cache_dir=app.state.decompiler_cache_dir,
+                ida_db_dir=proj.artifacts_dir / "decompiler-db",
+                ghidra_tmp_dir=proj.artifacts_dir / "ghidra-tmp",
+            )
+            # route-C（2026-11-02 Nan 选择）：Agent 侧**不再**走 IDA-MCP 按需拉起
+            # （此前 mcp_provider=IdaMcpManager.ensure）。IDA 插件是单进程串行，
+            # CTF 多条线程一起点查会排队超时；改由 analyze_sample（Ghidra headless
+            # 批处理）一次导出落缓存，点查只读缓存。IDA-MCP 只保留工作台给人用。
+            # F6 内置浏览器：渗透/红队/CTF 轨注入实例池（v0.70：CTF Web 题需真实
+            # 浏览器渲染 reCAPTCHA/JS 挑战；轨外不注入 → browser_* no-tool
+            # 降级；工具 schema 仍全量下发，同 decompiler 语义，不做动态工具面）
+            if proj.track in ("pentest", "redteam", "ctf"):
+                agent.dispatcher.browser = app.state.browser_pool
+            app.state.agents[agent.session["id"]] = agent
+            # 覆写回退可见化：会话 id 就绪，补落 llm.fallback（失败不掩盖开窗）
+            for fb in llm_fallbacks:
+                try:
+                    proj.bb.append_event(
+                        pid, "llm.fallback",
+                        {**fb, "session_id": agent.session["id"]},
+                        session_id=agent.session["id"], author="system")
+                except Exception:  # noqa: BLE001 —— 事件落库失败不掩盖开窗
+                    log.exception("llm.fallback 事件落库失败 pid=%s", pid)
+            return agent
+
+        return factory
+
+    def _ensure_agent(pid: str, sid: str) -> AgentSession:
+        """取在册会话；内存态缺失（服务重启/历史孤儿窗）时从黑板 sessions 行
+        rehydrate 一个同角色 AgentSession 并注册。claimed 任务无快照不续跑，
+        已在项目首开时统一 fail(awaiting_human)（§3 重启纪律）。"""
+        agent = app.state.agents.get(sid)
+        if agent is not None:
+            return agent
+        proj = _project(pid)
+        row = next((s for s in proj.bb.list_sessions(pid) if s["id"] == sid), None)
+        if row is None:
+            raise HTTPException(404, f"会话不存在: {sid}")
+        if row.get("status") == "closed":
+            raise HTTPException(404, f"会话已关窗: {sid}")
+        exec_llm, plan_llm = _llms()
+        agent = _registered_session_factory(pid, exec_llm, plan_llm)(
+            row["role"], existing_session=row)
+        # 重启后无 worker 线程：running/paused 都是无消费者的陈旧行状态。E8：落盘
+        # 快照在手（_resume_state 已载回且 paused=True）→ 保持 paused 可恢复；
+        # 无快照回 idle（claimed 任务已在项目首开时统一 fail，§3 重启纪律）。
+        if row.get("status") in {"running", "paused", "blocked"}:
+            proj.bb.set_session_status(
+                sid, "paused" if agent._resume_state is not None else "idle")
+        return agent
+
+    def _fanout_team(pid: str, team_id: str, run_id: str) -> dict[str, Any]:
+        """事务创建 Run 后逐成员创建专属会话并提交 Team worker。"""
+        proj = _project(pid)
+        ts = TeamStore(proj.bb, packs_root=app.state.packs_root)
+        run = ts.get_run(pid, team_id, run_id)
+        exec_llm, plan_llm = _llms()
+        factory = _registered_session_factory(pid, exec_llm, plan_llm)
+        submitted: list[dict[str, str]] = []
+        for row in run["members"]:
+            claimed = ts.claim_member(row["id"])
+            if claimed is None:
+                continue
+            try:
+                agent = factory(
+                    claimed["role"] or "_generalist",
+                    session_name=f"team/{team_id}/{claimed['member_key']}",
+                    max_steps=claimed["max_steps"],
+                    provider=claimed["provider"] or None,
+                    model=claimed["model"] or None,
+                )
+                sid = agent.session["id"]
+                context = ExecutionContext(
+                    execution_id=claimed["execution_id"], team_id=team_id,
+                    run_id=run_id, member_id=claimed["member_id"],
+                    session_id=sid, objective=claimed["objective"],
+                    role=claimed["role"], runtime=claimed["runtime"],
+                    threat_class=claimed["threat_class"],
+                )
+                proj.bb.set_session_meta(sid, {
+                    "team_id": team_id, "run_id": run_id,
+                    "team_member_id": claimed["member_id"],
+                    "run_member_id": claimed["id"],
+                    "execution_id": claimed["execution_id"],
+                    "team_direct": True, "worker_armed": False,
+                })
+                ts.attach_session(claimed["id"], sid)
+                job_id = _submit_worker(
+                    pid, agent, team_context=context, team_id=team_id,
+                    run_id=run_id, run_member_id=claimed["id"],
+                    execution_id=claimed["execution_id"], origin="team-direct",
+                )
+                submitted.append({"member_id": claimed["member_id"], "session_id": sid, "job_id": job_id})
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Team 成员 fan-out 失败 team=%s member=%s", team_id, row["id"])
+                ts.mark_member(row["id"], "failed", error=str(exc), outcome="session/job 创建失败")
+        ts.reconcile_run(pid, team_id, run_id)
+        return {"run_id": run_id, "submitted": submitted}
+
+    # ---------- 项目 ----------
+
+    def _expert_meta_view(view: dict) -> dict:
+        """meta 读视图补专家绑定推导值（§4.4）："experts" = 绑定清单；
+        "directions" = directions_effective（有绑定→专家 knowledge 面推导，无绑定→盘上直通）；
+        "directions_bound" = 盘上原始绑定。仅响应层，盘上 meta 不改。"""
+        experts = [e for e in (view.get("experts") or []) if str(e).strip()]
+        return {**view, "experts": experts,
+                "directions_bound": list(view.get("capabilities") or []),
+                "directions": directions_effective(
+                    app.state.packs_root, view.get("track") or "ctf", experts,
+                    fallback=view.get("capabilities") or [])}
+
+    @app.get("/api/projects")
+    def list_projects():
+        return [_expert_meta_view(m) for m in store.list_projects()]
+
+    # 回收站（DESIGN.md §5.3）：静态段 `/api/projects/trash` **必须先于**
+    # `/api/projects/{pid}` 注册，否则 "trash" 会被 {pid} 吃掉当项目 id 查。
+    @app.get("/api/projects/trash")
+    def list_trashed_projects():
+        """回收站清单（只读）。每项带 trash_name=回收站目录名（=恢复句柄）。"""
+        return [_expert_meta_view(m) for m in store.list_trashed()]
+
+    @app.post("/api/projects/{trash_name}/restore", status_code=201)
+    def restore_trashed_project(trash_name: str):
+        """从回收站恢复项目：目录移回 workspaces/<slug>/（同名自动加后缀）。"""
+        try:
+            path, slug = store.restore_project(trash_name)
+        except FileNotFoundError:
+            raise HTTPException(404, f"回收站条目不存在: {trash_name}") from None
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        except PermissionError as e:  # 重试耗尽仍有句柄（外部进程占用）
+            raise HTTPException(
+                422,
+                "回收站目录被占用，无法恢复；请关闭占用该目录的程序后重试: "
+                f"{e}") from e
+        try:
+            pid = json.loads((path / "project.json").read_text(encoding="utf-8")).get("id")
+        except (ValueError, OSError):
+            pid = None
+        return {"project_id": pid, "slug": slug, "status": "restored"}
+
+    # 回收站终点操作（2026-10-18）：静态段 /api/projects/trash/** 与 /trash 同口径，
+    # 必须先于 /api/projects/{pid} 注册，否则 trash 段会被 {pid} 吃掉。
+    @app.delete("/api/projects/trash/{trash_name}")
+    def purge_trashed_project(trash_name: str):
+        """永久删除回收站条目：物理抹除 .trash/<trash_name>/，不可恢复。"""
+        try:
+            store.purge_trashed(trash_name)
+        except FileNotFoundError:
+            raise HTTPException(404, f"回收站条目不存在: {trash_name}") from None
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        except PermissionError as e:  # 重试耗尽仍有句柄（外部进程占用）
+            raise HTTPException(
+                422,
+                "回收站目录被占用，无法永久删除；请关闭占用该目录的程序后重试: "
+                f"{e}") from e
+        except OSError as e:  # LX reparse point 等文件系统层异常：422 带因，不再漏 500
+            raise HTTPException(
+                422, f"永久删除失败（文件系统限制，详见原因）: {e}") from e
+        return {"status": "purged", "trash_name": trash_name}
+
+    @app.post("/api/projects/trash/{trash_name}/clear")
+    def clear_trashed_project(trash_name: str):
+        """清除回收站条目内的项目文件，仅保留 project.json（墓碑：名字信息保留、数据抹除）。"""
+        try:
+            stats = store.clear_trashed_contents(trash_name)
+        except FileNotFoundError:
+            raise HTTPException(
+                404, f"回收站条目不存在或元数据损坏: {trash_name}") from None
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        except PermissionError as e:  # 重试耗尽仍有句柄（外部进程占用）
+            raise HTTPException(
+                422,
+                "回收站目录被占用，无法清除文件；请关闭占用该目录的程序后重试: "
+                f"{e}") from e
+        except OSError as e:  # LX reparse point 等文件系统层异常：422 带因，不再漏 500
+            raise HTTPException(
+                422, f"清除文件失败（文件系统限制，详见原因）: {e}") from e
+        return {"status": "cleared", **stats}
+
+    @app.post("/api/projects", status_code=201)
+    def create_project(body: ProjectIn):
+        # 旧客户端只传 domain（pentest/ctf）：透明映射为 track+caps（读兼容写新值）
+        sent = body.model_fields_set
+        track = body.track if "track" in sent else None
+        if body.domain:
+            mapped = LEGACY_DOMAIN_MAP.get(body.domain)
+            track = track or (mapped[0] if mapped else body.domain)
+        track = track or "ctf"
+        # 校验轨真实存在（能力包已退役：创建不再绑定能力包）
+        valid_tracks = {t["name"] for t in list_packs(app.state.packs_root, "track")}
+        if track not in valid_tracks:
+            raise HTTPException(422, f"非法场景轨: {track}（合法: {sorted(valid_tracks)}）")
+        # 场景档（expert-pool M4a，§4.8/D6）：档提供组队预设与五件套缺省，
+        # 请求体显式值优先；物化进项目配置后即弃（模板升级不影响存量项目）。
+        profile = None
+        if body.profile:
+            profile = load_profile(app.state.packs_root, track, body.profile.strip())
+            if profile is None:
+                avail = [p["id"] for p in load_track_profiles(app.state.packs_root, track)]
+                raise HTTPException(
+                    422, f"场景档不存在: {body.profile}（{track} 轨内置: {avail}）")
+            bv = profile.get("board_view")
+            if bv and bv not in BOARD_VIEWS:
+                raise HTTPException(422, f"场景档 board_view 非法: {bv}（合法: {BOARD_VIEWS}）")
+        # 专家绑定校验（expert-pool M2，§4.4）：须在池内且可服务该轨（422）；
+        # 选档未显式传组队时用档内预设兜底（M3 前端总是提交定稿清单）
+        experts = list(body.experts) if body.experts else \
+            [str(e) for e in (profile.get("experts") or [])] if profile else []
+        bad_experts = [e for e in experts
+                       if not expert_exists(app.state.packs_root, str(e).strip(), track)]
+        if bad_experts:
+            pool = list_experts(app.state.packs_root, track)
+            raise HTTPException(
+                422, f"非法专家: {sorted(set(bad_experts))}"
+                     f"（{track} 轨可用: {pool}）")
+        # 知识继承源预检（M4b）：先 404 再建项目，避免建了项目才发现源不存在
+        if body.inherit_from:
+            try:
+                store.open_project(body.inherit_from.strip())
+            except FileNotFoundError as e:
+                raise HTTPException(404, str(e))
+        # 五件套物化（D6）：rule_profiles/board_view 立即生效，playbook/artifacts/
+        # knowledge（暂未对接机制）随 config.profile 快照留档不丢
+        cfg = dict(body.config)
+        if profile is not None:
+            cfg.setdefault("profile", {**profile_snapshot(profile),
+                                       "materialized_at": _utc_now()})
+            owners, rating = profile.get("rule_profiles_owners"), profile.get("rule_profiles_rating")
+            if "rule_profiles" not in body.config and (owners is not None or rating is not None):
+                cfg["rule_profiles"] = {k: v for k, v in
+                                        (("owners", owners), ("rating", rating)) if v is not None}
+            if profile.get("board_view"):
+                cfg.setdefault("board_view", {"default": profile["board_view"]})
+        proj = store.create_project(body.name, track, [], cfg, experts=experts)
+        app.state.projects[proj.id] = proj
+        # 分阶段工作流（M1，D3）：轨有阶段剧本 → 创建即登记初始阶段（不发剧本
+        # 任务——mission/目标商议前不发静态任务，首发随显式流转触发；publish
+        # ≠起跑，起跑仍按自主档/人工）
+        _book = phases_mod.load_track_phases(app.state.packs_root, proj.track,
+                                             proj.meta.get("config") or {})
+        if _book:
+            try:
+                phases_mod.enter_phase(proj, phases_mod.default_phase_id(_book),
+                                       by="system", packs_root=app.state.packs_root,
+                                       publish=False,
+                                       reason="项目创建进入初始阶段")
+            except Exception:  # noqa: BLE001 —— 初始登记失败不回滚建项
+                log.exception("初始阶段进入失败 pid=%s", proj.id)
+        # 知识继承（M4b）：创建后复制（只增不覆盖）；失败不回滚建项，响应里带错误
+        out = _expert_meta_view(proj.view_meta)
+        if body.inherit_from:
+            try:
+                out["inherited"] = store.inherit_knowledge(body.inherit_from.strip(), proj)
+            except (ValueError, OSError, sqlite3.Error) as e:
+                log.warning("知识继承失败 %s -> %s: %s", body.inherit_from, proj.id, e)
+                out["inherit_error"] = str(e)
+        return out
+
+    @app.get("/api/projects/{pid}")
+    def get_project(pid: str):
+        proj = _project(pid)
+        # chat 僵尸轮清扫已挪进 _sweep_restarted_project（2026-09-30 误报修复）：
+        # 此前每次 GET 项目都无条件清扫且不核对 chat_running——执行中刷新页面
+        # 会把活轮误判僵尸、落「进程重启」中断消息；现只在本进程首次打开项目
+        # 时执行（重启纪律同钩子），且清扫前逐线程核对 chat_running 双保险。
+        # 任务机制退役（2026-10-06）：task_stats 恒空（前端已不消费；保留键兼容旧契约）
+        stats: dict[str, int] = {}
+        usage = autonomy.usage_view(proj.bb, pid)
+        # 批 5（§6.8）：L2 链状态给直播间；estranged=DB 活但本进程无标记（重启急停）
+        cst = orch_state.load_or_create(proj.bb, pid)
+        usage["chain"] = {
+            "active": bool(cst["chain_active"]),
+            "ticks": int(cst["chain_ticks"]),
+            "auto_ticks_total": int(cst["auto_ticks_total"]),
+            "estranged": bool(cst["chain_active"]) and pid not in app.state.active_chains,
+        }
+        # 会话 UI 风格（trae 视图 2026-09-28）：config.ui_style 透出给前端切换钮
+        usage["ui_style"] = str((proj.view_meta.get("config") or {}).get("ui_style") or "claude")
+        # 编排 tick 运行中（trae 视图「正在规划下一步」状态行判定源）
+        usage["orch_running"] = any(
+            j["kind"] == "orchestrator-tick" and j["status"] == "running"
+            for j in app.state.jobs.all_jobs()
+            if j.get("meta", {}).get("project_id") == pid)
+        # 资产计数口径（level-two-counts，2026-10-16 Nan 定稿）：资产树只认
+        # 「根节点 → 二级子节点 → 三级 URL」，**资产数 = 二级子节点数**（根只是分组
+        # 容器、三级 URL 只是二级的明细，都不进分母）。findings 只查一次，计数复用。
+        findings = proj.bb.list_findings(pid)
+        lvl = level_two_stats(proj.bb.list_assets(pid), findings)
+        return {**_expert_meta_view(proj.view_meta), "task_stats": stats,
+                "findings": len(findings),
+                "assets": lvl["total"],
+                "assets_clean": lvl["clean"],
+                "assets_clean_pct": lvl["pct"],
+                "usage": usage,
+                "capability": app.state.inventory.to_dict()}
+
+    @app.patch("/api/projects/{pid}/config")
+    def patch_project_config(pid: str, body: ConfigPatchIn):
+        """改项目配置（本批消费 autonomy：L0/L1/L2、paused、cap、预算；§6.8）。
+        project.json + 黑板 projects 行双写；非法 autonomy 422；闸门下次重读即生效。"""
+        proj = _project(pid)
+        try:
+            meta = store.update_config(pid, body.config, project=proj)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        return meta
+
+    @app.patch("/api/projects/{pid}/experts")
+    def patch_project_experts(pid: str, body: ExpertsPatchIn):
+        """换将（expert-pool M2，§4.4）：重写绑定专家清单，下轮会话构造即生效
+        （构造链实时读 meta）。校验专家在池内且可服务项目轨（422）；空清单=解绑
+        恢复存量直通态。响应带推导后的 meta 视图（capabilities=directions_effective）。"""
+        proj = _project(pid)
+        bad = [e for e in body.experts
+               if not expert_exists(app.state.packs_root, str(e).strip(), proj.track)]
+        if bad:
+            pool = list_experts(app.state.packs_root, proj.track)
+            raise HTTPException(
+                422, f"非法专家: {sorted(set(bad))}（{proj.track} 轨可用: {pool}）")
+        return _expert_meta_view(store.update_experts(pid, body.experts, project=proj))
+
+    def _project_busy(pid: str) -> str | None:
+        """项目是否在运行中（删除前置检查）。忙则返回原因，空闲返回 None。"""
+        for j in app.state.jobs.all_jobs():
+            if j["status"] == "running" and j["meta"].get("project_id") == pid:
+                return "有 Agent/编排任务正在运行"
+        return None
+
+    @app.delete("/api/projects/{pid}")
+    def delete_project(pid: str):
+        """回收站式删除（DESIGN.md §5.3）：整目录移入 workspaces/.trash/，不物理删除。"""
+        proj = _project(pid)
+        if pid in app.state.projects_closing:
+            raise HTTPException(409, "项目正在删除中")
+        reason = _project_busy(pid)
+        if reason:
+            raise HTTPException(409, f"项目删除被拒绝：{reason}")
+        app.state.projects_closing.add(pid)
+        _stop_artex_engine(pid)
+        try:
+            # 摘缓存后由 store.delete_project 统一 close_all()+close()（双层闸门）：
+            # 之后在飞轮询/WS tick 既拿不到新实例（_project 409），也无法用旧 proj
+            # 引用重开黑板（Blackboard/Project 双层 BlackboardClosedError）——
+            # 这是 Windows 下 db 文件不被重新锁死、rename 成功的关键。
+            app.state.projects.pop(pid, None)
+            # 环境恢复器随项目终结一起摘除（其去重计数与 workspace 绑定该 pid）
+            app.state.environment_recovery.pop(pid, None)
+            # F6：先焚毁浏览器实例（chromium 占用 profile 目录会锁死 Windows 删除）
+            app.state.browser_pool.close_project(pid)
+            # 代理池已全局化（2026-10-11）：池/日志落 data/proxy/、serve 进程级单实例，
+            # 与项目工作区无句柄关系——故删除前置链**不再**停代理池（此前 close_project(pid)
+            # 只为释放 <项目>/proxy/*.log 句柄让 rename 成功；池已移出 workspaces，无需释放）。
+            # 会话级常驻容器先停删（释放卷挂载句柄，否则 Windows rename 必 422；P3，2026-10-07）
+            try:
+                app.state.session_containers.remove_project(pid)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                trash_path = store.delete_project(pid, project=proj)
+            except FileNotFoundError:
+                # 并发删除（双击/双标签）已先一步移走目录
+                raise HTTPException(404, f"项目不存在: {pid}") from None
+            except PermissionError as e:  # 重试耗尽仍有句柄（外部进程占用）
+                raise HTTPException(
+                    422,
+                    "项目目录被占用，无法移入回收站。常见原因：① 该项目的 Agent 曾用 "
+                    "run_cmd 起了**后台常驻/心跳进程**（如 Start-Process / nohup / "
+                    "setsid 起的循环脚本），命令结束后仍在跑，锁住工作区目录；"
+                    "② 外部进程（编辑器/终端/容器）打开了目录内文件。"
+                    "请找出并结束占用进程后重试（关页面标签通常无效）: "
+                    f"{e}") from e
+            return {"project_id": pid, "status": "trashed", "trash_path": str(trash_path)}
+        finally:
+            app.state.projects_closing.discard(pid)
+
+    # ---------- 内置浏览器（F6，DESIGN §7：抓包/人类驱动/重发/爆破） ----------
+
+    class BrowserNavIn(BaseModel):
+        url: str
+        sid: str | None = None
+
+    class BrowserActionIn(BaseModel):
+        action: Literal["click", "type", "back"]
+        sid: str | None = None
+        selector: str | None = None
+        text: str | None = None
+        x: float | None = None
+        y: float | None = None
+
+    class ReplayIn(BaseModel):
+        capture_id: int | None = None
+        raw: str | None = None             # 原始请求报文（F6-v3：与 capture_id 二选一）
+        # 传输选项（2026-10-07 重放工作台，全量对齐 Yakit 式 Repeater 控件）
+        force_https: bool = False
+        follow_redirects: bool = True
+        proxy: str | None = None           # 显式代理；None=直连（绝不读系统代理）
+        body_max_bytes: int | None = None  # 响应体截断上限（前端「响应体长度限制」）
+        insecure: bool = False             # 跳过证书校验
+        gm_tls: bool = False               # 国密 TLS（GM/T 0024）→ gmhttp sidecar
+        timeout_s: float = 15.0
+        server_name: str | None = None     # SNI 覆写
+        client_cert_pem: str | None = None  # 国密双证书：两块 CERTIFICATE 拼接
+        client_key_pem: str | None = None
+        ca_cert_pem: str | None = None
+
+    class IntruderIn(BaseModel):
+        template: dict                    # {method,url,headers,body}，含 §POS§ 标记
+        payloads: list[dict]              # [{position,type:"list"|"range",values|start/stop/step}]
+        concurrency: int = 5
+        rate_per_sec: float = 10.0
+        max_requests: int | None = None
+        proxy: str | None = None          # 显式代理；None=直连（绝不读系统代理）
+
+    class ProxyAddIn(BaseModel):
+        records: list[dict] = Field(default_factory=list)  # 代理记录（proxy/protocol/...）
+
+    class ProxyRemoveIn(BaseModel):
+        addresses: list[str] = Field(default_factory=list)
+
+    class ProxyUseIn(BaseModel):
+        proxy: str = ""                                # host:port（或含 scheme，前端已剥）
+
+    class ProxyFetchIn(BaseModel):
+        protocols: list[str] = Field(default_factory=list)  # http/socks4/socks5；空=全部
+        auto_validate: bool = True                           # 抓取后自动验证并清理失效
+        # 本次抓取条数上限（2026-10-15，前端「抓取条数」输入框）：None=用 config.fetch_limit，
+        # 0=不限。只影响本次，不改配置文件。
+        limit: int | None = None
+
+    class ProxyValidateIn(BaseModel):
+        workers: int = 100
+        timeout_s: float = 1200.0
+        prune: bool = True                                   # 验证后剔除失效代理
+
+    class ProxyCheckUrlIn(BaseModel):
+        url: str                                             # 目标网站 URL（必填）
+        workers: int = 50
+        timeout_s: float = 600.0
+        limit: int = 10                                      # 返回的可用代理条数上限
+        probe_waf: bool = True                               # 做 WAF/封禁判定（False=只测连通）
+
+    class ProxyConfigIn(BaseModel):
+        """PUT /api/proxy/config：代理池验证基准站等可配项。
+
+        验证基准（2026-10-12 前端开放配置）：``validate_target`` = 连通性基准（经代理
+        GET 它，通即 Working）；``validate_target_https`` = HTTPS 能力探测基准（经
+        CONNECT；空串=关闭探测）；``validate_target_b`` = 内容注入交叉验证第二目标
+        （空串=关闭）。``validate_timeout_s``/``prune_latency_ms`` 可选。
+        """
+        validate_target: str | None = None
+        validate_target_https: str | None = None
+        validate_target_b: str | None = None
+        validate_timeout_s: int | None = None
+        prune_latency_ms: float | None = None
+        fetch_limit: int | None = None      # 单次抓取条数上限（0=不限），2026-10-15
+
+    class ProxySelectIn(BaseModel):
+        limit: int = 1
+        region: str | None = None
+        max_latency_ms: float | None = None
+        include_failed: bool = False
+        # 只回 https_ok=true 的代理（2026-10-26）：访问 HTTPS 目标必须用它们，
+        # 池里 protocol=="http" 的出口多数做不了 CONNECT，TLS 会直接失败。
+        https_only: bool = False
+
+    class BrowserTakeoverIn(BaseModel):
+        sid: str
+        paused: bool
+
+    class BrowserExternalAttachIn(BaseModel):
+        cdp_url: str
+        sid: str
+        owner: str = "human"
+
+    class MobileStateIn(BaseModel):
+        connected: bool
+        serial: str = ""
+        model: str = ""
+
+    def _browser_inst(pid: str):
+        """浏览器实例（缺 playwright → 503 结构化，不 500）。"""
+        if not browser_available():
+            raise HTTPException(
+                503, 'playwright 未安装：请人工执行 pip install -e ".[browser]" '
+                     '&& playwright install chromium 后重启平台')
+        return app.state.browser_pool.get_instance(pid)
+
+    @staticmethod
+    def _browser_http_error(e: BrowserError) -> HTTPException:
+        msg = str(e)
+        code = 409 if "上限" in msg else 422
+        return HTTPException(code, msg)
+
+    @app.put("/api/projects/{pid}/mobile/state")
+    def update_mobile_state(pid: str, body: MobileStateIn):
+        """Accept a loopback desktop-shell device snapshot for this project."""
+        proj = _project(pid)
+        # 只认逆向轨：`Project.capabilities` 走 API 建项目时可能为空（轨默认方向
+        # 在 `directions_effective` 里补），拿 capabilities 判会把合法项目挡在
+        # 门外——track 才是「这台设备属于哪条工作台」的唯一稳定判据。
+        if proj.track != "research":
+            raise HTTPException(404, "Android 设备状态仅适用于逆向项目")
+        from core.chat.mobile import update_mobile_state as record_mobile_state
+        try:
+            return record_mobile_state(pid, connected=body.connected,
+                                       serial=body.serial, model=body.model)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/browser/status")
+    def browser_status():
+        """依赖探测 + 实例概况（全程 try/except，任何异常按未安装返回，不 500）。"""
+        try:
+            installed = browser_available()
+            return {
+                "playwright_installed": installed,
+                "chromium_installed": chromium_available() if installed else False,
+                "install_cmd": 'pip install -e ".[browser]" && playwright install chromium',
+                "instances": app.state.browser_pool.status(),
+            }
+        except Exception:  # noqa: BLE001
+            return {"playwright_installed": False, "chromium_installed": False,
+                    "install_cmd": 'pip install -e ".[browser]" && playwright install chromium',
+                    "instances": []}
+
+    @app.get("/api/projects/{pid}/browser/state")
+    def browser_state(pid: str):
+        proj = _project(pid)
+        inst = app.state.browser_pool.get_instance(pid)
+        return {**inst.status(),
+                "playwright_installed": browser_available(),
+                "track": proj.track}
+
+    @app.post("/api/projects/{pid}/browser/desktop/attach")
+    def browser_desktop_attach(pid: str, body: BrowserExternalAttachIn):
+        """Bind an Electron WebContentsView to the project's Playwright page.
+
+        The desktop shell owns Chromium; the API only attaches over CDP and
+        therefore never creates a second visible browser for this session.
+        """
+        _project(pid)
+        inst = _browser_inst(pid)
+        try:
+            return app.state.browser_pool.attach_external(
+                pid, body.cdp_url, body.sid, body.owner)
+        except BrowserError as e:
+            raise _browser_http_error(e) from e
+
+    @app.post("/api/projects/{pid}/browser/desktop/detach")
+    def browser_desktop_detach(pid: str, body: BrowserTakeoverIn):
+        _project(pid)
+        try:
+            app.state.browser_pool.detach_external(pid, body.sid)
+        except BrowserError as e:
+            raise _browser_http_error(e) from e
+        return {"detached": True, "sid": body.sid}
+
+    @app.post("/api/projects/{pid}/browser/takeover")
+    def browser_takeover(pid: str, body: BrowserTakeoverIn):
+        """暂停/恢复指定 AI 页面输入，供人类接管标签页。"""
+        _project(pid)
+        inst = _browser_inst(pid)
+        try:
+            return inst.set_input_paused(body.sid, body.paused)
+        except BrowserError as e:
+            raise _browser_http_error(e) from e
+
+    @app.get("/api/projects/{pid}/browser/screenshot")
+    def browser_screenshot(pid: str):
+        inst = _browser_inst(pid)
+        try:
+            sid = inst.ensure_human_session()["sid"]
+            png = inst.screenshot(sid)
+        except BrowserError as e:
+            raise _browser_http_error(e) from e
+        import base64 as _b64
+        return {"png": _b64.b64encode(png).decode("ascii"), "ts": time.time()}
+
+    @app.post("/api/projects/{pid}/browser/navigate")
+    def browser_navigate(pid: str, body: BrowserNavIn):
+        """人类导航（隐式会话或指定 sid；允许任意 URL）。"""
+        _project(pid)
+        inst = _browser_inst(pid)
+        try:
+            sid = body.sid
+            if not sid or sid == "human-main":
+                sid = inst.ensure_human_session()["sid"]
+            return inst.navigate(sid, body.url)
+        except BrowserError as e:
+            raise _browser_http_error(e) from e
+
+    @app.post("/api/projects/{pid}/browser/action")
+    def browser_action(pid: str, body: BrowserActionIn):
+        inst = _browser_inst(pid)
+        try:
+            sid = body.sid
+            if not sid or sid == "human-main":
+                sid = inst.ensure_human_session()["sid"]
+            return inst.act(sid, body.action, selector=body.selector,
+                            text=body.text, x=body.x, y=body.y)
+        except BrowserError as e:
+            raise _browser_http_error(e) from e
+
+    @app.get("/api/projects/{pid}/browser/history")
+    def browser_history(pid: str, since_id: int = 0, limit: int = 100,
+                        batch_id: str | None = None, source: str | None = None,
+                        session_id: str | None = None):
+        return _project(pid).bb.list_http_history(
+            pid, since_id=since_id, limit=limit, batch_id=batch_id,
+            source=source, session_id=session_id)
+
+    @app.get("/api/projects/{pid}/browser/history/{row_id}")
+    def browser_history_row(pid: str, row_id: int):
+        row = _project(pid).bb.get_http_history(pid, row_id)
+        if row is None:
+            raise HTTPException(404, f"抓包记录不存在: {row_id}")
+        return row
+
+    @app.delete("/api/projects/{pid}/browser/history")
+    def browser_history_clear(pid: str, batch_id: str | None = None):
+        n = _project(pid).bb.clear_http_history(pid, batch_id=batch_id)
+        return {"removed": n}
+
+    @app.get("/api/projects/{pid}/browser/gm-status")
+    def browser_gm_status(pid: str):
+        """国密 TLS 通道能力探测（重放工作台据此置灰「国密TLS」开关）。
+
+        红线：**不可用时不静默降级成普通 TLS**——前端必须显式置灰并给出安装指引，
+        否则会制造「以为走了国密、实际没走」的安全假象。"""
+        from core.browser.gmhttp import gm_available, resolve_gmhttp
+        path = resolve_gmhttp(app.state.tools_root or "tools")
+        return {"available": gm_available(app.state.tools_root or "tools"),
+                "path": path,
+                "guide": ("国密 sidecar 缺失：tools/bin/gmhttp.exe 未构建。"
+                          "跑 scripts/build_gmhttp.py（需 Go 1.21+）生成。") if not path else ""}
+
+    @app.post("/api/projects/{pid}/browser/replay", status_code=202)
+    def browser_replay(pid: str, body: ReplayIn):
+        """重发（人类 UI + Agent 工具 `browser_replay`，2026-10-07 放开红线）。
+        原始报文 raw 或 capture_id 模板。Job 化返回 job_id 轮询；run_id 供「停止」端点中断。"""
+        proj = _project(pid)
+        client = ReplayClient(proj.bb, config=app.state.browser_pool.config,
+                              tools_root=app.state.tools_root or "tools")
+        opts = ReplayOptions(
+            force_https=body.force_https,
+            follow_redirects=body.follow_redirects,
+            proxy=body.proxy or None,
+            body_max_bytes=body.body_max_bytes,
+            insecure=body.insecure,
+            gm_tls=body.gm_tls,
+            timeout_s=body.timeout_s,
+            server_name=body.server_name or None,
+            client_cert_pem=body.client_cert_pem,
+            client_key_pem=body.client_key_pem,
+            ca_cert_pem=body.ca_cert_pem,
+        )
+        run_id = f"rp-{uuid.uuid4().hex[:12]}"
+        stop = threading.Event()
+        app.state.replay_runs[run_id] = stop
+
+        def _run():
+            try:
+                return client.replay(pid, capture_id=body.capture_id,
+                                     raw=body.raw, author="human",
+                                     opts=opts, stop_event=stop)
+            finally:
+                app.state.replay_runs.pop(run_id, None)
+
+        job_id = app.state.jobs.submit("browser-replay", _run,
+                                       meta={"project_id": pid, "run_id": run_id})
+        return {"job_id": job_id, "run_id": run_id}
+
+    @app.post("/api/projects/{pid}/browser/replay/{run_id}/stop")
+    def browser_replay_stop(pid: str, run_id: str):
+        """中断在跑的单条重发（httpx=放弃等待，国密 sidecar=kill 子进程）。"""
+        stop = app.state.replay_runs.get(run_id)
+        if stop is None:
+            raise HTTPException(404, f"重发不在运行中: {run_id}")
+        stop.set()
+        return {"stopped": True}
+
+    @app.post("/api/projects/{pid}/browser/intruder", status_code=202)
+    def browser_intruder(pid: str, body: IntruderIn):
+        """爆破（人类 UI + Agent 工具 `browser_intruder`，2026-10-07 放开红线）。
+        服务端生成 batch_id + stop 事件；结果逐请求入 http_history 按 batch 拉取。"""
+        proj = _project(pid)
+        batch_id = f"in-{uuid.uuid4().hex[:12]}"
+        stop = threading.Event()
+        app.state.intruder_runs[batch_id] = stop
+        intruder = Intruder(proj.bb, config=app.state.browser_pool.config)
+        cfg = app.state.browser_pool.config
+
+        def _run():
+            try:
+                return intruder.run(pid, body.template, body.payloads,
+                                    batch_id=batch_id,
+                                    concurrency=body.concurrency,
+                                    rate_per_sec=body.rate_per_sec,
+                                    max_requests=body.max_requests,
+                                    proxy=body.proxy or None,
+                                    stop_event=stop, author="human")
+            finally:
+                app.state.intruder_runs.pop(batch_id, None)
+
+        job_id = app.state.jobs.submit(
+            "browser-intruder", _run,
+            meta={"project_id": pid, "batch_id": batch_id})
+        return {"job_id": job_id, "batch_id": batch_id,
+                "max_concurrency": cfg.intruder_max_concurrency}
+
+    @app.post("/api/projects/{pid}/browser/intruder/{batch_id}/stop")
+    def browser_intruder_stop(pid: str, batch_id: str):
+        stop = app.state.intruder_runs.get(batch_id)
+        if stop is None:
+            raise HTTPException(404, f"爆破批次不在运行中: {batch_id}")
+        stop.set()
+        return {"stopped": True}
+
+    # ---------- 代理池（fir-proxy 托管，2026-10-07 → 2026-10-11 全局化） ----------
+    # **全局单池**：进程级单 serve + 单池（data/proxy/pool.json），所有项目共享；
+    # 人类 UI 与 AI（经 MCP 控制面）共享同一池。路由**无 pid**（池不再绑定项目）。
+    # 缺 fir-proxy/依赖 → ProxyError → 503 结构化（不 500）。
+
+    def _proxy_pool():
+        return app.state.proxy_pool
+
+    def _proxy_call(fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ProxyError as exc:
+            raise HTTPException(503, str(exc)) from exc
+
+    def _proxy_running_job() -> dict | None:
+        """全局运行中的代理 Job（fetch/validate），无则 None。
+
+        池是全局的，故不再按项目过滤；至多一个此类 job 在跑（前端亦按 job_id 去重）。
+        前端切页回来据此重挂 `pollJob`（进度 dict 是 meta 内的**引用**，读到即最新）。
+        """
+        for j in app.state.jobs.all_jobs():
+            if (j.get("status") == "running"
+                    and j.get("kind") in ("proxy-fetch", "proxy-validate",
+                                          "proxy-check-url")):
+                meta = j.get("meta") or {}
+                return {"id": j["id"], "kind": j["kind"],
+                        "progress": meta.get("progress")}
+        return None
+
+    @app.get("/api/proxy/status")
+    def proxy_status():
+        out = _proxy_pool().status()
+        out["job"] = _proxy_running_job()
+        return out
+
+    @app.post("/api/proxy/start")
+    def proxy_start():
+        return _proxy_call(_proxy_pool().start)
+
+    @app.post("/api/proxy/stop")
+    def proxy_stop():
+        return _proxy_pool().stop()
+
+    @app.get("/api/proxy/proxies")
+    def proxy_list():
+        return _proxy_pool().list_proxies()
+
+    @app.post("/api/proxy/rotate")
+    def proxy_rotate():
+        return _proxy_call(_proxy_pool().rotate)
+
+    @app.post("/api/proxy/use")
+    def proxy_use(body: ProxyUseIn):
+        """精确切换到指定代理（2026-10-15 访问测试「可达即切换」入口）。
+
+        顺序轮换是碰运气：访问测试判出「对这个站点可达」的 IP 后应直接钉死它。
+        地址不在池/非 Working/服务未运行 → ProxyError → 503 + 人话。
+        """
+        return _proxy_call(_proxy_pool().use_proxy, body.proxy)
+
+    @app.post("/api/proxy/add")
+    def proxy_add(body: ProxyAddIn):
+        return _proxy_pool().add_records(body.records)
+
+    @app.post("/api/proxy/remove")
+    def proxy_remove(body: ProxyRemoveIn):
+        return _proxy_pool().remove_records(body.addresses)
+
+    @app.post("/api/proxy/select")
+    def proxy_select(body: ProxySelectIn):
+        return {"proxies": _proxy_pool().select(
+            limit=body.limit, region=body.region,
+            max_latency_ms=body.max_latency_ms,
+            include_failed=body.include_failed,
+            https_only=body.https_only)}
+
+    @app.post("/api/proxy/fetch", status_code=202)
+    def proxy_fetch(body: ProxyFetchIn):
+        """从在线源抓取代理入池（默认抓取后自动验证并清理失效；Job：联网慢，返 job_id 轮询）。
+
+        ``meta.progress`` 为可变 dict（引用共享）：前端轮询读到实时相位/进度/ETA。
+        """
+        pool = _proxy_pool()
+        progress: dict = {"phase": "queued", "done": 0, "total": 0,
+                          "eta_seconds": None, "message": "排队中…"}
+        job_id = app.state.jobs.submit(
+            "proxy-fetch",
+            lambda: pool.fetch(body.protocols, auto_validate=body.auto_validate,
+                               limit=body.limit, on_progress=progress.update),
+            meta={"progress": progress})
+        return {"job_id": job_id}
+
+    @app.post("/api/proxy/validate", status_code=202)
+    def proxy_validate(body: ProxyValidateIn):
+        """批量验证池内代理并清理失效（Job：慢；``meta.progress`` 同 fetch）。"""
+        pool = _proxy_pool()
+        progress: dict = {"phase": "queued", "done": 0, "total": 0,
+                          "eta_seconds": None, "message": "排队中…"}
+        job_id = app.state.jobs.submit(
+            "proxy-validate",
+            lambda: pool.validate(timeout=body.timeout_s, workers=body.workers,
+                                  prune=body.prune, on_progress=progress.update),
+            meta={"progress": progress})
+        return {"job_id": job_id}
+
+    @app.post("/api/proxy/check-url", status_code=202)
+    def proxy_check_url(body: ProxyCheckUrlIn):
+        """指定网站可达性 / WAF 封禁检测（Job：慢；``meta.progress`` 同 fetch）。
+
+        用池内全部代理逐一访问 ``url``，与直连基线对比判定「可达 / 被该站封禁」；
+        **只读报告，不改池**。Job 结果带 ``usable``（未被封禁的可用代理，≤limit 个）。
+        """
+        if not body.url.strip():
+            raise HTTPException(422, "目标 URL 不能为空")
+        pool = _proxy_pool()
+        progress: dict = {"phase": "queued", "done": 0, "total": 0,
+                          "eta_seconds": None, "message": "排队中…"}
+        job_id = app.state.jobs.submit(
+            "proxy-check-url",
+            lambda: pool.check_url(body.url, workers=body.workers,
+                                   timeout=body.timeout_s, limit=body.limit,
+                                   probe_waf=body.probe_waf,
+                                   on_progress=progress.update),
+            meta={"progress": progress})
+        return {"job_id": job_id}
+
+    @app.get("/api/proxy/config")
+    def proxy_config_get():
+        """代理池可配项（验证基准站等）：供前端「网站设置」弹窗回显。
+
+        ``defaults`` 给出内置缺省值，前端据此展示「恢复默认」。
+        """
+        from core.proxy.pool import ProxyConfig
+        cfg = _proxy_pool().config
+        d = ProxyConfig()
+        return {
+            "validate_target": cfg.validate_target,
+            "validate_target_https": cfg.validate_target_https,
+            "validate_target_b": cfg.validate_target_b,
+            "validate_timeout_s": cfg.validate_timeout_s,
+            "prune_latency_ms": cfg.prune_latency_ms,
+            "fetch_limit": cfg.fetch_limit,
+            "defaults": {
+                "validate_target": d.validate_target,
+                "validate_target_https": d.validate_target_https,
+                "validate_target_b": d.validate_target_b,
+                "validate_timeout_s": d.validate_timeout_s,
+                "prune_latency_ms": d.prune_latency_ms,
+                "fetch_limit": d.fetch_limit,
+            },
+        }
+
+    @app.put("/api/proxy/config")
+    def proxy_config_put(body: ProxyConfigIn):
+        """写 ``config/proxy.json`` 并**热更新**在跑的 ProxyPool.config（下轮验证/抓取即生效）。"""
+        from core.proxy.pool import ProxyConfig, write_config_file
+        updates: dict = {}
+        if body.validate_target is not None:
+            t = body.validate_target.strip()
+            if not t:
+                raise HTTPException(422, "验证基准网站不能为空")
+            updates["validate_target"] = t
+        if body.validate_target_https is not None:
+            updates["validate_target_https"] = body.validate_target_https.strip() or None
+        if body.validate_target_b is not None:
+            updates["validate_target_b"] = body.validate_target_b.strip() or None
+        if body.validate_timeout_s is not None:
+            if body.validate_timeout_s <= 0:
+                raise HTTPException(422, "验证超时必须为正整数秒")
+            updates["validate_timeout_s"] = int(body.validate_timeout_s)
+        if body.prune_latency_ms is not None:
+            updates["prune_latency_ms"] = float(body.prune_latency_ms)
+        if body.fetch_limit is not None:
+            if body.fetch_limit < 0:
+                raise HTTPException(422, "单次抓取条数不能为负（0=不限）")
+            updates["fetch_limit"] = int(body.fetch_limit)
+        if not updates:
+            raise HTTPException(422, "无可更新字段")
+        write_config_file(proxy_config_path, updates)
+        # 热更新：重建 config（读回落盘值，含未被本次更新的既有覆盖项），在跑的池立即跟随。
+        _proxy_pool().config = ProxyConfig.from_file(proxy_config_path)
+        return proxy_config_get()
+
+    # ---------- F6-v3 拦截（仅人工隐式会话 human-main 流量可挂起裁决） ----------
+
+    @app.get("/api/projects/{pid}/browser/intercept")
+    def browser_intercept(pid: str):
+        """挂起包快照 + 两开关状态（2s 轮询数据源）。"""
+        return _browser_inst(pid)._intercept.snapshot()
+
+    class InterceptToggleIn(BaseModel):
+        direction: Literal["request", "response"]
+        enabled: bool
+
+    @app.post("/api/projects/{pid}/browser/intercept/toggle")
+    def browser_intercept_toggle(pid: str, body: InterceptToggleIn):
+        """翻转拦截开关；关闭时该方向全部挂起包自动放行原文（hub 内处理）。"""
+        hub = _browser_inst(pid)._intercept
+        hub.toggle(body.direction, body.enabled)
+        return hub.snapshot()
+
+    class InterceptDecideIn(BaseModel):
+        action: Literal["forward", "drop"]
+        raw: str | None = None    # 放行（改后）：完整报文；缺省=放行原文
+
+    @app.post("/api/projects/{pid}/browser/intercept/{hold_id}/decide")
+    def browser_intercept_decide(pid: str, hold_id: str, body: InterceptDecideIn):
+        """裁决一个挂起包。解析成功后直接裁决，允许修改任意目标 URL。"""
+        from core.browser.httpmsg import parse_raw_request, parse_raw_response
+        inst = _browser_inst(pid)
+        hub = inst._intercept
+        # 锁内取（不 pop——裁决失败要继续等）；KeyError→404（已裁决/已超时同理）
+        hold = next((h for h in hub.snapshot()["pending"]
+                     if h["hold_id"] == hold_id), None)
+        if hold is None:
+            raise HTTPException(404, f"拦截包不存在或已裁决: {hold_id}")
+        mods = None
+        if body.action == "forward" and body.raw is not None and body.raw.strip():
+            if not hold["editable"]:
+                raise HTTPException(422, "二进制 body 不可编辑（只能放行原文或丢弃）")
+            try:
+                if hold["direction"] == "request":
+                    parsed = parse_raw_request(body.raw, base_url=hold["url"])
+                    mods = {"method": parsed["method"], "url": parsed["url"],
+                            "headers": parsed["headers"], "body": parsed["body"]}
+                else:
+                    parsed = parse_raw_response(body.raw)
+                    mods = {"status": parsed["status"],
+                            "headers": parsed["headers"], "body": parsed["body"]}
+            except ValueError as e:
+                raise HTTPException(422, f"报文解析失败: {e}") from e
+        try:
+            hub.decide(hold_id, body.action, mods)
+        except KeyError as e:
+            raise HTTPException(404, f"拦截包不存在或已裁决: {hold_id}") from e
+        return {"decided": True, "hold_id": hold_id, "action": body.action}
+
+
+    # ---------- 黑板（读开放 / 写走单一入口） ----------
+
+    @app.get("/api/projects/{pid}/findings")
+    def list_findings(pid: str, target_asset_id: str | None = None,
+                      min_severity: str | None = None, verified_only: bool = False,
+                      category: str | None = None):
+        return _project(pid).bb.list_findings(
+            pid, target_asset_id=target_asset_id, min_severity=min_severity,
+            verified_only=verified_only, category=category)
+
+    @app.post("/api/projects/{pid}/findings", status_code=201)
+    def add_finding(pid: str, body: FindingIn):
+        proj = _project(pid)
+        if body.target_asset_id:
+            owned = proj.bb.conn.execute(
+                "SELECT 1 FROM assets WHERE id=? AND project_id=?",
+                (body.target_asset_id, pid)).fetchone()
+            if not owned:
+                raise HTTPException(422, f"资产不存在于本项目: {body.target_asset_id}")
+        try:
+            return proj.bb.add_finding(
+                pid, body.vuln_class, body.title, target_asset_id=body.target_asset_id,
+                severity=body.severity, status=body.status, evidence=body.evidence,
+                dedup_key=body.dedup_key, author="human", rating_basis=body.rating_basis,
+                impact=body.impact, remediation=body.remediation,
+                summary=body.summary, affected_assets=body.affected_assets,
+                test_environment=body.test_environment,
+                reproduction_steps=body.reproduction_steps,
+                verification_result=body.verification_result,
+                risk_assessment=body.risk_assessment, pocs=body.pocs,
+                category=body.category, track=proj.track)
+        except ValueError as e:  # relates_to 悬空/跨项目等（E0）
+            raise HTTPException(422, str(e)) from e
+
+    @app.get("/api/projects/{pid}/assets")
+    def list_assets(pid: str, type: str | None = None, status: str | None = None,
+                    tag: str | None = None):
+        bb = _project(pid).bb
+        rows = bb.list_assets(pid, type_=type, status=status, tag=tag)
+        # effective 派生须基于全量树：带过滤参数时子资产可能不在 rows，
+        # 用全量资产算好后按 rows 顺序挂回（binary 等非 coverage 类型原样返回）
+        base = rows if not (type or status or tag) else bb.list_assets(pid)
+        decorated = {a["id"]: a for a in
+                     attach_effective_status(base, bb.list_findings(pid))}
+        return [decorated[a["id"]] for a in rows if a["id"] in decorated]
+
+    @app.post("/api/projects/{pid}/assets", status_code=201)
+    def add_asset(pid: str, body: AssetIn):
+        """人工登记资产（E6 统一入口）：与 Agent bb_add_asset 同走 register_asset——
+        类型自动识别/去重合并（修人工路径同值插重复行）/DNS 挂载/主域名标记。"""
+        try:
+            return register_asset(_project(pid).bb, pid, body.value, type_=body.type,
+                                  parent_id=body.parent_id, meta=body.meta,
+                                  author="human")
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+
+    # ---------- 网络空间测绘（cyberspace-mapping M2，2026-09-23） ----------
+
+    @app.get("/api/fofa/config")
+    def get_fofa_config():
+        cfg = fofa_mod.load_fofa_config(FOFA_CONFIG_PATH)
+        key = str(cfg.get("key") or "")
+        return {"base_url": cfg.get("base_url") or fofa_mod.DEFAULT_BASE_URL,
+                "key": fofa_mod.mask_key(key), "key_set": bool(key.strip())}
+
+    @app.put("/api/fofa/config")
+    def put_fofa_config(body: FofaConfigIn):
+        cfg = fofa_mod.load_fofa_config(FOFA_CONFIG_PATH)
+        if body.base_url is not None:
+            cfg["base_url"] = body.base_url.strip() or fofa_mod.DEFAULT_BASE_URL
+        if body.key:  # 空串/缺省 = 不修改（防回显脱敏值误覆盖真 key）
+            cfg["key"] = body.key.strip()
+        fofa_mod.save_fofa_config(FOFA_CONFIG_PATH, cfg)
+        return get_fofa_config()
+
+    @app.post("/api/fofa/test")
+    def test_fofa():
+        """测试连接：info_my 免费不耗配额。失败不抛（200 + ok:false），
+        错误文案直接可展示。"""
+        client = fofa_mod.FofaClient.from_config(FOFA_CONFIG_PATH)
+        if not client.configured:
+            raise HTTPException(400, "FOFA 未配置 key——先填入并保存")
+        try:
+            info = client.info_my()
+        except fofa_mod.FofaError as e:
+            return {"ok": False, "error": str(e), "base_url": client.base_url}
+        return {"ok": True, "remain": info["remain"], "expire": info["expire"],
+                "base_url": client.base_url}
+
+    # ---------- 飞书连接器（feishu-push v1：确认的中危及以上漏洞自动推送） ----------
+
+    @app.get("/api/integrations/feishu")
+    def get_feishu_config():
+        hub = app.state.feishu_hub
+        cfg = hub.config()
+        return {
+            "enabled": cfg["enabled"],
+            "webhook_url": feishu_mod.mask_webhook(cfg["webhook_url"]),
+            "webhook_set": bool(cfg["webhook_url"]),
+            "secret_set": bool(cfg["secret"]),
+            "min_severity": cfg["min_severity"],
+            "min_severity_choices": list(feishu_mod.SEVERITY_MIN_CHOICES),
+            "projects": cfg["projects"],
+            "notify_on_escalation": cfg["notify_on_escalation"],
+            "include_poc": cfg["include_poc"],
+            "rate_limit_per_min": cfg["rate_limit_per_min"],
+            "timeout_s": cfg["timeout_s"],
+            "retry": cfg["retry"],
+            "base_url": cfg["base_url"],
+            "stats": hub.stats(),
+        }
+
+    @app.put("/api/integrations/feishu")
+    def put_feishu_config(body: FeishuConfigIn):
+        cfg = feishu_mod.load_config(feishu_mod.CONFIG_PATH)
+        if body.enabled is not None:
+            cfg["enabled"] = body.enabled
+        if body.webhook_url is not None and "*" not in body.webhook_url:
+            cfg["webhook_url"] = body.webhook_url.strip()
+        if body.clear_secret:
+            cfg["secret"] = ""
+        elif body.secret and body.secret != "****":
+            cfg["secret"] = body.secret.strip()
+        if body.min_severity is not None:
+            cfg["min_severity"] = body.min_severity
+        if body.projects is not None:
+            cfg["projects"] = body.projects
+        if body.notify_on_escalation is not None:
+            cfg["notify_on_escalation"] = body.notify_on_escalation
+        if body.include_poc is not None:
+            cfg["include_poc"] = body.include_poc
+        if body.rate_limit_per_min is not None:
+            cfg["rate_limit_per_min"] = body.rate_limit_per_min
+        if body.timeout_s is not None:
+            cfg["timeout_s"] = body.timeout_s
+        if body.retry is not None:
+            cfg["retry"] = body.retry
+        if body.base_url is not None:
+            cfg["base_url"] = body.base_url.strip()
+        try:
+            feishu_mod.normalize_config(cfg)  # 写路径严格校验（非法 → 422）
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        except feishu_mod.FeishuError as e:
+            raise HTTPException(422, str(e))
+        feishu_mod.save_config(feishu_mod.CONFIG_PATH, cfg)
+        app.state.feishu_hub.reload_config()
+        app.state.feishu_hub.restart_worker_if_needed()
+        return get_feishu_config()
+
+    @app.post("/api/integrations/feishu/test")
+    async def test_feishu():
+        """测试连接：同步发一张测试卡（threadpool 跑，不占事件循环）。
+        失败不抛（200 + ok:false），文案可直展。"""
+        ok, detail = await run_in_threadpool(app.state.feishu_hub.send_test)
+        return {"ok": ok, "detail": detail}
+
+    # ---------- FOFA 查询历史（2026-09-28：查询结果持久化 + 历史即保持） ----------
+    # 动因：查询结果此前仅存前端组件局部 state，切导航/切页签即丢且后端零持久化。
+    # 现查询成功即落 <项目>/fofa_history/<id>.json（含全量 rows），前端面板挂载时
+    # 自动恢复最近一次——切页/刷新都不丢；历史可单删/清空，删除=删文件（连带物理
+    # 保存）。保存尽力而为（失败不阻断查询返回，配额照扣）。
+
+    _FOFA_HIST_MAX = 50  # FIFO 上限：文件名时间前缀天然有序，超限淘汰最旧
+
+    def _fofa_annotate_rows(proj, raw_rows: list[dict]) -> list[dict]:
+        """existing 三锚点标注（domain/service/host 是否已在黑板）——search 与
+        历史恢复共用：历史里存原始 rows，恢复时现算标注（资产可能已导入，
+        灰显状态要新鲜）。锚点镜像 import_assets 登记语义（2026-09-29 精确化）：
+        按 clean_host(host or domain)（=导入 _host_of 同口径）算实际会被登记的
+        值——是域名就精确查该子域（只入过根域不再灰显子域行），是 IP 归
+        service/host 锚点不查 domain。"""
+        rows = []
+        for row in raw_rows:
+            ip = str(row.get("ip") or "").strip()
+            port = str(row.get("port") or "").strip()
+            host = str(row.get("host") or "").strip()
+            domain = str(row.get("domain") or "").strip()
+            h = clean_host(host or domain)
+            dom = h if h and not _is_ip(h) else ""
+            # service 锚点镜像导入分支：ip:port，缺 ip 用域名 host:port
+            svc = (f"{ip}:{port}" if ip and port
+                   else (f"{h}:{port}" if port and h and not _is_ip(h) else ""))
+            rows.append({**row, "existing": {
+                "domain": bool(dom and proj.bb.find_asset(proj.id, "domain", dom)),
+                "service": bool(svc and proj.bb.find_asset(proj.id, "service", svc)),
+                "host": bool(ip and proj.bb.find_asset(proj.id, "host", ip)),
+            }})
+        return rows
+
+    def _fofa_hist_save(proj, query: str, size: int, total: int,
+                        raw_rows: list[dict]) -> dict | None:
+        """查询成功后落历史（尽力而为，任何异常返回 None 不上抛）。"""
+        try:
+            d = Path(proj.path) / "fofa_history"
+            d.mkdir(parents=True, exist_ok=True)
+            hid = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+            rec = {"id": hid, "query": query, "size": size, "total": total,
+                   "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                   "rows": raw_rows}
+            (d / f"{hid}.json").write_text(
+                json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+            # FIFO 按 mtime 排序（hid 时间前缀秒级，同秒多条时文件名字典序≠写入序）
+            files = sorted(d.glob("*.json"),
+                           key=lambda f: f.stat().st_mtime)
+            for f in files[:-_FOFA_HIST_MAX]:
+                f.unlink(missing_ok=True)
+            return {k: rec[k] for k in ("id", "query", "size", "total", "ts")}
+        except Exception:
+            log.exception("FOFA 查询历史保存失败（不影响查询返回）")
+            return None
+
+    def _fofa_hist_path(proj, hid: str) -> Path:
+        if not re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{6}", hid or ""):
+            raise HTTPException(422, "历史 id 非法")
+        return Path(proj.path) / "fofa_history" / f"{hid}.json"
+
+    @app.get("/api/projects/{pid}/fofa/history")
+    def fofa_history_list(pid: str):
+        """轻量列表（不含 rows，按时间倒序）——面板挂载拉取，最近一条用于自动恢复。"""
+        proj = _project(pid)
+        d = Path(proj.path) / "fofa_history"
+        items = []
+        if d.is_dir():
+            # mtime 倒序（最新在前；文件名时间前缀秒级，同秒多条时不可靠）
+            for f in sorted(d.glob("*.json"),
+                            key=lambda f: f.stat().st_mtime, reverse=True):
+                try:
+                    rec = json.loads(f.read_text(encoding="utf-8"))
+                    items.append({k: rec[k] for k in ("id", "query", "size", "total", "ts")})
+                except (OSError, ValueError, KeyError):
+                    continue  # 损坏记录跳过，不阻塞列表
+        return {"items": items}
+
+    @app.get("/api/projects/{pid}/fofa/history/{hid}")
+    def fofa_history_get(pid: str, hid: str):
+        """单条全量（恢复用）：rows 现算 existing 标注。"""
+        proj = _project(pid)
+        f = _fofa_hist_path(proj, hid)
+        if not f.is_file():
+            raise HTTPException(404, "历史记录不存在")
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise HTTPException(500, f"历史记录损坏: {e}") from e
+        return {**rec, "rows": _fofa_annotate_rows(proj, rec.get("rows") or [])}
+
+    @app.delete("/api/projects/{pid}/fofa/history/{hid}")
+    def fofa_history_delete(pid: str, hid: str):
+        """删单条记录（连带查询结果物理文件）。"""
+        proj = _project(pid)
+        f = _fofa_hist_path(proj, hid)
+        if f.is_file():
+            f.unlink(missing_ok=True)
+        return {"deleted": hid}
+
+    @app.delete("/api/projects/{pid}/fofa/history")
+    def fofa_history_clear(pid: str):
+        """清空全部历史（删整个目录）。"""
+        proj = _project(pid)
+        shutil.rmtree(Path(proj.path) / "fofa_history", ignore_errors=True)
+        return {"cleared": True}
+
+    @app.post("/api/projects/{pid}/fofa/search")
+    def fofa_search(pid: str, body: FofaSearchIn):
+        """FOFA 查询（消耗等量配额）：结果逐行标注 existing（domain/service/host
+        三锚点是否已在黑板），前端灰显免重复导入。错误分流：配额耗尽 429（必须
+        立即停）、key/base url 配置类 400、其余中转错误 502。成功后落查询历史
+        （历史即保持：切页/刷新由前端从历史自动恢复）。"""
+        proj = _project(pid)
+        client = fofa_mod.FofaClient.from_config(FOFA_CONFIG_PATH)
+        if not client.configured:
+            raise HTTPException(400, "FOFA 未配置 key——先在「网络空间测绘」设置里填入")
+        q = body.query.strip()
+        if not q:
+            raise HTTPException(422, "查询语句为空")
+        try:
+            res = client.search(q, size=body.size, page=body.page)
+        except fofa_mod.QuotaExhausted as e:
+            raise HTTPException(429, str(e)) from e
+        except (fofa_mod.ConfigError, fofa_mod.AuthError) as e:
+            raise HTTPException(400, str(e)) from e
+        except fofa_mod.FofaError as e:
+            raise HTTPException(502, str(e)) from e
+        # 查询入口统一清洗 host（clean_host 幂等：剥 scheme/「:端口」尾）——
+        # FOFA 的 host 字段常带「https://x」「x:8080」脏形态，清洗后展示/灰显/
+        # 落历史/导入四处同口径；存量旧历史文件不回写（恢复原样展示，导入链自清洗）
+        clean_rows = [{**r, "host": clean_host(str(r.get("host") or ""))}
+                      for r in res["rows"]]
+        rows = _fofa_annotate_rows(proj, clean_rows)
+        saved = _fofa_hist_save(proj, q, body.size, res["total"], clean_rows)
+        return {**res, "rows": rows, "history_id": (saved or {}).get("id")}
+
+    @app.post("/api/projects/{pid}/assets/import/preview")
+    def asset_import_preview(pid: str, file: UploadFile = File(...)):
+        """导入预览（multipart）：解析 + 列映射嗅探建议 + 全量行回传（前端内存
+        持有，确认导入时随 mapping 回传——服务端不存文件状态）。"""
+        _project(pid)
+        suffix = Path(file.filename or "").suffix
+        data = file.file.read(10 * 1024 * 1024 + 1)
+        if len(data) > 10 * 1024 * 1024:
+            raise HTTPException(413, "文件过大（>10MB）")
+        try:
+            parsed = assetimport.parse_table(data, suffix)
+        except assetimport.XlsxUnavailable as e:
+            raise HTTPException(503, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        return {"filename": file.filename, "header": parsed["header"],
+                "columns": parsed["columns"], "rows": parsed["rows"],
+                "total_rows": parsed["total_rows"], "truncated": parsed["truncated"]}
+
+    @app.post("/api/projects/{pid}/assets/import")
+    def asset_import(pid: str, body: AssetImportIn):
+        """批量导入（register_asset 单一入口 quiet=True，整批单条
+        asset.imported 汇总事件）：mapping 给出 → 表格二维数组先归一化；
+        缺省 → rows 为已归一化 dict 行（FOFA 勾选/手工 JSON）。"""
+        proj = _project(pid)
+        source = (body.source or "").strip().lower()
+        if source not in ("xlsx", "csv", "fofa", "manual"):
+            raise HTTPException(422, f"source 非法: {source}（限 xlsx/csv/fofa/manual）")
+        if len(body.rows) > assetimport.MAX_IMPORT_ROWS:
+            raise HTTPException(422,
+                                f"单批导入超上限（>{assetimport.MAX_IMPORT_ROWS} 行）")
+        skipped = 0
+        if body.mapping is not None:
+            try:
+                norm_rows, skipped = assetimport.normalize_rows(
+                    body.rows, body.mapping)
+            except (TypeError, KeyError, ValueError) as e:
+                raise HTTPException(422, f"行格式无法归一化: {e}") from e
+        else:
+            norm_rows = [r for r in body.rows if isinstance(r, dict)]
+            if len(norm_rows) != len(body.rows):
+                raise HTTPException(422, "rows 含非对象行（dict 形态导入需逐行对象）")
+        if not norm_rows:
+            raise HTTPException(422, "没有可导入的行（全空或映射后为空）")
+        summary = import_assets(proj.bb, pid, norm_rows, source, author="human")
+        summary["skipped_parse"] = skipped
+        return summary
+
+    @app.get("/api/projects/{pid}/artifacts/content")
+    def artifact_content(pid: str, ref: str):
+        """按 artifact id 或项目内相对路径读产物文本内容（只读；WebUI POC 弹窗用）。
+
+        解析顺序：artifacts 表按 id → 表按 path → 裸路径（旧数据 evidence.poc_artifact
+        只有路径字符串）。防穿越：resolve 后必须仍落在项目目录内；debug-log 上限
+        4MB（动态验证日志），其余 256KB。
+        """
+        proj = _project(pid)
+        row = proj.bb.conn.execute(
+            "SELECT id, path, kind, sha256 FROM artifacts WHERE (id=? OR path=?) AND project_id=?",
+            (ref, ref, pid)).fetchone()
+        if row:
+            rel, kind, sha, art_id = row["path"], row["kind"], row["sha256"], row["id"]
+        else:
+            rel, kind, sha, art_id = ref, "file", "", None
+        base = Path(proj.path).resolve()
+        target = (base / rel).resolve()
+        if not target.is_relative_to(base):
+            raise HTTPException(422, f"产物路径越界: {rel}")
+        if not target.is_file():
+            raise HTTPException(404, f"产物文件不存在: {rel}")
+        # debug-log（x64dbg 断点日志回流）放宽到 4MB，其余产物 256KB
+        max_bytes = 4 * 1024 * 1024 if kind == "debug-log" else 256 * 1024
+        if target.stat().st_size > max_bytes:
+            raise HTTPException(413, f"产物过大（>{max_bytes // 1024}KB），请到项目目录查看: {rel}")
+        return {
+            "id": art_id, "path": rel, "kind": kind, "sha256": sha,
+            "content": target.read_text(encoding="utf-8", errors="replace"),
+        }
+
+    @app.patch("/api/assets/{asset_id}")
+    def patch_asset(asset_id: str, body: AssetPatchIn):
+        """资产更新（改挂父行 / 合并 meta，§5.2）：upsert 键含 parent_id，补挂必须走更新。"""
+        bb = _project(_pid_of_asset(asset_id)).bb
+        changes = body.model_dump(exclude_unset=True)
+        try:
+            if "parent_id" in changes:  # 传 null = 摘挂为根行
+                bb.set_asset_parent(asset_id, body.parent_id)
+            if "meta" in changes:       # 传 {} = 无操作，传键值 = 合并
+                bb.update_asset_meta(asset_id, body.meta or {})
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        asset = bb.get_asset(asset_id)
+        if asset is None:
+            raise HTTPException(404, f"资产不存在: {asset_id}")
+        return asset
+
+    @app.delete("/api/projects/{pid}/assets/{asset_id}")
+    def delete_asset(pid: str, asset_id: str, cascade: bool = False):
+        """物理删除叶子资产（资产树整理/走查清理）：有子资产 → 409。
+
+        `cascade=true`（2026-10-16，Web UI 删除按钮默认带上）：把引用该资产的发现
+        **一并物理删除**（语义同 DELETE finding，不触发撤回传播），锚定该资产的
+        **意图一并物理删除**（intents.target_asset_id 同为外键，2026-10-16 esp 500
+        事故修复——不清则 assets 行删除触发 IntegrityError 裸穿成 500）；响应多带
+        `findings_deleted` / `intents_deleted`；不带该参数时仍被 finding/意图引用
+        → 409（agent 工具 `bb_delete_asset` 与脚本走 store 默认值，行为不变）。
+        """
+        bb = _project(pid).bb
+        if not bb.conn.execute(
+                "SELECT 1 FROM assets WHERE id=? AND project_id=?",
+                (asset_id, pid)).fetchone():
+            raise HTTPException(404, f"资产不存在于本项目: {asset_id}")
+        try:
+            row = bb.delete_asset(asset_id, author="human",
+                                  cascade_findings=cascade)
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from e
+        return {"deleted": asset_id, **row}
+
+    # ---------- CTF 题目（challenge-asset，2026-10-14） ----------
+
+
+    @app.get("/api/projects/{pid}/challenges")
+    def list_challenges(pid: str):
+        """题目清单（challenge-asset）：一次拿全题目行 + 附件/发现/意图计数。
+
+        读路径惰性补建存量项目（见 `_backfill_challenges`）——打开项目即补，
+        幂等且不重复触发。非 CTF 轨返回空清单。"""
+        proj = _project(pid)
+        if proj.track == "ctf":
+            _backfill_challenges(proj)
+        rows = proj.bb.list_assets(pid, type_=CHALLENGE_TYPE)
+        return _challenge_summary(proj, rows)
+
+    @app.post("/api/projects/{pid}/challenges", status_code=201)
+    def create_challenge(pid: str, body: ChallengeIn):
+        """人工建题（题目 tab 的「新建题目」入口）：与 Agent 的
+        bb_declare_challenge 同一写入口 register_challenge。
+
+        `thread_id` 可选：传了就把该线程绑到这道题上（工作台「设为当前题目」）。
+        `name` 可空——空名时按题面/入口内容指纹生成稳定 value（AI 可后补 title）。
+        `entries` 逐条建子资产（web 入口 URL / 附件）。
+        """
+        proj = _project(pid)
+        if proj.track != "ctf":
+            raise HTTPException(422,
+                                "bb_declare_challenge 仅 CTF 轨可用"
+                                "（渗透/红队/研究轨的目标是站点/样本，不是题目）")
+        try:
+            r = register_challenge(
+                proj.bb, pid, body.name,
+                title=body.title or body.description,
+                description=body.description,
+                brief=body.brief, entry_hint=body.entry_hint,
+                direction=body.direction, tags=body.tags,
+                flag_format=body.flag_format, flag_count=body.flag_count,
+                flag_hints=body.flag_hints,
+                entries=body.entries, author="human")
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        tid = (body.thread_id or "").strip()
+        if tid:
+            try:
+                chat_store.update_thread(proj.bb, tid, challenge_asset_id=r["id"])
+            except Exception as e:  # noqa: BLE001 —— 绑不上不阻断建题
+                log.exception("challenge 绑定线程失败 tid=%s", tid)
+                raise HTTPException(422, f"题目已建但绑定线程失败: {e}") from e
+        row = proj.bb.get_asset(r["id"])
+        if row is None:  # register_asset 合并既有行的兜底
+            row = proj.bb.find_asset(pid, CHALLENGE_TYPE, r["value"])
+        return _challenge_summary(proj, [row])[0]
+
+    @app.patch("/api/challenges/{asset_id}")
+    def patch_challenge(asset_id: str, body: ChallengePatchIn):
+        """改题目：name（改名）/ title / brief / entry_hint / direction /
+        tags / flag_format / flag_count。
+
+        name 走 `update_asset_value`（撞同名 422）；其余走 `update_asset_meta`
+        合并（传空串=清该键，None=不动）。
+        """
+        proj = _project(_pid_of_asset(asset_id))
+        row = proj.bb.get_asset(asset_id)
+        if row is None or row.get("type") != CHALLENGE_TYPE:
+            raise HTTPException(404, f"题目不存在: {asset_id}")
+        try:
+            if body.name is not None:
+                proj.bb.update_asset_value(asset_id, body.name)
+                row = proj.bb.get_asset(asset_id)
+            patch: dict = {}
+            if body.title is not None:
+                patch["title"] = body.title.strip()
+            elif body.description is not None:
+                patch["title"] = body.description.strip()
+            if body.brief is not None:
+                patch["brief"] = body.brief.strip()
+            if body.entry_hint is not None:
+                patch["entry_hint"] = body.entry_hint.strip()
+            if body.direction is not None:
+                patch["direction"] = body.direction.strip()
+            if body.flag_format is not None:
+                from core.blackboard.assets import _normalize_flag_format
+                patch["flag_format"] = _normalize_flag_format(body.flag_format)
+            if body.flag_count is not None:
+                patch["flag_count"] = max(1, min(int(body.flag_count), 50))
+            if body.flag_hints is not None:
+                from core.blackboard.assets import _normalize_flag_hints
+                hints = _normalize_flag_hints(body.flag_hints)
+                # 空列表 = 清空该键（与「空串=清该键」同口径）
+                patch["flag_hints"] = hints
+            if body.tags is not None:
+                patch["tags"] = [str(t).strip() for t in body.tags
+                                 if str(t).strip()]
+            if patch:
+                row = proj.bb.update_asset_meta(asset_id, patch)
+        except (ValueError, LookupError) as e:
+            raise HTTPException(422, str(e)) from e
+        return _challenge_summary(proj, [proj.bb.get_asset(asset_id)])[0]
+
+    # ---------- CTF flag 台账（challenge-flag-ledger，v47） ----------
+
+    @app.get("/api/challenges/{asset_id}/flags")
+    def list_challenge_flags(asset_id: str):
+        """某题目的 flag 台账（含 rejected，人工裁决界面需要看到才能撤销）。"""
+        from core.blackboard.challenge_flags import (
+            challenge_state, list_flags)
+        pid = _pid_of_asset(asset_id)
+        proj = _project(pid)
+        row = proj.bb.get_asset(asset_id)
+        if row is None or row.get("type") != CHALLENGE_TYPE:
+            raise HTTPException(404, f"题目不存在: {asset_id}")
+        running = _running_intents_by_challenge(proj, [asset_id]).get(asset_id, 0)
+        # `flag_hints` 与 `state` 同返回：台账弹层要按行显示「这条对应哪句题面」，
+        # 而提示是**题目级**的（meta.flag_hints），不是 flag 行自带的（flag-hint，
+        # 2026-10-21）。少这一个字段，前端只能显示裸 flag 串。
+        meta = dict(row.get("meta") or {})
+        return {"challenge_id": asset_id,
+                "flags": list_flags(proj.bb, pid, asset_id),
+                "flag_hints": [str(x or "") for x in (meta.get("flag_hints") or [])],
+                "state": challenge_state(proj.bb, pid, asset_id, running=running)}
+
+    @app.post("/api/challenges/{asset_id}/flags", status_code=201)
+    def add_challenge_flag(asset_id: str, body: ChallengeFlagIn):
+        """人工录入 flag（judged_by=human）。人工录入默认 accepted——人说的算。"""
+        from core.blackboard.challenge_flags import record_flag
+        pid = _pid_of_asset(asset_id)
+        proj = _project(pid)
+        row = proj.bb.get_asset(asset_id)
+        if row is None or row.get("type") != CHALLENGE_TYPE:
+            raise HTTPException(404, f"题目不存在: {asset_id}")
+        if body.verdict not in ("accepted", "pending", "rejected"):
+            raise HTTPException(422, "verdict 只能是 accepted / pending / rejected")
+        try:
+            r = record_flag(proj.bb, pid, asset_id, body.flag,
+                            source=body.source, judged_by="human",
+                            verdict=body.verdict, author="human",
+                            hint_index=body.hint_index)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        # 人工录入 accepted = 人工确认（默认值就是 accepted）。**必须与台账里点
+        # 「确认有效」同口径通知**（flag-hint，2026-10-21）：此前这条路径一条通知
+        # 都不发，于是「同样是人工确认一条 flag」，点按钮会通知、手工录入不会，
+        # 正在跑的 agent 完全不知道台账变了。
+        if str(body.verdict or "") == "accepted" and not r.get("rejected"):
+            try:
+                _notify_project_chat_turns(
+                    pid, asset_id=asset_id, flag_row=r.get("row") or {},
+                    reason="人工录入 flag")
+            except Exception:  # noqa: BLE001 —— 通知失败不该让录入失败
+                log.exception("人工录入 flag 后通知失败 asset=%s", asset_id)
+        return r
+
+    @app.patch("/api/challenges/{asset_id}/flags/{flag_id}")
+    def decide_challenge_flag(asset_id: str, flag_id: str,
+                              body: ChallengeFlagDecideIn):
+        """人工裁决 flag：accepted（确认）/ rejected（**标记为错误**）/ pending。
+
+        rejected 立刻从 solved 派生里扣除（状态是派生值，自动生效），并进
+        「已拒绝」清单——同串再提交会被 `ctf_submit_flag` 直接拦下。
+
+        **确认 = 通知收工，不是掐断**（challenge-confirm-notice，2026-10-20，
+        用户裁决推翻原「确认即停」）：
+        `accepted` 是**强证据**——人看过、点了确认，题目已经解出。但此前实现是
+        `_abort_project_chat_turns()`，即**直接置位中止事件**，后果是：
+        - 正在跑的轮次被掐在半个工具调用里，`_persist_stopped` 只落一句「已按
+          人类要求停止」——模型**没有任何机会写回**手上已识别的结论（解题路径、
+          还没登记的证据），这些观察随轮次一起蒸发；
+        - 用户看到的是「一堆线程突然红了」，而不是「主控说：这题解出了，我收工」。
+
+        现在改为**投递一条通知**（`core/chat/inbox.py`），模型在下一个步边界读到
+        事实后自己决定怎么收尾。**语义从「外部强制终止」变成「外部告知事实」**
+        ——终止权仍归模型，因为它比外部更清楚自己此刻在哪个方向、拿到了什么。
+
+        通知正文**按台账实际状态分叉**（flag-hint，2026-10-21）：真解出（拿满配额）
+        才说「收工」；只是 1/N 时说「已确认哪几条（含题面提示）、还差几条」，由 agent
+        自己比对方向。详见 `_solved_notice`。
+
+        `rejected` 不投递（题目还没解出，该继续跑）。
+        """
+        from core.blackboard.challenge_flags import decide_flag
+        pid = _pid_of_asset(asset_id)
+        proj = _project(pid)
+        try:
+            row = decide_flag(proj.bb, pid, flag_id, verdict=body.verdict,
+                              reason=body.reason, author="human")
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        if str(body.verdict or "") == "accepted":
+            # **通知的触发条件是「台账变了」而不是「这次是 accepted」**
+            # （flag-hint，2026-10-21 修正）。
+            #
+            # 旧实现只判 `verdict == "accepted"` 就投递「这题已解出，不用再
+            # 探索了」——多 flag 题（如 6 条）确认第 1 条时，题目才 1/6，
+            # 子 agent 却收到「答案已确认、别再探索」，于是把正在找的第 2~6 条
+            # 全放弃。用户看到的正是「确认一条 flag，子进程就被取消」。
+            #
+            # 现在文案由 `_solved_notice` 按台账实际状态分叉：
+            #   * 已解出（accepted >= quota）→ 收工；
+            #   * 未解出 → 告知「已确认哪几条（含题面提示）、还差几条」，
+            #     由 agent 自己判断「这条是不是我的方向」，是才转向、不是就继续。
+            _notify_project_chat_turns(
+                pid, asset_id=asset_id, flag_row=row,
+                reason="人工已确认 flag")
+        return row
+
+    @app.patch("/api/challenges/{asset_id}/flags/{flag_id}/hint")
+    def set_challenge_flag_hint(asset_id: str, flag_id: str,
+                                body: ChallengeFlagHintIn):
+        """人工改「这条 flag 对应题面第几条」（-1=解除绑定）。
+
+        题面序号由**人**定：agent 传的 `hint_index` 只经过来源文本核对，
+        对不上就记 -1；人工在台账详情里可以随时改绑，改完立刻按新序号
+        参与「已确认清单」注入与前端排序。
+        """
+        from core.blackboard.challenge_flags import set_flag_hint
+        pid = _pid_of_asset(asset_id)
+        proj = _project(pid)
+        row = proj.bb.conn.execute(
+            "SELECT challenge_id FROM challenge_flags WHERE id=? AND project_id=?",
+            (flag_id, pid)).fetchone()
+        if row is None or str(row["challenge_id"]) != asset_id:
+            raise HTTPException(404, f"flag 记录不存在于该题目: {flag_id}")
+        try:
+            return set_flag_hint(proj.bb, pid, flag_id, body.hint_index)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+
+    def _notify_project_chat_turns(pid: str, text: str | None = None, *,
+                                   asset_id: str | None = None,
+                                   flag_row: dict | None = None,
+                                   reason: str = "") -> int:
+        """给**该项目、该题目**下所有在跑轮次投递一条通知，返回投递个数。
+
+        **投递而非中止**（2026-10-20 用户裁决）：中止会让模型被掐在半个工具
+        调用里、来不及写回；投递让它在下一个步边界读到事实并自己收尾。
+
+        **存活判据是「通知箱还在」，不是 `app.state.chat_running`**
+        （2026-10-20 修正，用户实测「点了确认，其它子 agent 还在跑」）：
+        `chat_running` 只由 `_chat_launch_turn` 登记**顶层轮次**；`call_expert`
+        spawn 的子专家（`runtime._tool_call_expert`）与 ARTEX Worker
+        （`artex_worker.make_worker`）都不经过它，DB 里 status=running 但集合里
+        没有 → 旧实现 `if tid in running` 把它们**全部静默丢弃**，于是「通知所有
+        在跑轮次」实际只通知到主控自己。
+
+        现在改查 `core.chat.inbox` 的进程级登记表：`ChatTurn` 构造即登记、
+        `run()` 收尾即释放，所以「有箱」精确等于「这一轮正持有它」。
+
+        **范围按 (pid, 题目) 双重限定**：只按 pid 限是不够的——同一 CTF 项目里
+        可以有多道题并行，A 题确认后把「这题已解出」投给 B 题的 worker，它们会
+        停掉自己在做的**另一道题**（与跨项目误投同一种失败，只是粒度更细）。
+        题目归属走 `chat_store.resolve_challenge_asset_id`（子线程沿
+        parent_thread_id 继承，与调度层同口径）。
+
+        ``text`` 为空时按 ``asset_id``/``flag_row`` 现拼（并按收件人角色分叉）。
+        """
+        from core.chat import store as chat_store
+        from core.chat.inbox import box_of, live_thread_ids
+        from core.chat.runtime import CONTROLLER_IDS
+        live = live_thread_ids()
+        if not live:
+            return 0
+        try:
+            proj = _project(pid)
+            rows = proj.bb.conn.execute(
+                "SELECT id, agent_id FROM chat_threads WHERE status='running'"
+            ).fetchall()
+        except Exception:  # noqa: BLE001 —— 查不到就退回「本项目名下」的 running
+            log.exception("通知投递：查询在跑线程失败 pid=%s", pid)
+            return 0
+        hit = 0
+        for r in rows:
+            tid = str(r["id"])
+            if tid not in live:
+                continue        # 进程里没有这一轮（僵尸行交给对账兜底）
+            # 题目范围：通知只对「同一道题」有意义。
+            if asset_id:
+                try:
+                    own = chat_store.resolve_challenge_asset_id(proj.bb, tid)
+                except Exception:  # noqa: BLE001
+                    own = ""
+                # 解析不出归属（未绑定题目的通用会话）也收——它可能在帮这道题
+                # 做事却没有显式绑定；宁可多通知一条，也不要让它在已解出后空跑。
+                if own and own != asset_id:
+                    continue
+            try:
+                body = text
+                if not body:
+                    body = _solved_notice(
+                        proj, asset_id or "", flag_row or {},
+                        is_controller=str(r["agent_id"] or "") in CONTROLLER_IDS)
+                box = box_of(tid)
+                if box is not None and box.post(body):
+                    hit += 1
+            except Exception:  # noqa: BLE001 —— 单个线程投递失败不影响其余
+                log.exception("投递通知失败 tid=%s", tid)
+        if hit:
+            log.info("已向 %d 个在跑轮次投递通知（%s）", hit, reason)
+        return hit
+
+    def _chat_notice_inbox(tid: str, *, create: bool = False):
+        """每线程一个通知箱（兼容旧调用点；实现在 `core.chat.inbox`）。
+
+        登记表已挪到模块级（见 `core/chat/inbox.py` 的说明），这样 spawn 的
+        子专家与 ARTEX Worker 也能取到同一个箱。本函数保留只是为了不改动
+        既有调用点，语义与模块函数一一对应。
+        """
+        from core.chat.inbox import box_for, box_of
+        return box_for(tid) if create else box_of(tid)
+
+    @app.post("/api/challenges/{asset_id}/abandon")
+    def abandon_challenge(asset_id: str, body: ChallengeAbandonIn):
+        """标记放弃 / 撤销放弃（meta.abandoned）。放弃后调度层不再为它派 Worker。"""
+        from core.blackboard.challenge_flags import set_abandoned
+        pid = _pid_of_asset(asset_id)
+        proj = _project(pid)
+        try:
+            row = set_abandoned(proj.bb, pid, asset_id,
+                                abandoned=body.abandoned, author="human")
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        return _challenge_summary(proj, [row])[0]
+
+    def _pid_of_asset(asset_id: str) -> str:
+        for proj in store.list_projects():
+            try:
+                p = _project(proj["id"])
+            except HTTPException:
+                continue
+            if p.bb.conn.execute(
+                    "SELECT 1 FROM assets WHERE id=?", (asset_id,)).fetchone():
+                return proj["id"]
+        raise HTTPException(404, f"资产不存在: {asset_id}")
+
+    @app.get("/api/projects/{pid}/sessions")
+    def list_sessions(pid: str):
+        # F9：补 worker 状态灯数据——armed（meta）+ worker_running（内存 jobs）
+        rows = _project(pid).bb.list_sessions(pid)
+        for row in rows:
+            meta = row.get("meta")
+            meta = json.loads(meta) if isinstance(meta, str) else (meta or {})
+            row["worker_armed"] = bool(meta.get("worker_armed"))
+            # 任务机制退役（2026-10-06）：旧的「任务专属窗」绑定语义消失，绑定任务恒空。
+            row["bound_task_id"] = ""
+            row["context_task_id"] = meta.get("context_task_id") or ""
+            row["context_mode"] = meta.get("context_mode") or ("review" if row["context_task_id"] else "")
+            row["worker_running"] = _session_job_running(row["id"])
+        return rows
+
+    @app.get("/api/projects/{pid}/funcs")
+    def list_funcs(pid: str, binary_sha256: str | None = None):
+        rows = _project(pid).bb.list_funcs(pid, binary_sha256)
+        return [_hex_func_view(r) for r in rows]
+
+    # ---------- 逆向工作台（样本 / headless 缓存 / 人机共写） ----------
+
+    @app.post("/api/projects/{pid}/sample-packages/uploads", status_code=201)
+    def create_sample_upload(pid: str, body: SampleUploadCreateIn):
+        proj = _project(pid)
+        package_store: SamplePackageStore = _package_store()
+        if body.source_type not in {"auto", "file", "zip", "7z", "tar"}:
+            raise HTTPException(422, "source_type 仅支持 auto/file/zip/7z/tar")
+        if body.total_size > package_store.limits.max_source_bytes:
+            raise HTTPException(413, "原始上传物超过大小上限")
+        upload_id = uuid.uuid4().hex[:24]
+        root = _inside(proj, "sample_uploads", upload_id)
+        (root / "chunks").mkdir(parents=True, exist_ok=False)
+        metadata = {
+            "upload_id": upload_id,
+            "filename": body.filename,
+            "source_type": body.source_type,
+            "total_size": body.total_size,
+            "total_chunks": body.total_chunks,
+            "received_chunks": [],
+            "status": "uploading",
+            "created_at": _utc_now(),
+        }
+        (root / "metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {k: metadata[k] for k in ("upload_id", "filename", "total_size", "total_chunks", "status")}
+
+    @app.get("/api/projects/{pid}/sample-packages/uploads/{upload_id}")
+    def sample_upload_status(pid: str, upload_id: str):
+        proj = _project(pid)
+        root, metadata = _sample_upload_meta(proj, upload_id)
+        chunks = root / "chunks"
+        received = sorted(int(p.stem) for p in chunks.glob("*.part") if p.stem.isdigit())
+        metadata["received_chunks"] = received
+        metadata["received_size"] = sum(p.stat().st_size for p in chunks.glob("*.part"))
+        return metadata
+
+    @app.put("/api/projects/{pid}/sample-packages/uploads/{upload_id}/chunks/{chunk_index}")
+    async def upload_sample_chunk(pid: str, upload_id: str, chunk_index: int, request: Request):
+        proj = _project(pid)
+        root, metadata = _sample_upload_meta(proj, upload_id)
+        if metadata.get("status") != "uploading":
+            raise HTTPException(409, "上传会话已结束")
+        total_chunks = int(metadata["total_chunks"])
+        if chunk_index < 0 or chunk_index >= total_chunks:
+            raise HTTPException(422, "分片序号越界")
+        chunk = await request.body()
+        # A bounded chunk prevents a client from bypassing the source quota in
+        # memory before the assembled file is checked.
+        if len(chunk) > 16 * 1024 * 1024:
+            raise HTTPException(413, "单个分片不能超过 16MB")
+        path = root / "chunks" / f"{chunk_index}.part"
+        if path.exists():
+            if path.read_bytes() != chunk:
+                raise HTTPException(409, "同一分片已存在且内容不同")
+        else:
+            temp = path.with_suffix(".tmp")
+            temp.write_bytes(chunk)
+            os.replace(temp, path)
+        return {"upload_id": upload_id, "chunk_index": chunk_index,
+                "size": len(chunk), "status": "received"}
+
+    @app.post("/api/projects/{pid}/sample-packages/uploads/{upload_id}/complete", status_code=202)
+    def complete_sample_upload(pid: str, upload_id: str):
+        proj = _project(pid)
+        root, metadata = _sample_upload_meta(proj, upload_id)
+        if metadata.get("status") == "complete":
+            return metadata.get("result") or metadata
+        if metadata.get("status") != "uploading":
+            raise HTTPException(409, "上传会话不可完成")
+        chunks_dir = root / "chunks"
+        expected = list(range(int(metadata["total_chunks"])))
+        actual = sorted(int(p.stem) for p in chunks_dir.glob("*.part") if p.stem.isdigit())
+        if actual != expected:
+            missing = sorted(set(expected) - set(actual))
+            raise HTTPException(409, f"仍缺少分片: {missing[:20]}")
+        assembled = root / "assembled.part"
+        total = 0
+        with assembled.open("wb") as out:
+            for index in expected:
+                part = chunks_dir / f"{index}.part"
+                data = part.read_bytes()
+                total += len(data)
+                if total > int(metadata["total_size"]):
+                    raise HTTPException(422, "分片总大小超过声明值")
+                out.write(data)
+        if total != int(metadata["total_size"]):
+            raise HTTPException(422, "分片总大小与声明值不一致")
+        try:
+            result = _package_store().import_source(
+                proj.path, assembled, filename=str(metadata["filename"]),
+                source_type=str(metadata.get("source_type") or "auto"))
+        except SamplePackageError as exc:
+            metadata["status"] = "failed"
+            metadata["error"] = str(exc)
+            (root / "metadata.json").write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            raise HTTPException(422, str(exc)) from exc
+        metadata["status"] = "complete"
+        metadata["completed_at"] = _utc_now()
+        metadata["result"] = {"package_id": result["package_id"], "version_id": result["version_id"],
+                               "manifest_sha256": result["manifest_sha256"],
+                               "file_count": result["file_count"], "targets": result["targets"],
+                               "dependencies": result["dependencies"]}
+        (root / "metadata.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        shutil.rmtree(chunks_dir, ignore_errors=True)
+        return metadata["result"]
+
+    @app.post("/api/projects/{pid}/sample-packages", status_code=202)
+    def import_sample_package(
+        pid: str,
+        file: UploadFile | None = File(default=None),
+        files: list[UploadFile] | None = File(default=None),
+        relative_paths: list[str] | None = Form(default=None),
+    ):
+        """Import a single file/archive or a browser-selected directory.
+
+        Directory uploads use repeated ``files`` parts.  The browser supplied
+        filename is treated as an untrusted relative path and never as a host
+        filesystem path.
+        """
+        proj = _project(pid)
+        package_store: SamplePackageStore = _package_store()
+        uploads = list(files or [])
+        if file is not None:
+            if uploads:
+                raise HTTPException(422, "file 与 files 只能二选一")
+            temp = _write_upload_temp(file, package_store.limits.max_source_bytes)
+            try:
+                try:
+                    result = package_store.import_source(
+                        proj.path, temp, filename=file.filename or "sample.bin")
+                except SamplePackageError as exc:
+                    raise HTTPException(422, str(exc)) from exc
+            finally:
+                temp.unlink(missing_ok=True)
+        elif uploads:
+            temp_files: list[tuple[str, Path]] = []
+            try:
+                names = relative_paths or []
+                for index, upload in enumerate(uploads):
+                    temp = _write_upload_temp(upload, package_store.limits.max_file_bytes,
+                                              allow_empty=True)
+                    name = names[index] if index < len(names) and names[index] else (upload.filename or "sample.bin")
+                    temp_files.append((name, temp))
+                try:
+                    result = package_store.import_folder_files(
+                        proj.path, temp_files, origin={"file_count": len(temp_files)})
+                except SamplePackageError as exc:
+                    raise HTTPException(422, str(exc)) from exc
+            finally:
+                for _, temp in temp_files:
+                    temp.unlink(missing_ok=True)
+        else:
+            raise HTTPException(422, "请上传 file 或 files")
+        # 返回**完整**分析包对象（含 entries/origin/created_at/tree_ref）——与
+        # GET .../sample-packages/current 同形。此前只回摘要（丢 entries），前端
+        # `setPkg(摘要)` 后 `entries===undefined` → 文件树为空，用户必须手动刷新页面
+        # 才看到分析包（append/move/delete 端点本就回完整对象，此处对齐）。
+        pointer = package_store._read_current(proj.path) or {}
+        return {
+            **result,
+            "raw_sha256": (result.get("origin") or {}).get("raw_sha256"),
+            "undo_available": bool((pointer.get("undo") or {}).get("version_id")),
+        }
+
+    @app.get("/api/projects/{pid}/sample-packages")
+    def list_sample_packages(pid: str):
+        proj = _project(pid)
+        return _package_store().list_packages(proj.path)
+
+    # ---------- 选择分析包：目录浏览 + 原地关联（2026-10-24） ----------
+
+    #: 目录浏览一次最多返回多少个子目录（只列目录，不列文件——这里唯一的用途是
+    #: 让用户「点着找」到那个大包，列文件既慢又没用）。
+    _DIR_BROWSE_MAX = 300
+
+    def _browse_roots() -> list[Path]:
+        """目录浏览器可选的起点：Windows 各盘符 / POSIX 根与家目录。
+
+        这是**人工显式操作**（用户主动点「选择分析包」并逐级点进目标目录），
+        不是 agent 可触达的工具面——agent 侧读路径本就放开（只有写才拦边界），
+        故此处列盘符不构成新的越权面。
+        """
+        roots: list[Path] = []
+        if os.name == "nt":
+            import string
+            for letter in string.ascii_uppercase:
+                drive = Path(f"{letter}:\\")
+                try:
+                    if drive.exists():
+                        roots.append(drive)
+                except OSError:
+                    continue
+        else:
+            roots.extend([Path("/"), Path.home()])
+        home = Path.home()
+        if home.is_dir() and home not in roots:
+            roots.insert(0, home)
+        return roots
+
+    @app.get("/api/projects/{pid}/workspace/dirs")
+    def browse_directories(pid: str, path: str | None = Query(default=None)):
+        """列出一个目录的子目录（「选择分析包」的应用内目录浏览器）。
+
+        `path` 省略 → 返回起点列表（磁盘/家目录）。返回项含 `is_project` /
+        `is_workspace` 标记，前端据此提示「这个已经是本项目工作区」等。
+        隐藏/系统目录照常列出（用户可能就想选它们），但不 follow 符号链接，
+        读不到（权限/已卸载）的目录直接跳过而不是 500。
+        """
+        proj = _project(pid)
+        if not path:
+            items = []
+            for root in _browse_roots():
+                try:
+                    st = root.stat()
+                except OSError:
+                    continue
+                items.append({"name": str(root), "path": str(root), "kind": "dir",
+                              "entry_count": None, "root": True,
+                              "is_project": str(root) == str(proj.path)})
+            return {"path": "", "parent": None, "roots": True, "entries": items}
+
+        target = Path(str(path))
+        if not target.is_absolute():
+            raise HTTPException(422, "目录路径必须是绝对路径")
+        try:
+            resolved = target.resolve(strict=True)
+        except OSError as exc:
+            raise HTTPException(404, f"目录不存在或不可访问: {path}") from exc
+        if not resolved.is_dir():
+            raise HTTPException(422, f"不是目录: {path}")
+        linked_ws = _package_store().exec_workspace(proj.path)
+        entries: list[dict[str, Any]] = []
+        truncated = False
+        try:
+            children = sorted(resolved.iterdir(), key=lambda p: p.name.lower())
+        except OSError as exc:
+            raise HTTPException(403, f"目录不可读: {path}") from exc
+        for child in children:
+            try:
+                if not child.is_dir() or child.is_symlink():
+                    continue
+            except OSError:
+                continue
+            if len(entries) >= _DIR_BROWSE_MAX:
+                truncated = True
+                break
+            try:
+                count = sum(1 for _ in child.iterdir())
+            except OSError:
+                count = None
+            entries.append({
+                "name": child.name, "path": str(child), "kind": "dir",
+                "entry_count": count, "root": False,
+                "is_project": child == proj.path,
+                "is_workspace": bool(linked_ws and child == Path(linked_ws).parent),
+            })
+        parent = resolved.parent if resolved.parent != resolved else None
+        return {"path": str(resolved), "parent": str(parent) if parent else None,
+                "roots": False, "entries": entries, "truncated": truncated}
+
+    @app.post("/api/projects/{pid}/sample-packages/link", status_code=202)
+    def link_sample_package(pid: str, body: SampleLinkIn):
+        """把外部文件夹**原地**登记为分析包 + 执行工作区（2026-10-24）。
+
+        与上传路径的区别只有「不复制」：几十 GB 的分析包既不该走浏览器上传，
+        也不该在项目内再复制一份。目录本身成为 tree_ref，同时也是该项目后续
+        agent 会话的执行工作区（`_exec_workspace`）。
+
+        扫描是 CPU/IO 密集动作（几十万文件要算全量 sha256），故走后台 Job，
+        立即返回 `job_id`；前端轮询 `/api/jobs/{id}` 拿最终分析包对象。
+        """
+        proj = _project(pid)
+        store = _package_store()
+        directory = str(body.directory or "").strip()
+        if not directory:
+            raise HTTPException(422, "未指定目录")
+        # 同步预检（2026-10-24）：相对路径/不存在/非目录/平台内部目录这些能立刻
+        # 判死的错误必须在这里变成 4xx。否则 HTTP 先回 202，用户看到「已开始扫描」，
+        # 错误却只能从一个已经失败的 Job 里翻出来。
+        try:
+            store.validate_link_directory(proj.path, directory)
+        except SamplePackageError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        progress: dict[str, Any] = {"phase": "queued"}
+        job_id = app.state.jobs.submit_unique(
+            f"sample-package-link:{pid}",
+            lambda: store.link_directory(proj.path, directory, progress=progress),
+            meta={"project_id": pid, "progress": progress, "directory": directory},
+        )[0]
+        return {"job_id": job_id, "directory": directory}
+
+    @app.get("/api/projects/{pid}/workspace/path")
+    def get_workspace_path(pid: str, thread_id: str | None = Query(default=None)):
+        """当前生效的执行工作区（2026-10-30；2026-11-02 加线程级）。
+
+        `thread_id` 给定 → 返回该主控线程的显式设置与生效根（未设置时沿父链/
+        项目级继承）；缺省 → 项目级。响应同构：`workspace`=显式设置目录（未设置
+        null），`exec_workspace`=实际生效根。读操作，不落事件。
+        """
+        proj = _project(pid)
+        thread = None
+        if thread_id:
+            from core.chat import store as chat_store
+            thread = chat_store.get_thread(proj.bb, thread_id)
+            if thread is None or str(thread.get("project_id")) != pid:
+                raise HTTPException(404, f"线程不存在: {thread_id}")
+        explicit = ((str(thread.get("workspace") or "").strip() or None)
+                    if thread is not None else
+                    (str(proj.meta.get("workspace") or "").strip() or None))
+        return {"workspace": explicit,
+                "exec_workspace": str(_exec_workspace(proj, thread).resolve()),
+                **({"thread_id": thread_id} if thread_id else {})}
+
+    @app.post("/api/projects/{pid}/workspace/path")
+    def set_workspace_path(pid: str, body: WorkspacePathIn):
+        """设置执行工作区目录（2026-10-30 项目级；2026-11-02 线程级）。
+
+        把任意已存在目录设为 agent 会话的 cwd/scratch/写边界根——不复制、
+        不扫描（区别于「选择分析包」：不生成包身份哈希/版本元数据）。
+
+        - **带 `thread_id`**：只写该线程的 `chat_threads.workspace`，同一项目里
+          其它主控互不影响；清除（null/空）= 回退继承父线程/项目级。
+        - **不带**：写 `projects.meta.workspace`（旧行为），并刷新本项目所有
+          内存 AgentSession 的 dispatcher 工作区。
+        对话线程（ChatTurn）每轮新构造时实时读线程/项目设置——**正在跑的轮次
+        仍用旧 cwd**，下一轮生效；正在执行的命令保持原 cwd 不受影响。
+        """
+        proj = _project(pid)
+        directory = (body.directory or "").strip() or None
+        if directory:
+            try:
+                directory = str(_package_store().validate_link_directory(proj.path, directory))
+            except SamplePackageError as exc:
+                raise HTTPException(422, str(exc)) from exc
+        if body.thread_id:
+            from core.chat import store as chat_store
+            thread = chat_store.get_thread(proj.bb, body.thread_id)
+            if thread is None or str(thread.get("project_id")) != pid:
+                raise HTTPException(404, f"线程不存在: {body.thread_id}")
+            thread = chat_store.update_thread(
+                proj.bb, body.thread_id, workspace=directory or "")
+            proj.bb.append_event(
+                pid, "workspace.set",
+                {"workspace": directory or "", "thread_id": body.thread_id,
+                 "by": "human"}, author="system")
+            return {"workspace": directory or None,
+                    "exec_workspace": str(_exec_workspace(proj, thread)),
+                    "thread_id": body.thread_id}
+        app.state.store.update_workspace(pid, directory, project=proj)
+        target = None if directory is None else Path(directory)
+        for sid, agent in list(app.state.agents.items()):
+            if getattr(agent, "project_id", None) != pid:
+                continue
+            try:
+                agent.exec_workspace = target
+                agent.dispatcher.exec_workspace = target
+            except Exception:  # noqa: BLE001 —— 单个会话刷新失败不影响结果
+                log.exception("刷新会话工作区失败 session=%s", sid)
+        proj.bb.append_event(
+            pid, "workspace.set",
+            {"workspace": directory or "", "by": "human"}, author="system")
+        return {"workspace": directory or None,
+                "exec_workspace": str(_exec_workspace(proj))}
+
+    @app.get("/api/projects/{pid}/sample-packages/current")
+    def current_sample_package(pid: str):
+        proj = _project(pid)
+        row = _package_store().current_package(proj.path)
+        if row is None:
+            raise HTTPException(404, "分析包不存在")
+        pointer = _package_store()._read_current(proj.path) or {}
+        # exec_workspace：关联目录包时=该目录，否则=项目工作区。前端据此显示
+        # 「工作区」路径并把不可编辑（关联包）的文件树操作置灰。
+        return {**row, "undo_available": bool((pointer.get("undo") or {}).get("version_id")),
+                "apk_sources": _package_store().apk_source_roots(row),
+                "exec_workspace": str(_exec_workspace(proj))}
+
+    @app.post("/api/projects/{pid}/sample-packages/open-apk")
+    def open_sample_apk(pid: str, body: SampleApkOpenIn):
+        from core.apk_tools import ApkToolError, launch_apk_tool
+        proj = _project(pid)
+        store = _package_store()
+        current = store.current_package(proj.path)
+        if not current:
+            raise HTTPException(404, "分析包不存在")
+        if (current["package_id"], current["version_id"]) != (body.package_id, body.version_id):
+            raise HTTPException(409, "分析包已变化，请刷新后重试")
+        try:
+            apk, original = store.resolve_apk(proj.path, body.path)
+        except SamplePackageError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        try:
+            process_id = launch_apk_tool(body.tool, apk)
+        except ApkToolError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        return {"tool": body.tool, "pid": process_id, "original_upload": original}
+
+    @app.get("/api/projects/{pid}/sample-packages/preview")
+    def preview_sample_package_entry(pid: str, path: str = Query(..., min_length=1),
+                                     max_bytes: int = Query(256 * 1024, ge=4096, le=2 * 1024 * 1024)):
+        proj = _project(pid)
+        try:
+            result = _package_store().preview_entry(proj.path, path, max_bytes=max_bytes)
+        except SamplePackageError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        result["content_url"] = f"/api/projects/{pid}/sample-packages/content?path={quote(path, safe='')}"
+        return result
+
+    @app.get("/api/projects/{pid}/sample-packages/content")
+    def sample_package_content(pid: str, path: str = Query(..., min_length=1)):
+        proj = _project(pid)
+        try:
+            _, entry, resolved = _package_store().resolve_entry_path(proj.path, path)
+        except SamplePackageError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        media_type = mimetypes.guess_type(str(entry.get("path") or path))[0] or "application/octet-stream"
+        return FileResponse(resolved, media_type=media_type,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.delete("/api/projects/{pid}/sample-packages")
+    def delete_sample_package(pid: str):
+        """Delete the sole project package after cooperative analysis cancellation."""
+        proj = _project(pid)
+        package_store = _package_store()
+        package = package_store.current_package(proj.path)
+        if package is None:
+            raise HTTPException(404, "分析包不存在")
+        package_id = str(package.get("package_id") or "")
+        metadata_root = Path(proj.path) / "sample_packages"
+        package_ids = {package_id}
+        package_ids.update(path.name for path in metadata_root.glob("pkg-*") if path.is_dir())
+
+        # The package reports are the source of binary asset references.  Read
+        # them before removing package metadata so cleanup remains complete.
+        binary_shas: set[str] = set()
+        for current_package_id in package_ids:
+            package_root = metadata_root / current_package_id
+            for report_path in package_root.glob("versions/*/targets/*.json"):
+                try:
+                    report = json.loads(report_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                sha = report.get("binary_sha256")
+                if isinstance(sha, str) and re.fullmatch(r"[0-9a-fA-F]{64}", sha):
+                    binary_shas.add(sha.lower())
+        for asset in proj.bb.list_assets(pid, "binary"):
+            meta = asset.get("meta") or {}
+            if str(meta.get("package_id") or "") in package_ids:
+                value = str(asset.get("value") or "")
+                if re.fullmatch(r"[0-9a-fA-F]{64}", value):
+                    binary_shas.add(value.lower())
+
+        for current_package_id in package_ids:
+            _stop_sample_package_jobs(pid, current_package_id)
+        deadline = time.time() + _DELETE_STOP_TIMEOUT
+        while any(_sample_package_jobs_running(pid, current_package_id)
+                  for current_package_id in package_ids) and time.time() < deadline:
+            time.sleep(0.2)
+        if any(_sample_package_jobs_running(pid, current_package_id)
+               for current_package_id in package_ids):
+            raise HTTPException(409, "分析包仍有任务运行，已请求取消，请稍后重试")
+
+        removed_assets = 0
+        removed_files = 0
+        for sha in binary_shas:
+            blob = _sample_path(proj, sha)
+            try:
+                proj.bb.delete_binary(pid, sha, author="human")
+            except LookupError:
+                continue
+            removed_files += len(_purge_sample_files(proj, sha, blob))
+            removed_assets += 1
+        try:
+            for current_package_id in package_ids:
+                package_store.delete_package(proj.path, current_package_id)
+        except SamplePackageError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        for key in list(app.state.sample_cancel):
+            if any(key.startswith(current_package_id + "/") for current_package_id in package_ids):
+                app.state.sample_cancel.pop(key, None)
+        return {"deleted": package_id, "removed_packages": len(package_ids),
+                "removed_assets": removed_assets, "removed_files": removed_files}
+
+    @app.post("/api/projects/{pid}/sample-packages/files", status_code=202)
+    def append_sample_package_files(pid: str, files: list[UploadFile] = File(...),
+                                    relative_paths: list[str] | None = Form(default=None)):
+        proj = _project(pid)
+        store = _package_store()
+        temp_files: list[tuple[str, Path]] = []
+        try:
+            names = relative_paths or []
+            for index, upload in enumerate(files):
+                temp = _write_upload_temp(upload, store.limits.max_file_bytes,
+                                          allow_empty=True)
+                name = names[index] if index < len(names) and names[index] else (upload.filename or "sample.bin")
+                temp_files.append((name, temp))
+            try:
+                result = store.append_files(proj.path, temp_files)
+            except SamplePackageError as exc:
+                raise HTTPException(422, str(exc)) from exc
+        finally:
+            for _, temp in temp_files:
+                temp.unlink(missing_ok=True)
+        return result
+
+    @app.post("/api/projects/{pid}/sample-packages/move", status_code=202)
+    def move_sample_package_entry(pid: str, body: SamplePackageMoveIn):
+        proj = _project(pid)
+        try:
+            return _package_store().move_entry(proj.path, body.path, body.target_path)
+        except SamplePackageError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.delete("/api/projects/{pid}/sample-packages/entries", status_code=202)
+    def delete_sample_package_entry(pid: str, path: str = Query(..., min_length=1)):
+        proj = _project(pid)
+        try:
+            return _package_store().delete_entry(proj.path, path)
+        except SamplePackageError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/projects/{pid}/sample-packages/undo", status_code=200)
+    def undo_sample_package(pid: str):
+        proj = _project(pid)
+        try:
+            return _package_store().undo_last(proj.path)
+        except SamplePackageError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/projects/{pid}/sample-packages/{package_id}")
+    def get_sample_package(pid: str, package_id: str, version_id: str | None = Query(default=None)):
+        proj = _project(pid)
+        row = _package_store().get_package(proj.path, package_id, version_id)
+        if row is None:
+            raise HTTPException(404, "分析包版本不存在")
+        return row
+
+    @app.post("/api/projects/{pid}/sample-packages/{package_id}/versions/{version_id}/targets")
+    def select_sample_targets(pid: str, package_id: str, version_id: str,
+                              body: SampleTargetSelectIn):
+        proj = _project(pid)
+        try:
+            return _package_store().select_targets(
+                proj.path, package_id, version_id, body.target_ids)
+        except SamplePackageError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/projects/{pid}/sample-packages/{package_id}/versions/{version_id}/targets/{target_id}")
+    def get_sample_target(pid: str, package_id: str, version_id: str, target_id: str):
+        proj = _project(pid)
+        try:
+            package, target, path = _package_store().resolve_target(
+                proj.path, package_id, version_id, target_id)
+        except SamplePackageError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        report = _package_store().read_target_analysis(
+            proj.path, package_id, version_id, target_id)
+        return {"package_id": package["package_id"], "version_id": package["version_id"],
+                "target": target, "analysis": report,
+                "file_exists": path.is_file()}
+
+    @app.post("/api/projects/{pid}/sample-packages/{package_id}/versions/{version_id}/targets/{target_id}/analyze", status_code=202)
+    def analyze_sample_target(pid: str, package_id: str, version_id: str,
+                              target_id: str,
+                              body: SampleTargetAnalyzeIn = SampleTargetAnalyzeIn()):
+        proj = _project(pid)
+        try:
+            package, target, binary_path = _package_store().resolve_target(
+                proj.path, package_id, version_id, target_id)
+        except SamplePackageError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        from core.tools.decompiler import ENGINES, normalize_engine
+        engine = normalize_engine(body.engine)
+        if str(body.engine or "").strip().lower() not in ENGINES:
+            raise HTTPException(422, f"未知引擎: {body.engine}（可选 {'/'.join(ENGINES)}）")
+        if _package_target_job_running(pid, package_id, version_id, target_id):
+            raise HTTPException(409, "该分析目标正在分析中")
+        existing = _package_store().read_target_analysis(
+            proj.path, package_id, version_id, target_id)
+        if existing and existing.get("status") == "ok" and existing.get("engine") == engine:
+            # Reports created before the package-to-binary bridge may predate
+            # the asset mapping. Repair it lazily when the cached target opens.
+            if ("binary-static" in (target.get("analyzers") or [])
+                    and existing.get("sha256")
+                    and str(target.get("format") or "") in {"pe", "elf", "mach-o"}):
+                _register_package_binary_asset(
+                    proj, package, target,
+                    str(existing["sha256"]), int(target.get("size") or binary_path.stat().st_size))
+            return {"job_id": None, "cached": True, "report": existing}
+        progress: dict[str, Any] = {"phase": "queued"}
+        cancel_key = _sample_job_key(package_id, version_id, target_id)
+        stop = threading.Event()
+        app.state.sample_cancel[cancel_key] = stop
+
+        def _cleanup_sample_cancel(_job: dict) -> None:
+            if app.state.sample_cancel.get(cancel_key) is stop:
+                app.state.sample_cancel.pop(cancel_key, None)
+
+        job_id = app.state.jobs.submit(
+            "sample-target-analysis",
+            lambda: _run_sample_target_analysis(
+                pid, package_id, version_id, target_id, engine, progress, stop),
+            meta={"project_id": pid, "package_id": package_id,
+                  "version_id": version_id, "target_id": target_id,
+                  "progress": progress, "sample_cancel_key": cancel_key},
+            on_done=_cleanup_sample_cancel,
+        )
+        return {"job_id": job_id, "cached": False, "target_id": target_id}
+
+    @app.post("/api/projects/{pid}/sample-packages/{package_id}/versions/{version_id}/targets/{target_id}/register")
+    def register_sample_target_asset(pid: str, package_id: str, version_id: str,
+                                     target_id: str):
+        """把包内 PE/ELF/Mach-O 目标登记为 binary 资产（**不复制文件**，2026-10-12）。
+
+        取代「开始分析」：登记后目标即出现在黑板逆向工作台「选择样本」里（资产
+        `meta.source=sample-package` 记包坐标 + 包内相对路径），分析（IDA/Ghidra
+        headless）改在逆向工作台进行（那里有引擎选择）。非二进制格式不走此端点
+        （APK/AAB/DEX/文本仍用 `.../analyze`）。幂等：重复登记只刷新 meta。
+        """
+        proj = _project(pid)
+        store: SamplePackageStore = _package_store()
+        try:
+            package, target, binary_path = store.resolve_target(
+                proj.path, package_id, version_id, target_id)
+        except SamplePackageError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        analyzers = list(target.get("analyzers") or [])
+        if ("binary-static" not in analyzers
+                or str(target.get("format") or "") not in {"pe", "elf", "mach-o"}):
+            raise HTTPException(422, "该目标不是 PE/ELF/Mach-O 二进制，无法登记为资产")
+        # 关联目录包按**实际内容**登记（2026-10-24，与「信任快照」口径一致）：
+        # 那个目录是用户自己的工作区，文件随时可能被改；沿用快照 sha 会把资产
+        # 挂到一个已经不存在的哈希上（后续按 sha 定位/去重/缓存全错位）。
+        from core.sample_packages import sha256_file as _pkg_sha256
+        if package.get("linked"):
+            sha, size = _pkg_sha256(binary_path)
+        else:
+            sha = str(target.get("sha256") or "")
+            if not sha:
+                raise HTTPException(422, "目标缺少 sha256，无法登记")
+            size = int(target.get("size") or binary_path.stat().st_size)
+        asset = _register_package_binary_asset(proj, package, target, sha, size)
+        proj.bb.append_event(pid, "sample.target.registered", {
+            "package_id": package_id, "version_id": version_id,
+            "target_id": target_id, "sha256": sha, "asset_id": asset.get("id"),
+        }, author="human")
+        return {"binary_sha256": sha, "binary_asset_id": asset.get("id"),
+                "target_id": target_id, "path": target.get("path"),
+                "filename": Path(str(target.get("path") or "sample.bin")).name}
+
+    @app.post("/api/projects/{pid}/samples", status_code=202)
+    def upload_sample(pid: str, file: UploadFile = File(...)):
+        """样本上传（multipart，≤256MB，流式 sha）→ binary 资产登记。
+
+        样本是 untrusted 输入：只写 samples/，平台绝不在任何路径执行它；
+        反编译是 trusted 解析（idat/analyzeHeadless 只解析不执行）。
+        2026-09-29：上传不再自动投 headless 分诊——大样本分析很久，由用户
+        点「开始分析」确认后触发（POST /binaries/{sha}/triage）或走
+        「从 IDA 拉取函数」MCP 通道。job_id 恒为 None（前端 awaitJob 已兼容）。
+        """
+        proj = _project(pid)
+        name = _safe_upload_name(file.filename or "sample.bin")
+        samples_dir = _inside(proj, "samples")
+        samples_dir.mkdir(parents=True, exist_ok=True)
+        spool, sha, size = _spool_upload(file, SAMPLE_MAX_BYTES)
+        final = samples_dir / name
+        if final.exists():  # 重名：sha 短缀避让
+            p = Path(name)
+            final = samples_dir / f"{p.stem}.{sha[:8]}{p.suffix}"
+        with open(final, "wb") as fh:
+            shutil.copyfileobj(spool, fh)
+        spool.close()
+        rel = str(final.relative_to(proj.path)).replace("\\", "/")
+        meta = {"filename": Path(name).name, "size": size, "path": rel,
+                "uploaded_at": _utc_now()}
+        asset = proj.bb.upsert_asset(pid, "binary", sha, meta=meta, author="human")
+        if not asset["created"]:  # 同 sha 重传：刷新文件名/路径等 meta，不插新行
+            proj.bb.update_asset_meta(asset["id"], meta)
+        svc = _rev_service(proj)
+        if svc.read_cached(sha) is not None:
+            return {"cached": True, "job_id": None, "sha": sha, "asset_id": asset["id"]}
+        # 2026-09-29：不再自动投分诊——分析动作由用户显式确认（大样本 headless
+        # 可能很久）；重传已分析样本上方 read_cached 短路照旧直接可用
+        return {"cached": False, "job_id": None, "sha": sha, "asset_id": asset["id"]}
+
+    @app.post("/api/projects/{pid}/binaries/{sha}/triage", status_code=202)
+    def retry_triage(pid: str, sha: str):
+        proj = _project(pid)
+        asset = proj.bb.find_asset(pid, "binary", sha)
+        if asset is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        # 样本路径解析统一走 _sample_path：项目内样本 = meta.path（项目相对）；
+        # 分析包登记样本（source=sample-package）在**全局包树**（项目外），经包坐标还原。
+        path = _sample_path(proj, sha)
+        if path is None:
+            raise HTTPException(422, "资产缺少样本路径（早期数据，请重新上传/登记）")
+        # 自动分析体积上限（2026-10-13）：≥10MB 的样本 headless 全量分析会拖垮时间，
+        # 拒绝自动分析（按真实文件大小判定），引导改走 IDA 拉取。
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = None
+        if size is not None and size >= SAMPLE_AUTO_MAX_BYTES:
+            raise HTTPException(422,
+                f"样本 {size / 1048576:.1f}MB ≥ 10MB，超出自动分析上限（避免拖垮分析时间）；"
+                "请改用「从 IDA 拉取函数」（在 IDA 中打开样本按 Ctrl-Alt-M 启动 MCP）")
+        return {"job_id": _submit_triage(proj, sha, path), "sha": sha}
+
+    @app.post("/api/projects/{pid}/binaries/{sha}/triage/cancel")
+    def cancel_triage(pid: str, sha: str):
+        """停止进行中的 headless 全量导出（大样本 P3，协作式）：置位 export_cancel[sha]
+        → 后端写停止标志文件，Ghidra 脚本在函数边界停下并保留已导出部分（partial 缓存
+        立即可见；重新「开始分析」补全）。无在跑导出 / 已置位均幂等。"""
+        proj = _project(pid)
+        if proj.bb.find_asset(pid, "binary", sha) is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        ev = app.state.export_cancel.get(sha)
+        if ev is None or ev.is_set():
+            return {"cancelling": False, "hint": "没有进行中的导出"}
+        ev.set()
+        return {"cancelling": True,
+                "hint": "已请求停止：将在当前函数反编译完成后停下并保留已导出部分"}
+
+    @app.get("/api/projects/{pid}/binaries/{sha}/overview")
+    def binary_overview(pid: str, sha: str):
+        """样本条首屏：缓存增强段 + 覆盖率 + 工具三态灯。缓存缺席也 200（cached:false）。"""
+        proj = _project(pid)
+        asset = proj.bb.find_asset(pid, "binary", sha)
+        if asset is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        svc = _rev_service(proj)
+        data = svc.read_cached(sha)
+        kb = proj.bb.list_funcs(pid, sha)
+        analysis_job = next((job for job in app.state.jobs.all_jobs()
+                             if job.get("status") == "running"
+                             and job.get("kind") == "binary-triage"
+                             and job.get("meta", {}).get("project_id") == pid
+                             and (job.get("meta", {}).get("sha") == sha
+                                  or job.get("meta", {}).get("triage_sha") == sha)), None)
+        return {
+            "sha": sha,
+            "asset_meta": asset.get("meta") or {},
+            "engine": _binary_engine(proj, sha),
+            "cached": data is not None,
+            "analysis_job": ({"id": analysis_job.get("id"), "status": "running",
+                              "progress": analysis_job.get("meta", {}).get("progress") or {}}
+                             if analysis_job else None),
+            "meta": (data or {}).get("meta"),
+            "sections": (data or {}).get("sections"),
+            "imports": (data or {}).get("imports"),
+            "strings_count": (len((data or {}).get("strings"))
+                              if isinstance((data or {}).get("strings"), list) else 0),
+            "function_count": len((data or {}).get("functions") or []),
+            "analyzed_count": len(kb),
+            "risk_count": sum(1 for f in kb if f.get("risk_tags")),
+            "findings_count": len(proj.bb.conn.execute(
+                "SELECT 1 FROM findings WHERE target_asset_id=?",
+                (asset["id"],)).fetchall()),
+            "logic_blocks_count": len(proj.bb.conn.execute(
+                "SELECT 1 FROM logic_blocks WHERE project_id=? AND binary_sha256=?",
+                (pid, sha)).fetchall()),
+            "db_path": _db_rel(proj, sha),
+            "tools": {
+                "ida": {"state": _tool_lamp(proj, "ida-headless", data is not None)},
+                "ghidra": {"state": _tool_lamp(proj, "ghidra-headless", data is not None)},
+                # 真探活（1.5s 超时/3s TTL 懒缓存）：在线=installed 青灯；离线 off。
+                # 人手 13337 实例或平台按需拉起的样本实例（2026-09-20）任一在线即亮
+                "mcp": {"state": ("installed" if (
+                    svc.mcp_online() or app.state.ida_mcp_manager.online_for_project(pid)
+                ) else "off")},
+            },
+        }
+
+    @app.put("/api/projects/{pid}/binaries/{sha}/engine")
+    def set_binary_engine(pid: str, sha: str, body: EngineIn):
+        """设置样本的反编译引擎模式（ida / ghidra，2026-10-01 工作台双模式）。
+
+        存 binary 资产 meta.engine；引擎是「偏好」不是「排他」——所选引擎不可用时
+        后端仍回退另一引擎。「开始分析」按此引擎偏好选路，Ghidra 小样本导出内嵌反汇编。"""
+        from core.tools.decompiler import ENGINES, normalize_engine
+
+        proj = _project(pid)
+        asset = proj.bb.find_asset(pid, "binary", sha)
+        if asset is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        raw = str(body.engine or "").strip().lower()
+        if raw not in ENGINES:
+            raise HTTPException(422,
+                                f"未知引擎: {body.engine}（可选 {'/'.join(ENGINES)}）")
+        engine = normalize_engine(raw)
+        proj.bb.update_asset_meta(asset["id"], {"engine": engine})
+        proj.bb.append_event(pid, "binary.engine_set",
+                             {"sha": sha, "engine": engine}, author="human")
+        return {"status": "ok", "sha": sha, "engine": engine}
+
+    @app.delete("/api/projects/{pid}/binaries/{sha}")
+    def delete_binary(pid: str, sha: str):
+        """从项目中移除一个样本（2026-10-01 逆向工作台）。
+
+        硬级联：func_kb（该 sha）+ findings（指向该 asset）+ logic_blocks/
+        logic_block_funcs（binary_sha256=sha）+ chain_links（指向被删 func/finding 的边）
+        + 资产行；并物理清理磁盘产物（样本本体 / 缓存 / IDA 库 / Ghidra 工程；
+        全局缓存保留）。落 binary.deleted 审计事件。
+
+        并发安全：若该样本正在分诊/拉取，先置协作停止标志并等待 Job 收尾（上限
+        _DELETE_STOP_TIMEOUT）；超时（IDA headless 不支持协作中断）→ 409。
+        """
+        proj = _project(pid)
+        if proj.bb.find_asset(pid, "binary", sha) is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        _stop_binary_jobs(proj.id, sha)
+        deadline = time.time() + _DELETE_STOP_TIMEOUT
+        while _binary_jobs_running(proj.id, sha) and time.time() < deadline:
+            time.sleep(0.2)
+        if _binary_jobs_running(proj.id, sha):
+            raise HTTPException(
+                409, "该样本的分诊/拉取仍在进行且无法中断（IDA headless 不支持协作停），"
+                     "请等其完成后再删除")
+        blob = _sample_path(proj, sha)  # 删资产行前解析样本路径（行删后 find_asset 失效）
+        try:
+            counts = proj.bb.delete_binary(pid, sha, author="human")
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+        removed = _purge_sample_files(proj, sha, blob)
+        app.state.export_cancel.pop(sha, None)
+        app.state.pull_cancel.pop(sha, None)
+        return {"deleted": sha, "removed_files": len(removed), **counts}
+
+    @app.get("/api/projects/{pid}/binaries/{sha}/functions")
+    def cached_functions(pid: str, sha: str):
+        """精简函数行（不带伪码）；地址一律 hex 字符串（JS Number 精度）。"""
+        proj = _project(pid)
+        svc = _rev_service(proj)
+        bin_path = _sample_path(proj, sha)
+        projected = svc.cached_function_rows(sha, str(bin_path) if bin_path else None)
+        if projected is not None:
+            return [
+                {"address": hex(int(f["address"])), "name": f.get("name"),
+                 "size": f.get("size", 0), "has_pseudo": bool(f.get("has_pseudo")),
+                 "n_calls": f.get("n_calls", 0),
+                 "status": str(f.get("status") or ("done" if f.get("has_pseudo") else "pending")),
+                 "error": f.get("error")}
+                for f in projected
+            ]
+        data = _require_cache(proj, sha)
+        return [
+            {"address": hex(int(f["address"])), "name": f.get("name"),
+             "size": f.get("size", 0), "has_pseudo": bool(f.get("pseudocode")),
+             "n_calls": len(f.get("calls") or []),
+             "status": (str(f.get("status") or ("done" if f.get("pseudocode") else "pending"))),
+             "error": f.get("error")}
+            for f in data.get("functions", [])
+        ]
+
+    def _func_detail_view(detail: dict, want: int) -> dict:
+        """详情缓存/自动拉取 → CachedFunction 视图（disasm 行列表；source=cache）。"""
+        return {
+            "address": detail.get("address") or hex(want),
+            "name": detail.get("name"),
+            "size": detail.get("size", 0),
+            "calls": detail.get("calls") or [c.get("name") for c in (detail.get("callees") or []) if c.get("name")],
+            "pseudocode": detail.get("pseudocode"),
+            "status": detail.get("status"),
+            "error": detail.get("error"),
+            "disasm": ({"lines": detail.get("disasm_lines") or [],
+                        "truncated": bool(detail.get("disasm_truncated"))}
+                       if detail.get("disasm_lines") else None),
+            "disasm_pending": bool(detail.get("disasm_pending")),
+            "source": detail.get("source") or "cache",
+        }
+
+    @app.get("/api/projects/{pid}/binaries/{sha}/functions/{addr}")
+    def cached_function(pid: str, sha: str, addr: str):
+        """缓存命中走 v3 缓存；按样本引擎取伪码/反汇编（2026-10-01 双模式）：
+
+        - IDA（默认）：缓存有伪码直接用；名单有但无伪码（IDA 拉取轻量缓存）→ 按需
+          详情（MCP analyze_batch 拉取落盘）；缓存缺席且 MCP 在线实时取（source=mcp）
+        - Ghidra：伪码/调用关系取缓存；反汇编取缓存（小样本内嵌）或持久 Ghidra
+          工程按需反汇编（大样本）——走 ensure_func_detail 的 ghidra 分支
+        """
+        proj = _project(pid)
+        svc = _rev_service(proj)
+        want = _parse_hex_addr(addr)
+        engine = _binary_engine(proj, sha)
+        bin_path = _sample_path(proj, sha)
+        bin_arg = str(bin_path) if bin_path else None
+        data = svc.read_cached(sha)
+        if data is not None:
+            for f in data.get("functions", []):
+                if int(f["address"]) != want:
+                    continue
+                # Ghidra mode always queries the native project first. This
+                # avoids stale JSON/SQLite details masking real Listing data.
+                if engine == "ghidra" or not f.get("pseudocode"):
+                    detail = svc.ensure_func_detail(sha, want, engine=engine,
+                                                    binary=bin_arg)
+                    if detail is not None:
+                        return _func_detail_view(detail, want)
+                return {"address": hex(int(f["address"])),
+                        "name": f.get("name"), "size": f.get("size", 0),
+                        "calls": f.get("calls") or [],
+                        "pseudocode": f.get("pseudocode"),
+                        "disasm": ({"lines": f["disasm_lines"],
+                                    "truncated": bool(f.get("disasm_truncated"))}
+                                   if f.get("disasm_lines") else None)}
+            raise HTTPException(404, f"缓存中无此函数: {addr}")
+        detail = svc.ensure_func_detail(sha, want, engine=engine, binary=bin_arg)
+        if detail is not None:
+            return _func_detail_view(detail, want)
+        if engine == "ida":
+            live = svc.live_decompile(want)
+            if live is not None:
+                return {"address": hex(want), "name": None, "size": 0, "calls": [],
+                        "pseudocode": live["pseudocode"], "disasm": None,
+                        "source": "mcp"}
+        raise HTTPException(409, "样本尚未完成 headless 分诊（缓存缺席）；"
+                                "可在 IDA 中 Ctrl-Alt-M 启动 MCP 后实时读取，或先完成分诊")
+
+    @app.get("/api/projects/{pid}/binaries/{sha}/xrefs/{addr}")
+    def cached_xrefs(pid: str, sha: str, addr: str):
+        from core.tools.decompiler import build_xrefs
+
+        proj = _project(pid)
+        svc = _rev_service(proj)
+        want = _parse_hex_addr(addr)
+        engine = _binary_engine(proj, sha)
+        bin_path = _sample_path(proj, sha)
+        bin_arg = str(bin_path) if bin_path else None
+        projected_xref = svc.cached_xrefs(sha, want, bin_arg)
+        if projected_xref is not None:
+            return projected_xref
+        projected_rows = svc.cached_function_rows(sha, bin_arg)
+        if projected_rows is not None:
+            raise HTTPException(404, f"缓存中无此函数: {addr}")
+        data = svc.read_cached(sha)
+        target = None
+        if data is not None:
+            target = next((f for f in data.get("functions", [])
+                           if int(f["address"]) == want), None)
+            # headless 全量缓存（函数带 calls 键）→ build_xrefs 权威全局反查；
+            # Ghidra 模式一律用缓存（无 MCP 桥，不回实时降级）
+            if target is not None and ("calls" in target or engine == "ghidra"):
+                x = build_xrefs(data, want)
+                if x is None:
+                    raise HTTPException(404, f"缓存中无此函数: {addr}")
+                return x
+        # IDA 拉取轻量缓存（无 calls）/缓存缺席 → 按需详情（缓存命中→自动拉取落盘）
+        bin_path = _sample_path(proj, sha)
+        bin_arg = str(bin_path) if bin_path else None
+        detail = svc.read_func_detail(sha, want)
+        if detail is None:
+            detail = svc.ensure_func_detail(sha, want, engine=engine, binary=bin_arg)
+        if detail is not None:
+            return {"address": hex(want), "name": detail.get("name"),
+                    "callers": detail.get("callers") or [],
+                    "callees": detail.get("callees") or [],
+                    "source": "cache"}
+        if target is not None:
+            # 名单有但详情拿不到（MCP 离线未缓存）：空调用关系，不回 4xx
+            return {"address": hex(want), "name": target.get("name"),
+                    "callers": [], "callees": []}
+        if data is not None:
+            raise HTTPException(404, f"缓存中无此函数: {addr}")
+        if engine == "ida":
+            # 缓存缺席：MCP 在线走 func_profile 实时降级（xrefs_for 内含选路）；
+            # Ghidra 模式无 MCP 桥，直接 409 提示先分诊
+            x = svc.xrefs_for(sha, want)
+            if x is not None:
+                return x
+        raise HTTPException(409, "样本尚未完成 headless 分诊（缓存缺席）；"
+                                "可在 IDA 中 Ctrl-Alt-M 启动 MCP 后实时读取，或先完成分诊")
+
+    @app.get("/api/projects/{pid}/binaries/{sha}/strings")
+    def cached_strings(pid: str, sha: str, q: str = Query(default="", max_length=200)):
+        """字符串表（v3 契约）；缓存缺席 409，?q= 子串过滤，5000 行截断。"""
+        from core.tools.decompiler import build_strings
+
+        proj = _project(pid)
+        data = _require_cache(proj, sha)
+        strings = data.get("strings")
+        if isinstance(strings, dict):  # 导出时该段失败的 {"error": ...}
+            raise HTTPException(409, f"字符串段不可用: {strings.get('error', '导出失败')}")
+        return build_strings(data, q or None)
+
+    @app.post("/api/projects/{pid}/binaries/{sha}/open")
+    def open_in_ida(pid: str, sha: str, addr: str | None = Query(default=None)):
+        """detached 启动 IDA GUI 打开分诊数据库。?addr=0x.. 时在 db 同目录写一次性
+        跳转脚本 _jump_<sha8>.py（auto_wait + idc.jumpto），以无引号无空格的相对
+        -S 名 + cwd=db 目录启动，规避 Windows list2cmdline 的引号转义坑。"""
+        from core.tools.decompiler import resolve_ida_gui
+
+        proj = _project(pid)
+        if proj.bb.find_asset(pid, "binary", sha) is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        rel_db = _db_rel(proj, sha)
+        if not rel_db:
+            raise HTTPException(409, "尚无 IDA 数据库，请先完成 headless 分诊")
+        gui = resolve_ida_gui()
+        if not gui:
+            raise HTTPException(422, "未找到 IDA GUI（ida64/ida 不在 PATH 或常见安装目录）")
+        db_path = _inside(proj, rel_db)
+
+        jumping = None
+        cwd = str(Path(gui).parent)
+        ida_args = [gui, str(db_path)]
+        if addr is not None:
+            try:
+                addr_int = int(addr, 0)
+            except ValueError:
+                raise HTTPException(422,
+                                    f"addr 需为 0x 前缀 hex 或十进制整数: {addr}")
+            if addr_int < 0:
+                raise HTTPException(422, "addr 不可为负数")
+            # 每次重写（同一 sha 的跳址脚本复用文件名）
+            script_name = f"_jump_{sha[:8]}.py"
+            (db_path.parent / script_name).write_text(
+                "# 平台生成的一次性跳址脚本（open?addr=）；完成后可删\n"
+                "import ida_auto\n"
+                "import idc\n"
+                "ida_auto.auto_wait()\n"
+                f"idc.jumpto({addr_int})\n",
+                encoding="utf-8")
+            ida_args = [gui, f"-S{script_name}", str(db_path)]
+            cwd = str(db_path.parent)
+            jumping = hex(addr_int)
+
+        flags = 0
+        if os.name == "nt":
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen(ida_args, creationflags=flags,
+                             close_fds=True, cwd=cwd)
+        else:
+            subprocess.Popen(["nohup", *ida_args], start_new_session=True,
+                             close_fds=True, cwd=cwd)
+        return {"opening": rel_db, "jumping": jumping}
+
+    # 本地文件动作（会话流文件卡，2026-10-03）：把工作台/直播间叙述里出现的
+    # 文件交给系统打开。**scope 白名单**=项目工作区 ∪ packs ∪ tools——三处之外
+    # 一律 422，杜绝任意路径被当作句柄交给系统程序。
+    # 安全取舍（有意为之，勿当 bug）：本端点无鉴权（全项目 localhost 信任模型，
+    # 无 CORS/无 token），且**不按扩展名/目录设限**——samples/ 内的不可信样本也
+    # 能一键交给系统默认程序。与既有 /binaries/{sha}/open（detached 拉起 IDA GUI）
+    # 同一风险等级；要收紧只改下面的 _open_scope_roots 与动作分支。
+    _OPEN_CONTENT_MAX = 200_000
+
+    def _open_scope_roots(proj: Project) -> list[Path]:
+        roots = [Path(proj.path)]
+        # 执行工作区（2026-10-30 绝对路径化）：选了外部目录/关联分析包时，
+        # 文件卡与 /files/open 都要能触达它——否则工作区按钮显示对、点开却 422。
+        try:
+            roots.append(_exec_workspace(proj))
+        except Exception:  # noqa: BLE001 —— 工作区解析失败不拖垮文件打开
+            log.exception("解析执行工作区失败 project=%s", proj.id)
+        # 线程级工作区（v55，2026-11-02）：同一项目多个主控各选外部目录时，
+        # 主控会话流里的文件卡（绝对路径）也要能点开；不带 thread_id 的端点
+        # 无从判断是哪个线程，故把本项目的线程目录一并纳入 scope。
+        try:
+            from core.chat import store as chat_store
+            for t in chat_store.list_threads(proj.bb, proj.id):
+                ws = str(t.get("workspace") or "").strip()
+                if ws and Path(ws).is_dir():
+                    roots.append(Path(ws))
+        except Exception:  # noqa: BLE001 —— 线程表异常不阻断文件打开
+            log.exception("收集线程工作区失败 project=%s", proj.id)
+        for extra in (app.state.packs_root, app.state.tools_root):
+            if extra:  # tools_root 可为 None（测试机不做工具探测）
+                roots.append(Path(extra))
+        return [r.resolve() for r in roots]
+
+    def _open_scope_path(proj: Project, raw: str) -> Path:
+        """scope 内相对/绝对路径 → resolve；越出全部 scope 根 422（防穿越）。
+
+        相对路径基准 = 执行工作区根（2026-10-30，与 run_cmd cwd 一致）；文件卡
+        已全绝对化，相对形态仅兼容旧回执。"""
+        rel = str(raw or "").replace("\\", "/").strip()
+        if not rel or "\x00" in rel:
+            raise HTTPException(422, "文件路径非法")
+        p = Path(rel)
+        target = p.resolve() if p.is_absolute() else (
+            _exec_workspace(proj).resolve() / p).resolve()
+        if not any(target.is_relative_to(root) for root in _open_scope_roots(proj)):
+            raise HTTPException(422, f"路径越界（仅限项目工作区/packs/tools）: {raw}")
+        return target
+
+    def _spawn_detached(args: list[str]) -> None:
+        flags = 0
+        if os.name == "nt":
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen(args, creationflags=flags, close_fds=True)
+        else:
+            subprocess.Popen(args, start_new_session=True, close_fds=True)
+
+    @app.get("/api/projects/{pid}/workspace/tree")
+    def workspace_tree(pid: str):
+        proj = _project(pid)
+        return list_workspace_tree(proj.path)
+
+    @app.post("/api/projects/{pid}/files/open")
+    def open_local_file(pid: str, body: FileOpenIn):
+        proj = _project(pid)
+        target = _open_scope_path(proj, body.path)
+        if body.action == "resolve":
+            return {"status": "ok", "action": "resolve", "abs_path": str(target)}
+        if not target.exists():
+            raise HTTPException(404, f"文件不存在: {body.path}")
+        if body.action == "open":
+            if os.name == "nt":
+                os.startfile(str(target))  # noqa: S606 —— Windows 专用，交由文件关联
+            else:
+                _spawn_detached(["xdg-open", str(target)])
+        elif body.action == "reveal":
+            if os.name == "nt":
+                _spawn_detached(["explorer", f"/select,{target}"])
+            else:
+                _spawn_detached(["xdg-open", str(target.parent)])
+        else:  # content
+            if target.is_dir():
+                raise HTTPException(422, "目录不能读取内容")
+            text = target.read_text(encoding="utf-8", errors="replace")
+            return {"status": "ok", "action": "content", "abs_path": str(target),
+                    "content": text[:_OPEN_CONTENT_MAX],
+                    "truncated": len(text) > _OPEN_CONTENT_MAX}
+        return {"status": "ok", "action": body.action, "abs_path": str(target)}
+
+    @app.post("/api/projects/{pid}/binaries/{sha}/writeback", status_code=202)
+    def binary_writeback(pid: str, sha: str, body: WritebackIn):
+        """func_kb 命名/注释 headless 写回 .i64（Job，900s）。
+
+        锁文件存在（GUI 开着）返回 done{status:"locked"} 不强写；
+        成功发 binary.annotated（只放成功条数，注释全文不进事件）。
+        """
+        proj = _project(pid)
+        if proj.bb.find_asset(pid, "binary", sha) is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        items = [{"address": it.address,
+                  **({"name": it.name} if it.name else {}),
+                  **({"comment": it.comment} if it.comment else {})}
+                 for it in body.items]
+        return {"job_id": _submit_writeback(proj, sha, items), "sha": sha}
+
+    @app.post("/api/projects/{pid}/binaries/{sha}/pull-names", status_code=202)
+    def binary_pull_names(pid: str, sha: str):
+        """把 IDA GUI 里手改的函数名拉回 func_kb（Job）：库内重导→diff→改名入 name_history。"""
+        proj = _project(pid)
+        if proj.bb.find_asset(pid, "binary", sha) is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        return {"job_id": _submit_pull_names(proj, sha), "sha": sha}
+
+    @app.post("/api/projects/{pid}/binaries/{sha}/pull-ida-functions",
+              status_code=202)
+    def pull_ida_functions(pid: str, sha: str):
+        """从 GUI IDA 拉取函数清单（Job，2026-09-29）：MCP list_funcs 分页 →
+        轻量缓存（函数名/地址/大小，无伪码）+ 有效命名 diff 回拉 func_kb。
+        前置：IDA 已打开样本并启动 MCP 插件（三态灯 MCP 亮）。"""
+        proj = _project(pid)
+        if proj.bb.find_asset(pid, "binary", sha) is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        return {"job_id": _submit_pull_ida_functions(proj, sha), "sha": sha}
+
+    @app.post("/api/projects/{pid}/binaries/{sha}/pull-ida-functions/cancel")
+    def cancel_pull_ida_functions(pid: str, sha: str):
+        """停止进行中的 IDA 拉取（2026-09-30 断点续拉）：Event 页间检查点生效，
+        已拉部分保持生效（partial 缓存），再点拉取从断点继续。无在跑 job 幂等。"""
+        proj = _project(pid)
+        if proj.bb.find_asset(pid, "binary", sha) is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        ev = app.state.pull_cancel.get(sha)
+        if ev is None or ev.is_set():
+            return {"cancelling": False, "hint": "没有进行中的拉取"}
+        ev.set()
+        return {"cancelling": True}
+
+    @app.post("/api/projects/{pid}/binaries/{sha}/push-names-to-ida",
+              status_code=202)
+    def push_names_to_ida(pid: str, sha: str):
+        """func_kb 有效命名 → GUI IDA（反向，Job）：批量 rename 写当前库，
+        只改内存不落盘（完成后提示在 IDA 保存）。"""
+        proj = _project(pid)
+        if proj.bb.find_asset(pid, "binary", sha) is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        return {"job_id": _submit_push_names_to_ida(proj, sha), "sha": sha}
+
+    @app.post("/api/projects/{pid}/binaries/{sha}/import-ida-db", status_code=202)
+    def import_ida_db(pid: str, sha: str, body: ImportIdaDbIn):
+        """纳入外部已分析好的 IDA 库（.i64/.idb）到项目并库内重导为缓存（Job）。
+
+        免去「GUI 打开 → Ctrl-Alt-M → MCP 分页回拉」一整轮：把现成库拷进项目
+        decompiler-db/，headless 复用库内既有自动分析（不从样本重建，大样本关键）。
+        目标库正被 GUI 占用（锁文件）返回 done{status:"locked"}，绝不强写。
+        """
+        proj = _project(pid)
+        if proj.bb.find_asset(pid, "binary", sha) is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        if not Path(body.path).is_file():
+            raise HTTPException(422, f"路径不存在或不是文件: {body.path}")
+        return {"job_id": _submit_import_ida_db(proj, sha, body.path), "sha": sha}
+
+    @app.post("/api/projects/{pid}/binaries/{sha}/import-export", status_code=202)
+    def import_export(pid: str, sha: str, body: ImportExportIn):
+        """纳入外部 headless 全量导出 JSON 为本地缓存（Job）：只收 export_version>=3，
+        低契约结构化拒绝（让上层重导）。免重跑 IDA/Ghidra headless。"""
+        proj = _project(pid)
+        if proj.bb.find_asset(pid, "binary", sha) is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        if not Path(body.path).is_file():
+            raise HTTPException(422, f"路径不存在或不是文件: {body.path}")
+        return {"job_id": _submit_import_export(proj, sha, body.path), "sha": sha}
+
+    @app.post("/api/projects/{pid}/binaries/{sha}/reexport-db", status_code=202)
+    def reexport_db(pid: str, sha: str):
+        """直读项目内既有 IDA 库重导缓存（Job，不含改名 diff；锁库时结构化 locked）。
+
+        与 pull-names 的差别：只重导缓存，不 diff 回拉 func_kb——用于 GUI 深度
+        分析后在后台把库内分析结果同步进缓存（大样本耗时可长，走 Job 不阻塞）。
+        """
+        proj = _project(pid)
+        if proj.bb.find_asset(pid, "binary", sha) is None:
+            raise HTTPException(404, f"样本资产不存在: {sha}")
+        return {"job_id": _submit_reexport_db(proj, sha), "sha": sha}
+
+    @app.post("/api/projects/{pid}/funcs", status_code=201)
+    def create_func(pid: str, body: FuncCreateIn):
+        """为仅缓存函数补建 func_kb 行（人写笔记的前置）；同 (sha,addr) 已存在则幂等返回。"""
+        bb = _project(pid).bb
+        existing = bb.lookup_func(pid, body.binary_sha256, int(body.address))
+        if existing:
+            return _hex_func_view(existing)
+        rid = bb.upsert_func(pid, body.binary_sha256, int(body.address), body.name,
+                             analysis=body.analysis, analyzed_by="human")
+        return _hex_func_view(
+            bb.lookup_func(pid, body.binary_sha256, int(body.address)) or {"id": rid["id"]})
+
+    @app.patch("/api/projects/{pid}/funcs/{func_id}")
+    def patch_func(pid: str, func_id: str, body: FuncPatchIn):
+        changes = body.model_dump(exclude_unset=True)
+        if changes.get("risk_tags") is None:  # 显式 null = 不动（清空请传 []）
+            changes.pop("risk_tags", None)
+        row = _project(pid).bb.patch_func(pid, func_id, author="human", **changes)
+        if row is None:
+            raise HTTPException(404, f"函数知识条目不存在: {func_id}")
+        return _hex_func_view(row)
+
+    @app.patch("/api/projects/{pid}/findings/{finding_id}")
+    def patch_finding(pid: str, finding_id: str, body: FindingPatchIn):
+        changes = body.model_dump(exclude_unset=True)
+        proj = _project(pid)
+        try:
+            row = proj.bb.patch_finding(pid, finding_id, author="human",
+                                        track=proj.track, **changes)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        if row is None:
+            raise HTTPException(404, f"发现不存在: {finding_id}")
+        return row
+
+    @app.delete("/api/projects/{pid}/findings/{finding_id}")
+    def delete_finding(pid: str, finding_id: str):
+        """物理删除发现（垃圾/走查数据清理）：store 同事务摘除反向 relates_to 边与
+        任务 refs 引用；链边保留走孤儿占位、私信保留审计。误报请走 PATCH（撤回传播）。"""
+        row = _project(pid).bb.delete_finding(pid, finding_id, author="human")
+        if row is None:
+            raise HTTPException(404, f"发现不存在: {finding_id}")
+        return {"deleted": finding_id, **row}
+
+    # ---------- 攻击链（人工建链；节点快照在 API 层组装，store 层保真实+项目归属） ----------
+
+    def _entity_snapshot(bb: Blackboard, pid: str, node_type: str, node_id: str) -> dict | None:
+        """链节点的实体快照（孤儿实体已删→None，调用方标 deleted:true）。"""
+        if node_type == "finding":
+            f = bb.get_finding(pid, node_id)
+            if f is None:
+                return None
+            return {"id": f["id"], "title": f["title"], "severity": f["severity"],
+                    "status": f["status"], "category": (f.get("evidence") or {}).get("category")}
+        if node_type == "func_kb":
+            f = bb.get_func(pid, node_id)
+            if f is None:
+                return None
+            return {"id": f["id"], "name": f["name"], "address": hex(int(f["address"])),
+                    "risk_tags": f.get("risk_tags") or []}
+        if node_type == "artifact":
+            a = bb.get_artifact(pid, node_id)
+            if a is None:
+                return None
+            return {"id": a["id"], "kind": a["kind"], "path": a["path"],
+                    "description": a.get("description", "")}
+        return None
+
+    def _chain_detail(bb: Blackboard, pid: str, cid: str) -> dict | None:
+        chain = bb.get_chain(cid)
+        if chain is None or chain.get("project_id") != pid:
+            return None
+        for link in chain["links"]:
+            snap = _entity_snapshot(bb, pid, link["node_type"], link["node_id"])
+            link["entity"] = snap
+            link["deleted"] = snap is None
+        return chain
+
+    @app.get("/api/projects/{pid}/chains")
+    def list_chains(pid: str, origin: str | None = None):
+        # v19 origin 过滤：manual=人工链（默认视图）/ trace=任务轨迹自动链（沉淀侧消费）
+        return _project(pid).bb.list_chains(pid, origin=origin)
+
+    @app.get("/api/projects/{pid}/trace-effect")
+    def get_trace_effect(pid: str, top: int = 20):
+        """打法效果榜（M3，R4 基于物化侧）：轨迹链 (skill × kb) × verified finding。"""
+        return traces.effect_stats(_project(pid).bb, pid, top=max(1, min(top, 50)))
+
+    @app.get("/api/projects/{pid}/retrieval-stats")
+    def get_retrieval_stats(pid: str):
+        """检索对账三象限（retrieval-upgrade M3，2026-09-23）：提示×打开×verified
+        产出离线对账，missed 清单是同义词/route_index 增补的信号源（与 M2 互喂）。"""
+        return traces.retrieval_stats(_project(pid).bb, pid)
+
+    @app.post("/api/projects/{pid}/chains", status_code=201)
+    def create_chain(pid: str, body: ChainIn):
+        bb = _project(pid).bb
+        cid = bb.create_chain(pid, body.name, body.goal, author="human")
+        return _chain_detail(bb, pid, cid)
+
+    @app.get("/api/projects/{pid}/chains/{cid}")
+    def get_chain(pid: str, cid: str):
+        detail = _chain_detail(_project(pid).bb, pid, cid)
+        if detail is None:
+            raise HTTPException(404, f"攻击链不存在: {cid}")
+        return detail
+
+    @app.patch("/api/projects/{pid}/chains/{cid}")
+    def update_chain(pid: str, cid: str, body: ChainPatchIn):
+        bb = _project(pid).bb
+        try:
+            row = bb.update_chain(pid, cid, author="human",
+                                  **body.model_dump(exclude_unset=True))
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        if row is None:
+            raise HTTPException(404, f"攻击链不存在: {cid}")
+        return _chain_detail(bb, pid, cid)
+
+    @app.delete("/api/projects/{pid}/chains/{cid}")
+    def delete_chain(pid: str, cid: str):
+        if not _project(pid).bb.delete_chain(pid, cid, author="human"):
+            raise HTTPException(404, f"攻击链不存在: {cid}")
+        return {"deleted": cid}
+
+    @app.post("/api/projects/{pid}/chains/{cid}/links", status_code=201)
+    def add_chain_link(pid: str, cid: str, body: ChainLinkIn):
+        bb = _project(pid).bb
+        try:
+            bb.add_chain_link(
+                pid, cid, body.node_type, body.node_id, body.edge_note, author="human")
+        except LookupError as e:  # 链不存在/跨项目 → 404
+            raise HTTPException(404, str(e)) from e
+        except ValueError as e:  # 节点非法/不存在/跨项目 → 422
+            raise HTTPException(422, str(e)) from e
+        return _chain_detail(bb, pid, cid)["links"][-1]
+
+    @app.patch("/api/projects/{pid}/chains/links/{link_id}")
+    def update_link_note(pid: str, link_id: str, body: LinkNoteIn):
+        row = _project(pid).bb.update_link_note(pid, link_id, body.edge_note, author="human")
+        if row is None:
+            raise HTTPException(404, f"链节点不存在: {link_id}")
+        return row
+
+    @app.delete("/api/projects/{pid}/chains/links/{link_id}")
+    def delete_chain_link(pid: str, link_id: str):
+        row = _project(pid).bb.delete_chain_link(pid, link_id, author="human")
+        if row is None:
+            raise HTTPException(404, f"链节点不存在: {link_id}")
+        return row
+
+    # ---------- 蓝图（R4 逆向开发管线，DESIGN §9 R4） ----------
+
+    @app.get("/api/projects/{pid}/blueprints")
+    def list_blueprints(pid: str):
+        return _project(pid).bb.list_blueprints(pid)
+
+    @app.post("/api/projects/{pid}/blueprints", status_code=201)
+    def create_blueprint(pid: str, body: BlueprintIn):
+        bb = _project(pid).bb
+        try:
+            return bb.create_blueprint(
+                pid, body.name, goal=body.goal, binary_sha256=body.binary_sha256,
+                modules=[m.model_dump() for m in body.modules],
+                content_md=body.content_md,
+                feature_tree_id=body.feature_tree_id, author="human")
+        except ValueError as e:  # 重名/模块非法 → 422
+            raise HTTPException(422, str(e)) from e
+
+    @app.get("/api/projects/{pid}/blueprints/{bid}")
+    def get_blueprint(pid: str, bid: str):
+        row = _project(pid).bb.get_blueprint(pid, bid)
+        if row is None:
+            raise HTTPException(404, f"蓝图不存在: {bid}")
+        return row
+
+    @app.patch("/api/projects/{pid}/blueprints/{bid}")
+    def patch_blueprint(pid: str, bid: str, body: BlueprintPatchIn):
+        bb = _project(pid).bb
+        kw = body.model_dump(exclude_unset=True)
+        status = kw.pop("status", None)
+        try:
+            if kw:
+                row = bb.update_blueprint_content(pid, bid, author="human", **kw)
+            else:
+                row = bb.get_blueprint(pid, bid)
+            if row is not None and status:
+                row = bb.set_blueprint_status(pid, bid, status, author="human")
+        except ValueError as e:  # 非法状态/不可流转 → 422
+            raise HTTPException(422, str(e)) from e
+        if row is None:
+            raise HTTPException(404, f"蓝图不存在: {bid}")
+        return row
+
+    @app.patch("/api/projects/{pid}/blueprints/{bid}/modules/{module_name}")
+    def patch_blueprint_module(pid: str, bid: str, module_name: str,
+                               body: BlueprintModulePatchIn):
+        bb = _project(pid).bb
+        try:
+            row = bb.update_blueprint_module(
+                pid, bid, module_name, author="human",
+                **body.model_dump(exclude_unset=True))
+        except LookupError as e:  # 模块不存在 → 404
+            raise HTTPException(404, str(e)) from e
+        except ValueError as e:  # 模块状态非法 → 422
+            raise HTTPException(422, str(e)) from e
+        if row is None:
+            raise HTTPException(404, f"蓝图不存在: {bid}")
+        return row
+
+    # ---------- 功能树/功能图（v36 独立产物；v53 dev 轨升级为功能图） ----------
+
+    class FeatureNodeIn(BaseModel):
+        name: str
+        parent_id: str | None = None
+        desc: str = ""
+        func_addresses: list[str] = []
+        status: str = "pending"
+        node_type: str = "feature"
+        path: str = ""
+
+    class FeatureNodePatchIn(BaseModel):
+        name: str | None = None
+        desc: str | None = None
+        status: str | None = None
+        parent_id: str | None = None
+        func_addresses: list[str] | None = None
+        node_type: str | None = None
+        path: str | None = None
+
+    @app.get("/api/projects/{pid}/feature-trees")
+    def list_feature_trees(pid: str, binary_sha256: str | None = None):
+        return _project(pid).bb.list_feature_trees(pid, binary_sha256=binary_sha256)
+
+    @app.get("/api/projects/{pid}/feature-trees/{tid}")
+    def get_feature_tree(pid: str, tid: str):
+        row = _project(pid).bb.get_feature_tree(pid, tid)
+        if row is None:
+            raise HTTPException(404, f"功能图不存在: {tid}")
+        return row
+
+    @app.post("/api/projects/{pid}/feature-trees", status_code=201)
+    def create_feature_tree(pid: str, body: dict):
+        bb = _project(pid).bb
+        try:
+            return bb.create_feature_tree(
+                pid, binary_sha256=str(body.get("binary_sha256", "")),
+                name=str(body.get("name", "")),
+                status=str(body.get("status", "pending")), author="human")
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+
+    @app.patch("/api/projects/{pid}/feature-trees/{tid}")
+    def patch_feature_tree(pid: str, tid: str, body: dict):
+        """v53 图级验收状态（pending/passed）——仅人工 UI 调用，Agent 工具层无此入口。"""
+        bb = _project(pid).bb
+        try:
+            return bb.update_feature_tree_status(
+                pid, tid, status=str(body.get("status", "pending")), author="human")
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+
+    @app.post("/api/projects/{pid}/feature-trees/{tid}/nodes", status_code=201)
+    def add_feature_node(pid: str, tid: str, body: FeatureNodeIn):
+        bb = _project(pid).bb
+        try:
+            return bb.add_feature_node(
+                pid, tid, body.name, parent_id=body.parent_id,
+                desc=body.desc, func_addresses=body.func_addresses,
+                status=body.status, node_type=body.node_type, path=body.path,
+                author="human")
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+
+    @app.patch("/api/projects/{pid}/feature-trees/{tid}/nodes/{nid}")
+    def patch_feature_node(pid: str, tid: str, nid: str,
+                           body: FeatureNodePatchIn):
+        bb = _project(pid).bb
+        try:
+            return bb.update_feature_node(
+                pid, tid, nid, author="human",
+                **body.model_dump(exclude_unset=True))
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+
+    @app.delete("/api/projects/{pid}/feature-trees/{tid}/nodes/{nid}")
+    def delete_feature_node(pid: str, tid: str, nid: str):
+        bb = _project(pid).bb
+        try:
+            return bb.delete_feature_node(pid, tid, nid, author="human")
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+
+
+    # ---------- 业务逻辑块（逆向第四页签：函数协作/业务语义，人机共写） ----------
+
+    @app.get("/api/projects/{pid}/logic-blocks")
+    def list_logic_blocks(pid: str, binary_sha256: str | None = None):
+        return _project(pid).bb.list_logic_blocks(pid, binary_sha256=binary_sha256)
+
+    @app.post("/api/projects/{pid}/logic-blocks", status_code=201)
+    def create_logic_block(pid: str, body: LogicBlockIn):
+        bb = _project(pid).bb
+        try:
+            return bb.create_logic_block(
+                pid, body.name, description=body.description,
+                binary_sha256=body.binary_sha256, seq=body.seq,
+                feature_node_id=body.feature_node_id, author="human")
+        except ValueError as e:  # 空名/同项目同样本重名 → 422
+            raise HTTPException(422, str(e)) from e
+
+    @app.get("/api/projects/{pid}/logic-blocks/{lbid}")
+    def get_logic_block(pid: str, lbid: str):
+        row = _project(pid).bb.get_logic_block(pid, lbid)
+        if row is None:
+            raise HTTPException(404, f"业务块不存在: {lbid}")
+        return row
+
+    @app.patch("/api/projects/{pid}/logic-blocks/{lbid}")
+    def patch_logic_block(pid: str, lbid: str, body: LogicBlockPatchIn):
+        try:
+            row = _project(pid).bb.update_logic_block(
+                pid, lbid, author="human", **body.model_dump(exclude_unset=True))
+        except ValueError as e:  # 空名/重名 → 422
+            raise HTTPException(422, str(e)) from e
+        if row is None:
+            raise HTTPException(404, f"业务块不存在: {lbid}")
+        return row
+
+    @app.delete("/api/projects/{pid}/logic-blocks/{lbid}")
+    def delete_logic_block(pid: str, lbid: str):
+        if not _project(pid).bb.delete_logic_block(pid, lbid, author="human"):
+            raise HTTPException(404, f"业务块不存在: {lbid}")
+        return {"deleted": lbid}
+
+    @app.post("/api/projects/{pid}/logic-blocks/{lbid}/funcs", status_code=201)
+    def add_logic_block_func(pid: str, lbid: str, body: LogicBlockFuncIn):
+        bb = _project(pid).bb
+        try:
+            return bb.add_logic_block_func(
+                pid, lbid, body.address, body.role, author="human")
+        except LookupError as e:  # 块不存在/跨项目 → 404
+            raise HTTPException(404, str(e)) from e
+        except ValueError as e:  # 地址非法/未入库/重复挂接/项目级块 → 422
+            raise HTTPException(422, str(e)) from e
+
+    @app.patch("/api/projects/{pid}/logic-blocks/{lbid}/funcs")
+    def patch_logic_block_func(pid: str, lbid: str, body: LogicBlockFuncPatchIn,
+                               address: str = ""):
+        """改挂接函数的角色注。address 走 query（推荐 0x hex 串；query 无 int/str
+        联合语义，统一交给 store 层 _parse_addr 解析）。"""
+        if not address:
+            raise HTTPException(422, "缺 address（0x hex 串）")
+        try:
+            row = _project(pid).bb.update_logic_block_func(
+                pid, lbid, address, body.role, author="human")
+        except ValueError as e:  # 地址非法 → 422
+            raise HTTPException(422, str(e)) from e
+        if row is None:
+            raise HTTPException(404, f"业务块或挂接不存在: {lbid}")
+        return row
+
+    @app.delete("/api/projects/{pid}/logic-blocks/{lbid}/funcs")
+    def delete_logic_block_func(pid: str, lbid: str, address: str = ""):
+        if not address:
+            raise HTTPException(422, "缺 address（0x hex 串）")
+        try:
+            row = _project(pid).bb.remove_logic_block_func(
+                pid, lbid, address, author="human")
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        if row is None:
+            raise HTTPException(404, f"业务块或挂接不存在: {lbid}")
+        return row
+
+    @app.get("/api/projects/{pid}/artifacts")
+    def list_artifacts(pid: str, task_id: str | None = None,
+                       session_id: str | None = None):
+        """产物只读列表（攻击链节点选择器数据源；工作区隔离 W3 起可按归属过滤）。"""
+        return _project(pid).bb.list_artifacts(pid, task_id=task_id,
+                                               session_id=session_id)
+
+    @app.post("/api/projects/{pid}/scratch/clear")
+    def clear_scratch(pid: str):
+        """清空项目自由工作区（scratch + .tmp，工作区隔离 W3）。正式产物 artifacts/ 不动。"""
+        proj = _project(pid)
+        removed = 0
+        failed: list[str] = []
+        for name in ("scratch", ".tmp"):
+            d = Path(proj.path) / name
+            if not d.exists():
+                continue
+            for p in sorted(d.rglob("*"), key=lambda x: len(x.parts), reverse=True):
+                try:
+                    if p.is_file() or p.is_symlink():
+                        p.unlink()
+                    elif p.is_dir() and not any(p.iterdir()):
+                        p.rmdir()
+                    else:
+                        continue
+                    removed += 1
+                except OSError:
+                    failed.append(p.name)
+        return {"removed": removed, "failed": failed[:10]}
+
+    @app.post("/api/projects/{pid}/artifacts/upload", status_code=201)
+    def upload_debug_log(pid: str, kind: str = Form(...), file: UploadFile = File(...)):
+        """调试日志回流（x64dbg 动态验证凭据）：multipart ≤16MB，kind 仅 debug-log。"""
+        if kind != "debug-log":
+            raise HTTPException(422, "该入口只接受 kind=debug-log")
+        proj = _project(pid)
+        name = _safe_upload_name(file.filename or "debug.log")
+        spool, sha, size = _spool_upload(file, DEBUGLOG_MAX_BYTES)
+        out_dir = _inside(proj, "artifacts", "debug-log")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        final = out_dir / f"{sha[:12]}_{name}"
+        with open(final, "wb") as fh:
+            shutil.copyfileobj(spool, fh)
+        spool.close()
+        rel = str(final.relative_to(proj.path)).replace("\\", "/")
+        art_id = proj.bb.add_artifact(pid, rel, kind="debug-log",
+                                      description=name, sha256=sha, author="human")
+        return {"id": art_id, "path": rel, "sha256": sha, "size": size}
+
+    def _attachment_refs(pid: str, ids: list[str] | None) -> list[dict]:
+        """附件随发（2026-09-19）共用校验：id 必须存在且 kind=attachment（否则
+        422，严格不静默丢），返回渲染用精简清单（落 tasks.context.attachments
+        与 human_note payload.attachments，agent 层渲染 📎 行）。"""
+        refs: list[dict] = []
+        for aid in (ids or []):
+            art = _project(pid).bb.get_artifact(pid, aid)
+            if art is None or art.get("kind") != "attachment":
+                raise HTTPException(422, f"附件不存在或类型不符: {aid}")
+            meta = _loads_meta(art)
+            refs.append({
+                "id": aid, "path": art["path"],
+                "name": str(meta.get("original_name") or Path(art["path"]).name),
+                "size": int(meta.get("size") or 0),
+            })
+        return refs
+
+    @app.post("/api/projects/{pid}/attachments", status_code=201)
+    def upload_attachment(pid: str, file: UploadFile = File(...)):
+        """通用附件上传（2026-09-19 直播间输入行「+」随发附件）：任意类型，落
+        artifacts/attachments/<sha12>_<name> 并注册 artifact 行 kind=attachment
+        （meta.original_name/size 供渲染与下载命名）。同项目同内容（sha256）去重
+        返回既有行，不产生重复 artifact。
+
+        **本端点只承接 ≤64MB 的小文件**（一次 body 到位、无进度、不可续传）。
+        超过上限的走 `/attachments/uploads` 分片续传（2026-10-25：附件不再设大小
+        限制，几 GB 也照传）。413 里回 `chunked: true` 让前端知道该换路，而不是
+        把用户堵死在"文件超过 64MB 上限"。"""
+        proj = _project(pid)
+        name = _safe_upload_name(file.filename or "attachment.bin")
+        spool, sha, size = _spool_upload(file, ATTACHMENT_MAX_BYTES)
+        # tmp_path 必须**先绑定**再进 try：若下面副本抛错，finally 里对未绑定名
+        # 求值会抛 UnboundLocalError，把真实异常顶掉（dump.py 踩过同一个坑）。
+        tmp_path: Path | None = None
+        try:
+            # 已落 spool 的内容直接进共用出口；finalize 只从临时文件读，故先转存。
+            with tempfile.NamedTemporaryFile(suffix=".attachment", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+                shutil.copyfileobj(spool, tmp, 1 << 20)
+            return _finalize_attachment(proj, tmp_path, name, sha, size)
+        finally:
+            spool.close()
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+
+    # ---------- 附件分片续传（2026-10-25 用户口径：无论大小，显示上传进度） ----------
+
+    @app.post("/api/projects/{pid}/attachments/uploads", status_code=201)
+    def create_attachment_upload(pid: str, body: AttachmentUploadCreateIn):
+        """建分片会话。**声明值只作交叉校验，不预先分配空间**：总量在每片累加时
+        再检查，避免"先按 4GB 建会话"的空头承诺。"""
+        proj = _project(pid)
+        _purge_stale_attachment_uploads(proj)
+        if body.total_size > ATTACHMENT_MAX_TOTAL_BYTES:
+            raise HTTPException(
+                413, f"附件超过 {ATTACHMENT_MAX_TOTAL_BYTES // (1024 ** 3)}GiB 上限")
+        name = _safe_upload_name(body.filename)
+        expected_chunks = -(-body.total_size // ATTACHMENT_CHUNK_BYTES)  # 向上取整
+        if body.total_chunks != expected_chunks:
+            # 分片大小是前后端共享常量；对不上说明版本不齐，宁可立刻报错——
+            # 否则合并时按各自的数算，会拼出个大小对、内容错的文件。
+            raise HTTPException(
+                422, f"分片数应为 {expected_chunks}（每片 {ATTACHMENT_CHUNK_BYTES // (1024 ** 2)}MB）")
+        upload_id = uuid.uuid4().hex[:24]
+        root = _inside(proj, "attachment_uploads", upload_id)
+        (root / "chunks").mkdir(parents=True, exist_ok=False)
+        metadata = {
+            "upload_id": upload_id,
+            "filename": name,
+            "total_size": body.total_size,
+            "total_chunks": body.total_chunks,
+            "chunk_bytes": ATTACHMENT_CHUNK_BYTES,
+            "sha256": (body.sha256 or "").lower() or None,
+            "received_chunks": [],
+            "status": "uploading",
+            "created_at": _utc_now(),
+        }
+        _write_attachment_upload_meta(root, metadata)
+        return {k: metadata[k] for k in
+                ("upload_id", "filename", "total_size", "total_chunks", "chunk_bytes", "status")}
+
+    @app.get("/api/projects/{pid}/attachments/uploads/{upload_id}")
+    def attachment_upload_status(pid: str, upload_id: str):
+        """续传用：回已收到的分片号。前端开局先问一次，断线重连/刷新后跳过已传片。"""
+        proj = _project(pid)
+        root, metadata = _attachment_upload_meta(proj, upload_id)
+        received = _received_attachment_chunks(root)
+        metadata["received_chunks"] = received
+        metadata["received_size"] = sum(
+            (root / "chunks" / f"{i}.part").stat().st_size for i in received)
+        if metadata.get("status") == "complete":
+            metadata["result"] = metadata.get("result")
+        return metadata
+
+    @app.put("/api/projects/{pid}/attachments/uploads/{upload_id}/chunks/{chunk_index}")
+    async def upload_attachment_chunk(pid: str, upload_id: str, chunk_index: int,
+                                      request: Request):
+        """PUT 单个分片。幂等：同号同内容重复 PUT 视为成功（网络重试不报错），
+        同号不同内容 409（说明客户端拼错了，不能静默覆盖）。"""
+        proj = _project(pid)
+        root, metadata = _attachment_upload_meta(proj, upload_id)
+        if metadata.get("status") != "uploading":
+            raise HTTPException(409, "上传会话已结束")
+        total_chunks = int(metadata["total_chunks"])
+        if chunk_index < 0 or chunk_index >= total_chunks:
+            raise HTTPException(422, "分片序号越界")
+        chunk = await request.body()
+        # 上限防「分片号合法但内容超长」把单请求内存顶爆；最后一片允许更短。
+        if len(chunk) > ATTACHMENT_CHUNK_BYTES:
+            raise HTTPException(
+                413, f"单个分片不能超过 {ATTACHMENT_CHUNK_BYTES // (1024 ** 2)}MB")
+        if not chunk:
+            raise HTTPException(422, "空分片")
+        path = root / "chunks" / f"{chunk_index}.part"
+        if path.exists():
+            if path.read_bytes() != chunk:
+                raise HTTPException(409, "同一分片已存在且内容不同")
+        else:
+            temp = root / "chunks" / f"{chunk_index}.tmp"
+            temp.write_bytes(chunk)
+            os.replace(temp, path)
+        return {"upload_id": upload_id, "chunk_index": chunk_index,
+                "size": len(chunk), "status": "received"}
+
+    @app.post("/api/projects/{pid}/attachments/uploads/{upload_id}/complete",
+              status_code=201)
+    def complete_attachment_upload(pid: str, upload_id: str):
+        """合并分片 → 计算真实 sha256 → 走与单请求相同的登记出口。
+
+        **幂等**：重复调用回同一结果（前端重试/网络抖动不该造出两个 artifact）。
+        合并后立刻删分片目录——几 GB 的分片留着等于把占用翻倍。
+        """
+        proj = _project(pid)
+        root, metadata = _attachment_upload_meta(proj, upload_id)
+        if metadata.get("status") == "complete":
+            return metadata.get("result") or metadata
+        if metadata.get("status") != "uploading":
+            raise HTTPException(409, "上传会话不可完成")
+        chunks_dir = root / "chunks"
+        expected = list(range(int(metadata["total_chunks"])))
+        actual = _received_attachment_chunks(root)
+        if actual != expected:
+            missing = sorted(set(expected) - set(actual))
+            raise HTTPException(409, f"仍缺少分片: {missing[:20]}")
+        total_size = int(metadata["total_size"])
+        assembled = root / "assembled.part"
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            with assembled.open("wb") as out:
+                for index in expected:
+                    part = chunks_dir / f"{index}.part"
+                    with part.open("rb") as src:
+                        while True:
+                            block = src.read(1 << 20)
+                            if not block:
+                                break
+                            total += len(block)
+                            if total > total_size:
+                                raise HTTPException(422, "分片总大小超过声明值")
+                            digest.update(block)
+                            out.write(block)
+            if total != total_size:
+                raise HTTPException(422, "分片总大小与声明值不一致")
+            sha = digest.hexdigest()
+            declared = (metadata.get("sha256") or "").lower()
+            if declared and declared != sha:
+                # 客户端算了 sha 就一定要对上；对不上说明传输中变了（曾被代理截断/
+                # 磁盘写坏），此时落盘等于给用户一个"看起来传好了"的坏文件。
+                raise HTTPException(422, "附件内容校验失败（sha256 不一致），请重传")
+            result = _finalize_attachment(
+                proj, assembled, str(metadata["filename"]), sha, total)
+        except HTTPException:
+            metadata["status"] = "failed"
+            metadata["error"] = "合并/校验失败"
+            _write_attachment_upload_meta(root, metadata)
+            raise
+        finally:
+            assembled.unlink(missing_ok=True)
+        metadata["status"] = "complete"
+        metadata["completed_at"] = _utc_now()
+        metadata["result"] = result
+        _write_attachment_upload_meta(root, metadata)
+        shutil.rmtree(chunks_dir, ignore_errors=True)
+        return result
+
+    @app.get("/api/projects/{pid}/artifacts/{aid}/download")
+    def download_artifact(pid: str, aid: str):
+        """产物/附件二进制下载（此前只有文本 content 只读口，≤256KB 截断——
+        附件是 exe/elf/图片等二进制，必须走 FileResponse 全量）。"""
+        proj = _project(pid)
+        art = proj.bb.get_artifact(pid, aid)
+        if art is None:
+            raise HTTPException(404, f"产物不存在: {aid}")
+        target = _inside(proj, art["path"])
+        if not target.is_file():
+            raise HTTPException(404, "产物文件缺失")
+        name = str(_loads_meta(art).get("original_name")
+                   or Path(art["path"]).name)
+        return FileResponse(target, filename=name)
+
+    @app.get("/api/projects/{pid}/events")
+    def list_events(pid: str, since_id: int = 0, limit: int = 200,
+                    before_id: int | None = None, tail: int = 0,
+                    session_id: str | None = None, kinds: str | None = None):
+        # tail/before_id：直播间首屏增量 + 上翻分页（不全量回放，2026-09-17）；
+        # session_id：会话维度分页（2026-09-23 直播间会话窗口，store 层 F8 既支持）；
+        # kinds：逗号分隔事件类型过滤（编排器对话历史按 kind=orch.chat 全量拉取用，
+        # 2026-09-26——首屏只水合尾部 300 条，长跑项目 orch.chat 落窗外显空）
+        kind_list = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
+        return _project(pid).bb.recent_events(
+            pid, since_id=since_id, limit=limit,
+            session_id=session_id, before_id=before_id, tail=tail, kinds=kind_list)
+
+    # ---------- 审批收件箱（§12 一等公民：越界/net:real 等待批动作） ----------
+
+    @app.get("/api/projects/{pid}/approvals")
+    def list_approvals(pid: str, status: str | None = None):
+        proj = _project(pid)
+        sql = "SELECT * FROM approvals WHERE project_id=?"
+        params: list[Any] = [pid]
+        if status:
+            sql += " AND status=?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC"
+        # M5 D2：行动边界全文随审批卡出口（§0-10）——人类在审批卡里对照当前
+        # 边界审授权/升级申请；server 拼好（与编排器 _mission_section 同源），
+        # 前端存在才渲染。项目级常量，N 条重复 N 次可接受。
+        from core.orchestrator.orchestrator import mission_boundary_lines
+        proj_row = proj.bb.get_project(pid)
+        boundary = "；".join(mission_boundary_lines(proj_row.get("track"), proj_row["config"]))
+        # action 库存 JSON 字符串，出口解析为对象（与前端 types.ts Approval.action 对齐）
+        out = []
+        for r in proj.bb.conn.execute(sql, params).fetchall():
+            d = dict(r)
+            d["boundary"] = boundary
+            try:
+                d["action"] = json.loads(d["action"])
+            except (TypeError, ValueError, KeyError):
+                pass
+            out.append(d)
+        return out
+
+    def _exec_approved_spawn_session(
+        bb: Blackboard, pid: str, action: dict, approval_id: str,
+    ) -> dict:
+        """批准 spawn_session（纯开窗单）：当场建无绑侦查窗并起跑
+        （sessions_cap 预检保留）。任何失败抛异常，由 decide 统一落
+        approval.exec_failed，不回滚批准。"""
+        proj = _project(pid)
+        auto = autonomy.autonomy_of(bb.get_project(pid)["config"], track=proj.track)
+        active = autonomy.count_active_sessions(bb, pid)
+        if active >= auto["sessions_cap"]:
+            raise RuntimeError(
+                f"活跃会话已达项目上限 sessions_cap={auto['sessions_cap']}"
+                f"（当前 {active} 个非 closed 会话）；请先关窗或调高上限后重新申请")
+        role = (action.get("role") or "").strip()
+        if not role:
+            raise RuntimeError("审批 action 缺少 role")
+        try:
+            exec_llm, plan_llm = _llms()
+        except HTTPException as e:  # 无可用 key：503 转为执行失败，不回滚批准
+            raise RuntimeError(e.detail) from e
+        factory = _registered_session_factory(pid, exec_llm, plan_llm)
+        try:
+            agent = factory(role)  # 角色 yaml 缺失抛 FileNotFoundError
+        except FileNotFoundError as e:
+            raise RuntimeError(str(e)) from e
+        sid = agent.session["id"]
+        bb.set_session_meta(sid, {"worker_armed": True})  # F9：编排开窗默认已启动
+        bb.append_event(
+            pid, "session.spawned",
+            {"role": role, "session_id": sid, "approval_id": approval_id},
+            author="orchestrator")
+        job_id = _submit_worker(pid, agent, auto=True, origin="approval-spawn")
+        return {"session_id": sid, "job_id": job_id}
+
+    def _exec_approved_phase_transition(
+            bb: Blackboard, pid: str, action: dict, approval_id: str) -> dict:
+        """批准阶段流转审批单（分阶段工作流 M2）：批准即流转。生产方唯一=API 层
+        `_phase_gate_check` 的 L1 分流。目标阶段缺失/等待期人工已流转过 → 视为
+        已处理直接通过（审批终检语义，不落 exec_failed）。"""
+        proj = _project(pid)
+        book = _phase_book_of(proj)
+        to = str(action.get("to") or "").strip()
+        if to not in book:
+            return {"skipped": f"目标阶段不存在: {to}"}
+        cur = phases_mod.current_spec(book, proj.meta or {})
+        if cur and cur[0] == to:
+            return {"skipped": "已处于目标阶段"}
+        idle = int(orch_state.load_or_create(bb, pid)["derive_idle_rounds"])
+        r = phases_mod.enter_phase(proj, to, by="approval",
+                                   packs_root=app.state.packs_root,
+                                   reason=f"审批 {approval_id} 批准", idle_rounds=idle)
+        return {"phase": to, "published": r["published"]}
+
+    def _exec_approved_authorization(
+            bb: Blackboard, pid: str, action: dict, approval_id: str) -> dict:
+        """批准授权申请审批单（M5 D2，orchestrator-efficiency §0-10）：**纯回流**
+        ——批准即人类授权，处理器不做任何平台动作（scope_expand 后 Agent 自行
+        bb_add_asset 登记、rating_override 后按更高口径重新登记/patch）；结果经
+        收件箱 authorization_result 回流提交会话。恒 human 决策在架构上已成立
+        （Agent 产的审批单只有人类 decide），L2 无自动批路径。"""
+        # scope_expand 的结构化目标在批准后自动并入项目 scope；自由文本
+        # request_authorization 仍保持纯回流，只有明确 scope_value 才执行。
+        if action.get("scope_value"):
+            from core.scope_policy import expand_project_scope
+            expand_project_scope(bb, pid, str(action["scope_value"]))
+            bb.append_event(
+                pid, "scope.expanded",
+                {"approval_id": approval_id, "scope_value": str(action["scope_value"])[:500]},
+                author="system")
+        sid = str(action.get("session_id") or "")
+        if sid:
+            try:
+                ok = bb.inbox_post(
+                    pid, sid, "authorization_result", approval_id,
+                    {"op": "authorization", "kind": action.get("kind"),
+                     "scope_request": str(action.get("scope_request") or "")[:300],
+                     "approved": True})
+                if ok:  # 事件流同步可见（与 escalation 回执同款 message.inbox 卡）
+                    bb.append_event(
+                        pid, "message.inbox",
+                        {"to_session": sid, "kind": "authorization_result",
+                         "ref_id": approval_id,
+                         "title": f"✅ 授权申请已批准（{action.get('kind')}）",
+                         "by": "system"},
+                        session_id=sid, author="system")
+            except Exception:  # noqa: BLE001 —— 回流失败不影响批准
+                log.exception("authorization 回流失败 approval=%s", approval_id)
+        return {"notified": sid or None}
+
+    def _exec_approved_command_approval(
+            bb: Blackboard, pid: str, action: dict, approval_id: str) -> dict:
+        """批准危险命令审批单（2026-10-30）：**纯回流**——批准即放行，执行仍由
+        Agent 用 run_cmd 的 approval_id 参数重试（网关执行后一次性 consumed）。
+        结果经收件箱 approval_granted 回流提交会话，Agent 下个步边界读到后
+        立即带 approval_id 重试，不再空等。"""
+        sid = str(action.get("session_id") or "")
+        if sid:
+            try:
+                ok = bb.inbox_post(
+                    pid, sid, "approval_granted", approval_id,
+                    {"approval_id": approval_id,
+                     "cmd": str(action.get("cmd") or "")[:400],
+                     "rule": str(action.get("rule") or "")})
+                if ok:  # 事件流同步可见（与 authorization 回执同款 message.inbox 卡）
+                    bb.append_event(
+                        pid, "message.inbox",
+                        {"to_session": sid, "kind": "approval_granted",
+                         "ref_id": approval_id,
+                         "title": "✅ 危险命令审批已批准",
+                         "by": "system"},
+                        session_id=sid, author="system")
+            except Exception:  # noqa: BLE001 —— 回流失败不影响批准
+                log.exception("command_approval 回流失败 approval=%s", approval_id)
+        return {"notified": sid or None}
+
+    # 审批 op 处理器白名单（批 4，红线）：批准后动作只准字典分派，绝不 eval。
+    # 2026-10-06 任务退役：delegate_window/cancel_task/requeue_task 三 op 移除；
+    # spawn_session（纯开窗单）、phase_transition、authorization 保留。
+    _APPROVAL_OP_HANDLERS = {
+        "spawn_session": _exec_approved_spawn_session,
+        "phase_transition": _exec_approved_phase_transition,
+        "authorization": _exec_approved_authorization,
+        # 2026-10-30：危险命令一次性审批（网关自动建审；批准=纯回流，执行待
+        # Agent 带 approval_id 重试，网关执行后 consumed）。
+        "command_approval": _exec_approved_command_approval,
+    }
+
+    @app.post("/api/approvals/{approval_id}/decide")
+    def decide_approval(approval_id: str, body: ApprovalDecisionIn):
+        proj_bb = _bb_of_approval(approval_id)
+        try:
+            row = proj_bb.decide_approval(approval_id, body.decision)  # 人类决策（默认 decided_by=human）
+        except ValueError as e:
+            raise HTTPException(404 if "不存在" in str(e) else 422, str(e))
+        result: dict[str, Any] = {"approval_id": approval_id, "status": body.decision}
+        # 批 4：approved 且 action.op 命中白名单才执行处理器；
+        # rejected / 无 op / 未知 op 维持旧语义——只翻状态（rejected 由 orch 下轮经事件改道）
+        if body.decision == "rejected":
+            # M5 D2 搭车（§0-10）：authorization 被拒后回流提交会话
+            # （此前 rejected 无回流=Agent 空等）；回流失败不影响拒绝
+            action = row.get("action")
+            if isinstance(action, str):
+                try:
+                    action = json.loads(action)
+                except ValueError:
+                    action = None
+            op = action.get("op") if isinstance(action, dict) else None
+            sid = str((action or {}).get("session_id") or "") if isinstance(action, dict) else ""
+            if op == "authorization" and sid:
+                try:
+                    proj_bb.inbox_post(
+                        row["project_id"], sid, "approval_rejected", approval_id,
+                        {"op": op, "kind": (action or {}).get("kind")})
+                except Exception:  # noqa: BLE001
+                    log.exception("拒绝回流失败 approval=%s", approval_id)
+        if body.decision == "approved":
+            action = row.get("action")
+            if isinstance(action, str):
+                try:
+                    action = json.loads(action)
+                except ValueError:
+                    action = None
+            op = action.get("op") if isinstance(action, dict) else None
+            handler = _APPROVAL_OP_HANDLERS.get(op) if op else None
+            if handler is not None:
+                try:
+                    result.update(executed=True,
+                                  **handler(proj_bb, row["project_id"], action, approval_id))
+                except Exception as e:  # noqa: BLE001 —— 执行失败不回滚批准
+                    err = f"{type(e).__name__}: {e}"
+                    proj_bb.append_event(
+                        row["project_id"], "approval.exec_failed",
+                        {"approval_id": approval_id, "op": op, "error": err},
+                        author="system")
+                    result.update(executed=False, error=err)
+                else:
+                    # 触发点 E（批 5）：新窗的 job 已由处理器提交；再唤醒其他空闲窗
+                    # 认领同轮任务（L1/L2 未暂停；新窗被 _session_job_running 去重）。
+                    try:
+                        ep = row["project_id"]
+                        ecfg = _auto_cfg(ep)
+                        if ecfg["level"] in {"L1", "L2"} and not ecfg["paused"]:
+                            result["kicked"] = _kick_workers(ep)
+                    except Exception:  # noqa: BLE001 —— kick 失败不影响批准结果
+                        log.exception("审批后 kick 失败 approval=%s", approval_id)
+        return result
+
+    def _bb_of_approval(approval_id: str) -> Blackboard:
+        for proj in store.list_projects():
+            try:
+                p = _project(proj["id"])
+            except HTTPException:
+                continue
+            if p.bb.conn.execute(
+                    "SELECT 1 FROM approvals WHERE id=?", (approval_id,)).fetchone():
+                return p.bb
+        raise HTTPException(404, f"审批不存在: {approval_id}")
+
+    @app.get("/api/projects/{pid}/session-graph")
+    def get_session_graph(pid: str):
+        # 会话中心化 M4：节点=编排器+会话窗；delegate/derive/inbox/dm 边（见 graph.session_graph）
+        return session_graph(_project(pid).bb, pid)
+
+    # ---------- Team direct execution（独立于旧任务/DAG） ----------
+    @app.post("/api/projects/{pid}/teams", status_code=201)
+    def create_team(pid: str, body: TeamCreateIn):
+        proj = _project(pid)
+        try:
+            return TeamStore(proj.bb, packs_root=app.state.packs_root).create_team(
+                pid, name=body.name, goal_text=body.goal_text,
+                members=[member.model_dump() for member in body.members],
+                config=body.config)
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+
+    @app.get("/api/projects/{pid}/teams")
+    def list_teams(pid: str):
+        proj = _project(pid)
+        return TeamStore(proj.bb, packs_root=app.state.packs_root).list_teams(pid)
+
+    @app.get("/api/projects/{pid}/teams/{team_id}")
+    def get_team(pid: str, team_id: str):
+        try:
+            return TeamStore(_project(pid).bb, packs_root=app.state.packs_root).get_team(pid, team_id)
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+
+    @app.patch("/api/projects/{pid}/teams/{team_id}")
+    def patch_team(pid: str, team_id: str, body: TeamPatchIn):
+        proj = _project(pid)
+        try:
+            return TeamStore(proj.bb, packs_root=app.state.packs_root).update_team(
+                pid, team_id, name=body.name, goal_text=body.goal_text,
+                members=None if body.members is None else [member.model_dump() for member in body.members],
+                config=body.config)
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from e
+
+    @app.get("/api/projects/{pid}/teams/{team_id}/preflight")
+    def team_preflight(pid: str, team_id: str):
+        try:
+            return TeamStore(_project(pid).bb, packs_root=app.state.packs_root).preflight(pid, team_id)
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+
+    @app.post("/api/projects/{pid}/teams/{team_id}/start")
+    def start_team(pid: str, team_id: str, body: TeamStartIn):
+        proj = _project(pid)
+        ts = TeamStore(proj.bb, packs_root=app.state.packs_root)
+        try:
+            run = ts.create_run_and_members(pid, team_id, revision=body.preflight_revision, confirmations=body.confirmations)
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+        except RuntimeError as e:
+            raise HTTPException(409, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        job_id = app.state.jobs.submit("team-fanout", lambda: _fanout_team(pid, team_id, run["id"]), meta={"project_id": pid, "team_id": team_id, "run_id": run["id"]})
+        return {"run": run, "job_id": job_id, "status": "starting"}
+
+    @app.post("/api/projects/{pid}/teams/{team_id}/cancel")
+    def cancel_team(pid: str, team_id: str, body: TeamCancelIn):
+        proj = _project(pid)
+        ts = TeamStore(proj.bb, packs_root=app.state.packs_root)
+        try:
+            run = ts.cancel_run(pid, team_id, body.run_id, body.reason)
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+        for member in run["members"]:
+            sid = member.get("session_id")
+            if sid and member.get("status") == "running":
+                agent = app.state.agents.get(sid)
+                if agent is not None:
+                    agent.request_abort()
+        return run
+
+    @app.get("/api/projects/{pid}/teams/{team_id}/runs")
+    def list_team_runs(pid: str, team_id: str):
+        try:
+            return TeamStore(_project(pid).bb, packs_root=app.state.packs_root).list_runs(pid, team_id)
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+
+    @app.get("/api/projects/{pid}/teams/{team_id}/runs/{run_id}")
+    def get_team_run(pid: str, team_id: str, run_id: str):
+        try:
+            return TeamStore(_project(pid).bb, packs_root=app.state.packs_root).get_run(pid, team_id, run_id)
+        except LookupError as e:
+            raise HTTPException(404, str(e)) from e
+
+    @app.get("/api/projects/{pid}/board-graph")
+    def get_board_graph(pid: str):
+        # 黑板链路图（2026-09-20）：五类对象类型分层 DAG；边口径见 graph.board_graph docstring
+        return board_graph(_project(pid).bb, pid)
+
+    @app.get("/api/projects/{pid}/attack-path")
+    def get_attack_path(pid: str, target: str):
+        # 单站攻击链路图 v3（2026-09-24）：目标→意图→漏洞/发现/死路，只读
+        try:
+            return build_attack_path(_project(pid).bb, pid, target)
+        except LookupError:
+            raise HTTPException(404, "目标资产不存在")
+
+    @app.get("/api/projects/{pid}/intents")
+    def get_intents(pid: str, status: str | None = None):
+        # 意图清单（人类侧，供收尾核对）；?status=open/closed 过滤
+        proj = _project(pid)
+        return list_intents(proj.bb, pid, status=status)
+
+    @app.get("/api/projects/{pid}/intent-graph")
+    def get_intent_graph(pid: str):
+        # 项目级意图推导图（2026-10-13，逆向轨）：样本→意图→收尾（发现|死路），
+        # 只读逻辑层（无执行层）；「意图」subnav 的链路视角数据源
+        return build_intent_graph(_project(pid).bb, pid)
+
+    @app.post("/api/projects/{pid}/intents/{iid}/reopen")
+    def post_reopen_intent(pid: str, iid: str, payload: dict | None = None):
+        # 人类否决收尾：漏洞被证伪/有新证据 → 重开意图（AI 须重新收尾）
+        try:
+            return reopen_intent(_project(pid).bb, pid, iid, author="human",
+                                 note=(payload or {}).get("note", ""))
+        except LookupError:
+            raise HTTPException(404, "意图不存在")
+
+    def _session_meta(bb, sid: str) -> dict:
+        """读会话 meta（JSON 文本→dict；损坏/缺失→{}）。"""
+        raw = (bb.get_session(sid) or {}).get("meta")
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except ValueError:
+                return {}
+        return raw or {}
+
+    def _session_job_running(sid: str) -> bool:
+        return any(j["status"] == "running" and j["kind"] == "agent-work"
+                   and j["meta"].get("session_id") == sid
+                   for j in app.state.jobs.all_jobs())
+
+    def _do_close_session(sid: str) -> dict:
+        """关窗收尾（§6.4 人类插手通道；F9 从 close_session 抽出供排水复用）：
+        status='closed' + session.closed 事件；编排不再复用该窗口（从
+        app.state.agents 摘除），黑板数据保留。调用方须先确认无在跑 worker
+        （排水路径由 worker 在任务收尾后自调，天然满足）。"""
+        agent = app.state.agents.get(sid)
+        if agent is not None:
+            # E12：closed 会话不可 rehydrate（_ensure_agent 404），快照必成孤儿 → 显式清理
+            agent._clear_snapshot()
+        pid = _pid_of_session(sid)
+        try:
+            _project(pid).bb.close_session(sid)
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        app.state.agents.pop(sid, None)
+        # 会话级常驻容器随会话终结销毁（P3，2026-10-07）；尽力而为，不阻断关窗
+        try:
+            app.state.session_containers.remove(pid, sid)
+        except Exception:  # noqa: BLE001
+            pass
+        return {"session_id": sid, "status": "closed"}
+
+    @app.post("/api/sessions/{sid}/close")
+    def close_session(sid: str):
+        """关窗=结束会话（2026-09-19 改硬中断，F9 优雅排水退役）：worker 在跑时
+        request_abort + 置 close_pending——当前步做完任务 fail（人工中断，快照
+        保留可续跑），worker 退出循环后经 close_pending 检查点自关；空闲时立即
+        关。前端页签 × 是唯一入口（会话控制组已删）。"""
+        pid = _pid_of_session(sid)
+        if _session_job_running(sid):
+            bb = _project(pid).bb
+            _ensure_agent(pid, sid).request_abort()
+            bb.set_session_meta(sid, {"close_pending": True, "worker_armed": False})
+            bb.append_event(
+                pid, "session.work_state",
+                {"session_id": sid, "armed": False, "close_pending": True,
+                 "abort": True},
+                session_id=sid, author="human")
+            return {"session_id": sid, "status": "closing"}
+        return _do_close_session(sid)
+
+    @app.delete("/api/sessions/{sid}")
+    def delete_session(sid: str):
+        """物理删除会话窗（2026-09-26 新壳侧栏悬停删除）：仅 closed 可删——活窗
+        必须先 POST /close 正规关窗（排水/摘 agents/open 任务退回公共池都在关窗
+        路径上）；这里只做黑板行级清除，events 留审计（session.deleted）。不可逆。"""
+        pid = _pid_of_session(sid)
+        try:
+            return _project(pid).bb.delete_session(sid)
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+
+    # ---------- 会话控制（DESIGN.md §3：暂停/恢复/中断） ----------
+
+    @app.post("/api/sessions/{sid}/pause")
+    def pause_session(sid: str):
+        """软暂停：worker 在 LLM 步边界退出。
+        空闲会话（无 job 且无认领任务）：已武装只解除武装（F9，不落 paused 不发
+        session.paused）；未武装无事可暂停 → 409（修「空闲点暂停也落已暂停」）。"""
+        pid = _pid_of_session(sid)
+        bb = _project(pid).bb
+        agent = _ensure_agent(pid, sid)
+        if agent.paused:
+            raise HTTPException(409, "会话已处于暂停态")
+        job_running = _session_job_running(sid)
+        if not job_running and agent.dispatcher.current_task_id is None:
+            meta_raw = (bb.get_session(sid) or {}).get("meta")
+            meta = json.loads(meta_raw) if isinstance(meta_raw, str) else (meta_raw or {})
+            if not meta.get("worker_armed"):
+                raise HTTPException(409, "会话空闲，无需暂停")
+            bb.set_session_meta(sid, {"worker_armed": False})
+            bb.append_event(pid, "session.work_state",
+                            {"session_id": sid, "armed": False},
+                            session_id=sid, author="human")
+            return {"session_id": sid, "status": "idle", "disarmed": True}
+        agent.request_pause()
+        if job_running:
+            # v0.64：暂停请求即时落盘断点快照（尾部 sanitize）——软暂停要等步
+            # 边界才由 worker 落盘，期间关后端会丢现场；先落一份兜底，worker 到
+            # 边界后以干净现场覆盖（幂等）。
+            agent.pause_snapshot_now()
+        if not job_running:
+            agent._enter_paused()  # 认领了任务但 worker 已退（孤儿认领）：无线程消费检查点，直接落 paused
+        # F9：暂停 = 解除武装（armed 是自动接任务的常驻开关；显式「跑」才重新点亮）
+        bb.set_session_meta(sid, {"worker_armed": False})
+        return {"session_id": sid, "status": "paused"}
+
+    @app.post("/api/sessions/{sid}/resume")
+    def resume_session(sid: str, body: SessionResumeIn | None = None):
+        """恢复：清控制标志；有快照则起新 agent-work job 续跑被暂停的任务。
+        E8：可附引导语（随快照注入 user 消息）；预算暂停缺省自动 +200 步
+        （extra_steps 可覆盖，0=不增补），并落 step.budget_extended 审计。"""
+        agent = _ensure_agent(_pid_of_session(sid), sid)
+        if not agent.paused:
+            raise HTTPException(409, "会话未处于暂停态")
+        agent.paused = False
+        agent._pause_req.clear()
+        agent._abort_req.clear()
+        pid = agent.project_id
+        bb = _project(pid).bb
+        st = agent._resume_state
+        if st is not None and st.get("reason") == "budget":
+            extra = 200 if body is None or body.extra_steps is None else body.extra_steps
+            if extra > 0:
+                old = agent.dispatcher.max_steps
+                agent.dispatcher.max_steps = old + extra
+                bb.append_event(
+                    pid, "step.budget_extended",
+                    {"session_id": sid, "task_id": st.get("task_id"),
+                     "old_max": old, "new_max": old + extra, "by": "human"},
+                    session_id=sid, author="human")
+        if body and body.note and st is not None:
+            st["messages"].append(
+                {"role": "user", "content": f"💬 人类引导：{body.note.strip()}"})
+        bb.append_event(pid, "session.resumed", {"session_id": sid},
+                        session_id=sid, author="human")
+        # F9：恢复是显式「跑」动作 → 重新点亮武装（有快照继续跑，无快照回到待命可接单）
+        bb.set_session_meta(sid, {"worker_armed": True, "close_pending": None})
+        if st is not None:
+            bb.set_session_status(sid, "running")
+            _submit_worker(pid, agent, origin="human-resume")
+        else:
+            bb.set_session_status(sid, "idle")  # 空闲暂停：无快照可续，回到待命
+        return {"session_id": sid, "status": "running"}
+
+    @app.post("/api/sessions/{sid}/abort")
+    def abort_session(sid: str):
+        """硬中断：当前步做完 → 任务 fail（人工中断）→ 会话空闲。"""
+        agent = _ensure_agent(_pid_of_session(sid), sid)
+        agent.request_abort()
+        if not _session_job_running(sid):
+            agent._abort_current_task()  # 暂停态/空闲：没有线程会消费检查点
+        return {"session_id": sid, "status": "aborted"}
+
+    # ---------- 会话收件箱（§6.7 的 1.5/1.6：知会私信，独立于审批收件箱） ----------
+
+    @app.get("/api/sessions/{sid}/inbox")
+    def session_inbox(sid: str, unread: bool = False):
+        pid = _pid_of_session(sid)
+        return _project(pid).bb.inbox_list(pid, sid, unread_only=unread)
+
+    @app.post("/api/sessions/{sid}/inbox/read")
+    def session_inbox_read(sid: str, body: InboxRead | None = None):
+        pid = _pid_of_session(sid)
+        n = _project(pid).bb.inbox_mark_read(pid, sid, body.ids if body else None)
+        return {"marked": n}
+
+    @app.post("/api/sessions/{sid}/note", status_code=201)
+    def post_session_note(sid: str, body: SessionNoteIn):
+        """人工引导通道（E8）：human_note 私信直达会话，worker 步边界 drain
+        注入「💬 人类引导：…」user 消息（不打断当前工具调用）；暂停期投递的
+        引导在恢复随快照一并注入。页签红点/已读/事件流审计全复用。
+        返回 wake（2026-09-27）=后端实际处置：resumed=暂停会话被引导唤醒走
+        恢复语义；kicked=空闲踢对话轮；queued=窗内有活滞留收件箱等注入；
+        deferred=轮进行中维持轮末注入。"""
+        pid = _pid_of_session(sid)
+        text = body.text.strip()
+        att_refs = _attachment_refs(pid, body.attachment_ids)
+        if not text and not att_refs:
+            raise HTTPException(422, "引导内容不能为空（文本与附件至少一项）")
+        try:
+            r = _project(pid).bb.post_human_note(pid, sid, text,
+                                                 attachments=att_refs)
+        except ValueError as e:
+            raise HTTPException(404, str(e))
+        if r is None:
+            raise HTTPException(409, "会话已关闭，无法投递引导")
+        # 空闲对话轮（2026-09-19；v24 会话中心化口径）：无 worker 在跑时——armed
+        # 窗一律踢（自动接单语义）；未武装窗仅当**窗内无 open/claimed 委托**才踢
+        # （宁严勿松：不能让一条聊天消息替未批准的委托起跑），窗内有活则引导滞留
+        # 收件箱、等窗起跑轮注入。轮进行中投递的引导维持轮末注入。
+        #
+        # 暂停会话（2026-09-27 修「引导石沉大海」）：此前 armed 窗被暂停时不看
+        # paused 直接踢 worker——rehydrate 载回快照即 paused=True，run_session
+        # 暂停闸静默空退（无事件无日志无 LLM），引导滞留收件箱永无回应。人工
+        # 引导本身即显式人手动作 → 走 ▶继续 恢复语义：引导已入收件箱，恢复轮
+        # drain 随注；预算暂停比照 resume 缺省 +200 步（chat 轮步数取
+        # min(dispatcher, chat_max_steps)，不增补则连回应步都没有）。
+        resp = {"note_id": r["id"], "session_id": sid}
+        if not _session_job_running(sid):
+            agent = _ensure_agent(pid, sid)
+            if agent.paused:
+                agent.paused = False
+                agent._pause_req.clear()
+                agent._abort_req.clear()
+                bb = _project(pid).bb
+                st = agent._resume_state
+                if st is not None and st.get("reason") == "budget":
+                    old = agent.dispatcher.max_steps
+                    agent.dispatcher.max_steps = old + 200
+                    bb.append_event(
+                        pid, "step.budget_extended",
+                        {"session_id": sid, "task_id": st.get("task_id"),
+                         "old_max": old, "new_max": old + 200, "by": "human-note"},
+                        session_id=sid, author="human")
+                bb.append_event(pid, "session.resumed",
+                                {"session_id": sid, "by": "human-note"},
+                                session_id=sid, author="human")
+                # F9：恢复是显式「跑」动作 → 重新点亮武装（比照 resume 端点）
+                bb.set_session_meta(sid, {"worker_armed": True, "close_pending": None})
+                if st is not None:
+                    bb.set_session_status(sid, "running")
+                _submit_worker(pid, agent, origin="human-note-resume")
+                resp["wake"] = "resumed"
+                return resp
+            # 任务机制退役（2026-10-06）：无任务即无「窗内持有未批准委托」，
+            # 空闲窗可安全 kick；已武装窗照常直接 kick。
+            chat_safe = True
+            if chat_safe:
+                _submit_worker(pid, agent, origin="human-note")
+                resp["wake"] = "kicked"
+            else:
+                resp["wake"] = "queued"
+        else:
+            resp["wake"] = "deferred"
+        return resp
+
+    @app.post("/api/sessions/{sid}/compact")
+    def compact_session(sid: str):
+        """手动持久压缩会话对话上下文（直播间 `/compact`，2026-10-06）：把
+        chat-<sid>.json 旧历史经 LLM 压成摘要后重写（摘要 + 近 8 条），后续对话轮
+        从压缩后历史起跑；落 llm.compact 事件（前端「🧹 上下文压缩」行）。
+        会话执行中 409——避免与轮末 _append_chat_to_session 的写竞争。"""
+        pid = _pid_of_session(sid)
+        if _session_job_running(sid):
+            raise HTTPException(409, "会话正在执行中，稍候再压缩")
+        agent = _ensure_agent(pid, sid)  # 404：不存在/已关窗
+        return agent.compact_session_chat()
+
+    @app.get("/api/sessions/{sid}/context")
+    def session_context(sid: str):
+        """会话上下文用量快照（直播间 `/context`，2026-10-06）：窗口分母 = 供应商
+        model_context（缺省 256K），占用 = 最近一次 LLM 调用的真实 input（无则估算）。"""
+        pid = _pid_of_session(sid)
+        return _ensure_agent(pid, sid).context_usage()
+
+    @app.post("/api/sessions/{sid}/role")
+    def switch_session_role(sid: str, body: SessionRoleIn):
+        """会话级换智能体（会话中心化 §4.4，2026-09-25）：会话行身份更新 +
+        对在内存会话热换装（下个步边界重建 system/工具白名单）——对话历史与
+        黑板全保留、新身份跨委托持续。closed 窗 409；专家不在池 422。"""
+        pid = _pid_of_session(sid)
+        role = body.role.strip()
+        if not role:
+            raise HTTPException(422, "role 不能为空")
+        proj = _project(pid)
+        if not expert_exists(app.state.packs_root, role, proj.track):
+            raise HTTPException(422, f"专家不在池内或不可服务该轨: {role}")
+        try:
+            row = proj.bb.set_session_role(sid, role)
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+        agent = app.state.agents.get(sid)
+        if agent is not None:
+            try:
+                agent.switch_session_role(role)
+            except Exception:  # noqa: BLE001
+                log.exception("会话级换人热换装失败 sid=%s", sid)
+        return row
+
+    def _pid_of_session(sid: str) -> str:
+        for proj in store.list_projects():
+            try:
+                p = _project(proj["id"])
+            except HTTPException:
+                continue
+            if p.bb.conn.execute("SELECT 1 FROM sessions WHERE id=?", (sid,)).fetchone():
+                return proj["id"]
+        raise HTTPException(404, f"会话不存在: {sid}")
+
+    # ---------- Agent 会话（开窗） ----------
+
+    @app.get("/api/projects/{pid}/roles")
+    def list_roles(pid: str):
+        """专家清单（WebUI 开窗下拉 / 编排 allowed_roles 多选的数据源）。
+        expert-pool M2：数据源=experts/ 池按项目轨过滤，响应键保持角色视图兼容
+        （role=专家 id，name=中文显示名），前端零改动；M3 换将页跟进。"""
+        track = _project(pid).track
+        out = []
+        for name in list_experts(app.state.packs_root, track):
+            e = load_expert(app.state.packs_root, name, track)
+            out.append({"role": name, "name": e.get("name") or name,
+                        "description": e.get("description"),
+                        "persona": e.get("persona"),
+                        "tools": e.get("tools"),
+                        "max_steps": e.get("max_steps")})
+        return out
+
+    # ---------------- 网关策略快照（gateway-config-view M1，2026-09-23）----------------
+    # 单一事实源仍是代码：本端点做代码→JSON 映射，改规则必须走代码+测试，页面永不漂移。
+
+    @app.get("/api/gateway/config")
+    def gateway_config():
+        """执行网关策略快照（设置页「网关」页签数据源，DESIGN §7）。
+        runtime/threat/net 直出 policy 常量；pathguard 为手工语义摘要（测试断言
+        条数防遗漏）；rate_rules 直出 rateguard.RATE_RULES 表。"""
+        from core.runtime import pathguard, policy, rateguard
+        runtime_levels = [
+            {"name": "host", "level": 0, "label": "宿主原生",
+             "desc": "本项目自身代码、静态分析"},
+            {"name": "wsl", "level": 1, "label": "WSL2 半可信",
+             "desc": "与宿主同信任级（不可信代码不因 wsl 降险）"},
+            {"name": "docker", "level": 2, "label": "普通容器",
+             "desc": "不可信代码默认环境"},
+            {"name": "sandbox", "level": 3, "label": "加固沙箱",
+             "desc": "活体恶意样本专用（L3+fakenet）"},
+        ]
+        threat_matrix = [
+            {"threat_class": tc, "allowed": sorted(policy.allowed_runtimes(tc)),
+             "note": note}
+            for tc, note in [
+                ("trusted", "可信：本项目自身代码与静态分析"),
+                ("untrusted", "不可信：来源不明代码/下载工具，只允许容器"),
+                ("unknown", "未知按恶意样本处理（宁严勿松，§7 安全默认值）"),
+                ("malware_live", "活体恶意样本：仅 L3 加固沙箱"),
+            ]
+        ]
+        pathguard_rules = [
+            "只拦写不拦读（核心诉求=产物归置，读另行审计）",
+            "PowerShell 写 cmdlet 清单：out-file / set-content / add-content / "
+            "tee-object / new-item / export-csv / export-clixml / "
+            "export-pfxcertificate / set-variable",
+            "参数式写目标同拦：curl/wget/iwr 的 -o / --output / -OutFile 及 "
+            "nmap 风格 -oG/-oN 连写、bash tee",
+            "重定向 > >> 1> 2> 1>> 2>> 同拦",
+            "豁免特殊目标：&1 &2 /dev/null nul con $null",
+            "变量间接静态不可判：~ 一律视为逃逸；$env: / %VAR% 放行"
+            "（TEMP/TMP 已被网关重定向进项目）",
+            "相对路径按 cwd=scratch 解析，越出 workspace 即拒；workspace 内可写，正式产物走 bb_add_artifact",
+        ]
+        return {
+            "runtime_levels": runtime_levels,
+            "threat_matrix": threat_matrix,
+            "net_modes": {"modes": ["none", "fakenet", "real"],
+                          "default": policy.DEFAULT_NET_MODE,
+                          "note": "real 不默认、可直接经 run_cmd 指定（2026-10-01 起不再人工审批）；fakenet 为后续里程碑"},
+            "pathguard_rules": pathguard_rules,
+            "rate_rules": [
+                {"tool": tool, "requirement": r["requirement"],
+                 "params": r["params"], "hint": r["hint"]}
+                for tool, r in rateguard.RATE_RULES.items()
+            ],
+            "exec_params": {"default_timeout": resolve_default_timeout(),
+                            "max_default_timeout": MAX_CMD_TIMEOUT,
+                            "sandbox_image": "python:3.11-alpine"
+                            "（占位，专用分析镜像后续经 tools/ 管理）"},
+        }
+
+    class GatewayExecParamsIn(BaseModel):
+        default_timeout: float | None = None
+
+    @app.put("/api/gateway/exec-params")
+    def gateway_exec_params_put(body: GatewayExecParamsIn):
+        """改 run_cmd 的缺省超时（设置页「网关 → 执行参数」；投诉 D 2026-10-26）。
+
+        写 config/runtime.json 的 ``cmd_timeout``，**落盘即热生效**——ExecutionGateway
+        每次 run 都重解析配置（`resolve_default_timeout` 带 mtime 缓存），无需重启平台。
+        安全策略仍不可前端编辑：这里只动「执行预算」，不动 THREAT_ALLOWED /
+        unknown→按恶意 / real 须审批这些审计边界（见本页底部红线注记）。
+        """
+        if body.default_timeout is None:
+            raise HTTPException(422, "无可更新字段")
+        val = float(body.default_timeout)
+        if not 0 < val <= MAX_CMD_TIMEOUT:
+            raise HTTPException(
+                422, f"缺省超时须在 (0, {MAX_CMD_TIMEOUT:.0f}] 秒之间")
+        write_runtime_config({"cmd_timeout": val})
+        return {"default_timeout": resolve_default_timeout(),
+                "max_default_timeout": MAX_CMD_TIMEOUT}
+
+    @app.post("/api/gateway/probe")
+    def gateway_probe():
+        """手动重跑宿主能力探测，替换 app.state.inventory 并返回新清单
+        （结构与 GET /api/projects/{pid}.capability 完全一致）。同步执行，
+        最坏 ~20s（docker+wsl 各 10s 超时），仅用户主动点击触发；刷新即生效
+        ——后续新开窗经 app.state.inventory 引用取到新清单。"""
+        app.state.inventory = HostDetector().probe(tools_root=app.state.tools_root)
+        return json.loads(app.state.inventory.to_json())
+
+    @app.get("/api/agent-tools")
+    def agent_tools():
+        """Agent 工具目录（设置页「工具」页签数据源，agent-tools-view 2026-09-24）：
+        直出 AGENT_TOOLS 静态全集 + 静态分组；无项目依赖、无 IO、无敏感字段。"""
+        from core.agent.tools import (
+            AGENT_TOOLS, TOOL_GROUPS, agent_tool_group)
+        return {
+            "groups": TOOL_GROUPS,
+            "tools": [
+                {"name": t["name"], "description": t["description"],
+                 "group": agent_tool_group(t["name"]),
+                 "input_schema": t.get(
+                     "input_schema", {"type": "object", "properties": {}})}
+                for t in AGENT_TOOLS
+            ],
+        }
+
+    @app.get("/api/models")
+    def list_models():
+        """模型清单（开窗下拉数据源）：路由默认 ∪ 实测可用清单（DESIGN.md §8）。
+        providers/default 供两级下拉（供应商→模型）。"""
+        try:
+            router = ModelRouter()
+            vals = {router.model_for(r) for r in KNOWN_ROLES}
+        except Exception:  # noqa: BLE001 —— 配置损坏时仍返回实测清单
+            vals = set()
+        vals.update(AVAILABLE_MODELS)
+        llm_store: ProviderStore = app.state.llm_store
+        providers = llm_store.masked()
+        for p in providers:
+            vals.update(p["models"])
+        try:
+            dname, dmodel = llm_store.default_target()
+            default = {"provider": dname, "model": dmodel}
+        except ProviderError:
+            default = None
+        return {"models": sorted(vals), "providers": providers, "default": default}
+
+    # ---------- LLM 供应商管理（§8） ----------
+
+    @app.get("/api/llm/providers")
+    def list_llm_providers():
+        llm_store: ProviderStore = app.state.llm_store
+        try:
+            dname, dmodel = llm_store.default_target()
+            default = {"provider": dname, "model": dmodel}
+        except ProviderError:
+            default = None
+        return {"providers": llm_store.masked(), "default": default,
+                "default_provider": llm_store.default_provider_name(),
+                "system_delivery_default": llm_store.delivery_default(),
+                "delivery_summary": _delivery_summary(llm_store)}
+
+    @app.put("/api/llm/providers")
+    def save_llm_providers(body: ProvidersIn):
+        llm_store: ProviderStore = app.state.llm_store
+        try:
+            llm_store.save([m.model_dump() for m in body.providers],
+                           default_provider=body.default_provider,
+                           system_delivery_default=body.system_delivery_default)
+        except ProviderError as e:
+            raise HTTPException(422, str(e))
+        # system 送达自检（system-delivery，2026-10-28）：新加的供应商默认 "auto"，
+        # 保存时替用户探一次「这个网关到底收不收 system/instructions」并落库判定。
+        # **放在保存之后**：探测失败绝不能让保存失败（用户改配置的权利优先）。
+        checks = _probe_delivery_after_save(llm_store)
+        out = list_llm_providers()
+        out["delivery_checks"] = checks
+        return out
+
+    def _delivery_summary(llm_store: ProviderStore) -> list[dict]:
+        """每个启用供应商「实际怎么发 system」的只读摘要（设置页角标用）。
+
+        只读落库判定、不发请求：判定过期（指纹变了）也会明确标 stale，
+        免得用户看见一个旧的"原生字段"以为万事大吉。
+        """
+        from core.llm import system_delivery as delivery
+        out: list[dict] = []
+        for p in llm_store.load():
+            if not p.get("enabled", True):
+                continue
+            fp = delivery.fingerprint(p)
+            verdict = str(p.get("system_delivery_verdict") or "").strip().lower()
+            out.append({
+                "name": p.get("name"),
+                "mode": str(p.get("system_delivery") or "auto"),
+                "resolved": llm_store.resolve_delivery(p),
+                "verdict": verdict or None,
+                "stale": bool(verdict) and p.get("system_delivery_verdict_for") != fp,
+                "checked_at": p.get("system_delivery_checked_at") or None,
+            })
+        return out
+
+    def _probe_delivery_after_save(llm_store: ProviderStore) -> list[dict]:
+        """对「auto 且无同指纹判定」的供应商跑送达探测 → 落库 → 返回明细。
+
+        预算：逐个串行、单个 8s、整批最多 3 家 / 24s。保存是人在等的动作，
+        宁可少探几家（其余等下次保存/诊断页），也不能把这一下拖成半分钟。
+        `app.state.delivery_probe=False`（测试默认）时整段短路，保证不触网。
+        """
+        if not getattr(app.state, "delivery_probe", True):
+            return []
+        from core.llm import system_delivery as delivery
+        checks: list[dict] = []
+        budget = time.monotonic() + 24.0
+        for p in llm_store.load():
+            if len(checks) >= 3 or time.monotonic() > budget:
+                break
+            try:
+                if not llm_store.needs_delivery_probe(p):
+                    continue
+                r = delivery.check_provider(llm_store, str(p.get("name") or ""),
+                                            timeout=8.0)
+            except Exception as e:  # noqa: BLE001 —— 自检是附加项，不阻断保存
+                log.exception("system_delivery 自检失败 name=%s", p.get("name"))
+                r = {"name": str(p.get("name") or ""), "verdict": "error",
+                     "detail": str(e)[:200], "elapsed_ms": 0}
+            checks.append(r)
+        return checks
+
+    @app.post("/api/llm/discover")
+    def discover_llm_models(body: DiscoverIn):
+        """获取供应商支持的模型：先试 /v1/models；不支持则候选清单探活（真实最小调用）。
+        已保存供应商给 name；未保存的新供应商给 base_url+api_key。"""
+        llm_store: ProviderStore = app.state.llm_store
+        try:
+            if body.name:
+                return llm_store.discover(body.name)
+            if body.base_url and body.api_key:
+                return llm_store.discover_credentials(body.base_url, body.api_key,
+                                                       format=body.format, proxy=body.proxy)
+            raise ProviderError("须提供已保存供应商 name，或 base_url+api_key")
+        except ProviderError as e:
+            raise HTTPException(422, str(e))
+        except Exception as e:  # noqa: BLE001 —— 探活网络错误等
+            raise HTTPException(502, f"模型发现失败: {e}") from e
+
+    @app.post("/api/llm/test-model")
+    def test_llm_model(body: TestModelIn):
+        """手填模型测活（200 + ok 布尔，错误内联返回，供 UI 就地提示）。"""
+        llm_store: ProviderStore = app.state.llm_store
+        try:
+            if body.name:
+                p = llm_store.get(body.name)
+                base_url = p["base_url"]
+                api_key = body.api_key or llm_store.resolve_key(p)
+            else:
+                if not body.base_url or not body.api_key:
+                    return {"ok": False, "error": "未保存供应商须填 base_url 与 api_key"}
+                base_url, api_key = body.base_url, body.api_key
+            if body.name:
+                format = p.get("format", "openai-chat-completions")
+            else:
+                format = body.format
+            proxy = p.get("proxy") if body.name else body.proxy
+            probe_credentials(base_url, api_key, body.model, format=format, proxy=proxy)
+        except ProviderError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        return {"ok": True}
+
+    @app.post("/api/agents/{sid}/llm")
+    def switch_agent_llm(sid: str, body: SwitchLlmIn):
+        """在跑会话动态切换供应商/模型：替换 provider 引用，下一次 LLM 调用即生效。
+        经 _ensure_agent（2026-09-19）：后端重启内存注册表空时按黑板行 rehydrate，
+        与其他会话控制端点同语义——修「重启后切模型 404 会话不存在」。"""
+        agent = _ensure_agent(_pid_of_session(sid), sid)
+        try:
+            new_llm = app.state.llm_store.build(body.provider, body.model)
+        except ProviderError as e:
+            raise HTTPException(422, str(e))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(503, f"供应商/模型不可用（{e}）") from e
+        agent.llm = new_llm
+        # 模型声明上下文随切换即时生效（与开窗同口径，loop.apply_context_budget）
+        from core.agent.loop import apply_context_budget
+        apply_context_budget(agent.config, new_llm)
+        agent.bb.append_event(
+            agent.project_id, "llm.switched",
+            {"session_id": sid, "provider": body.provider, "model": new_llm.model},
+            session_id=sid, author="human")
+        return {"status": "ok", "provider": body.provider, "model": new_llm.model}
+
+    # ---------- 项目级 executor 模型覆写（TRAE 新壳 M3，2026-09-25） ----------
+
+    def _default_executor_target() -> dict | None:
+        """路由缺省 executor（ModelRouter 覆写 ∪ ProviderStore 默认）。"""
+        try:
+            t = ModelRouter().target_for("executor")
+            if t is not None:
+                return {"provider": t[0], "model": t[1]}
+        except Exception:  # noqa: BLE001 —— 配置损坏时回落供应商默认
+            pass
+        try:
+            dname, dmodel = app.state.llm_store.default_target()
+            return {"provider": dname, "model": dmodel}
+        except ProviderError:
+            return None
+
+    def _executor_override_of(pid: str) -> dict | None:
+        cfg = _project(pid).bb.get_project(pid)["config"] or {}
+        ov = cfg.get("executor_llm")
+        if isinstance(ov, dict) and str(ov.get("provider") or "").strip():
+            return {"provider": str(ov["provider"]).strip(),
+                    "model": str(ov.get("model") or "").strip()}
+        return None
+
+    def _apply_executor_llm_live(pid: str, new_llm, *, provider: str,
+                                 model: str, scope: str) -> list[str]:
+        """把新 llm 装到本项目全部在内存的会话上（下次 LLM 调用即生效；
+        与全局 llm 跨会话共享同实例的既有口径一致），落一条 llm.switched 审计。"""
+        from core.agent.loop import apply_context_budget
+        touched: list[str] = []
+        for sid, agent in list(app.state.agents.items()):
+            if agent.project_id != pid:
+                continue
+            agent.llm = new_llm
+            apply_context_budget(agent.config, new_llm)
+            touched.append(sid)
+        if touched:
+            _project(pid).bb.append_event(
+                pid, "llm.switched",
+                {"session_ids": touched, "provider": provider, "model": model,
+                 "scope": scope}, author="human")
+        return touched
+
+    @app.get("/api/projects/{pid}/executor-llm")
+    def get_project_executor_llm(pid: str):
+        """executor 模型三态视图：default=路由缺省 / override=项目覆写 /
+        effective=当前实际（chip 默认值/覆盖/重置的数据源）。"""
+        default = _default_executor_target()
+        override = _executor_override_of(pid)
+        return {"default": default, "override": override,
+                "effective": override or default}
+
+    @app.put("/api/projects/{pid}/executor-llm")
+    def set_project_executor_llm(pid: str, body: SwitchLlmIn):
+        """项目 executor 覆写：先实测构建供应商/模型（坏值 422 不落盘），
+        经项目 config 单一写口持久化（project.json+黑板双写），并对在内存会话
+        即时换装。"""
+        proj = _project(pid)
+        try:
+            new_llm = app.state.llm_store.build(body.provider, body.model)
+        except ProviderError as e:
+            raise HTTPException(422, str(e)) from e
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(503, f"供应商/模型不可用（{e}）") from e
+        override = {"provider": body.provider, "model": new_llm.model}
+        store.update_config(pid, {"executor_llm": override}, project=proj)
+        touched = _apply_executor_llm_live(
+            pid, new_llm, provider=body.provider, model=new_llm.model,
+            scope="project-executor-override")
+        return {"status": "ok", "override": override, "effective": override,
+                "touched_sessions": touched}
+
+    @app.delete("/api/projects/{pid}/executor-llm")
+    def reset_project_executor_llm(pid: str):
+        """重置：剥 config.executor_llm（恢复跟随路由缺省），在内存会话换装回
+        缺省 executor。"""
+        proj = _project(pid)
+        store.update_config(pid, {"executor_llm": None}, project=proj)
+        default = _default_executor_target()
+        new_llm = None
+        if default is not None:
+            try:
+                new_llm = app.state.llm_store.build(
+                    default["provider"], default["model"] or None)
+            except Exception:  # noqa: BLE001 —— 缺省构建失败保留各窗现状
+                new_llm = None
+        touched: list[str] = []
+        if new_llm is not None and default is not None:
+            touched = _apply_executor_llm_live(
+                pid, new_llm, provider=default["provider"],
+                model=default["model"], scope="project-executor-reset")
+        return {"status": "ok", "default": default, "override": None,
+                "effective": default, "touched_sessions": touched}
+
+    @app.post("/api/projects/{pid}/agents", status_code=201)
+    def spawn_agent(pid: str, body: AgentIn):
+        proj = _project(pid)
+        # sessions_cap 是资源硬上限（§6.8）：人手开窗与编排开窗同效，超限 409
+        row = proj.bb.get_project(pid)
+        auto = autonomy.autonomy_of(row["config"], track=proj.track)
+        active = autonomy.count_active_sessions(proj.bb, pid)
+        if active >= auto["sessions_cap"]:
+            raise HTTPException(
+                409, f"活跃会话已达项目上限 sessions_cap={auto['sessions_cap']}"
+                     f"（当前 {active} 个非 closed 会话）；请先关窗或在直播间调高上限")
+        exec_llm, plan_llm = _llms()
+        if body.provider or body.model:
+            try:
+                # 仅给 model → 默认供应商；仅给 provider → 其默认模型
+                exec_llm = app.state.llm_store.build(body.provider, body.model)
+            except ProviderError as e:
+                raise HTTPException(422, str(e)) from e
+            except Exception as e:  # noqa: BLE001 —— key 缺失等
+                raise HTTPException(503, f"供应商/模型不可用（{e}）") from e
+        factory = _registered_session_factory(pid, exec_llm, plan_llm)
+        try:
+            agent = factory(body.role, session_name=body.session_name,
+                            max_steps=body.max_steps)
+        except FileNotFoundError as e:
+            raise HTTPException(422, str(e))
+        # 触发点 C（批 5；F9 改 armed 闸）：L1/L2 未暂停且显式 armed 时开窗即自动起
+        # 一个 worker（空队列零成本退）；人手开窗默认不接任务，点「跑任务队列」启动；
+        # L0 不自起；paused 时只开窗不消费。
+        extra: dict[str, Any] = {}
+        proj.bb.set_session_meta(agent.session["id"], {"worker_armed": body.armed})
+        # 会话中心化：人开窗与编排开窗同审计（此前 POST /agents 无 session.spawned，
+        # 事件流查不到人开的窗）；先于 worker 起跑事件。
+        proj.bb.append_event(
+            pid, "session.spawned",
+            {"role": agent.session["role"], "session_id": agent.session["id"],
+             "origin": "human"},
+            session_id=agent.session["id"], author="human")
+        if body.armed and auto["level"] in {"L1", "L2"} and not auto["paused"]:
+            extra["job_id"] = _submit_worker(
+                pid, agent, auto=True, origin="human-spawn")  # 触发点 C
+        # 预算对人手动作仅警告不拦截（硬闸只拦编排自主动作，§6.8）
+        warning = autonomy.human_warning(proj.bb, pid)
+        if warning:
+            extra["warning"] = warning
+        return {**agent.session, **extra, "worker_armed": body.armed}
+
+    @app.get("/api/agents")
+    def list_agents():
+        return [a.session for a in app.state.agents.values()]
+
+    @app.post("/api/agents/{sid}/work")
+    def run_agent_work(sid: str, task_id: str | None = None):
+        # F9 启动口：显式点亮武装（清排水标记）+ 起一个 worker；已在跑则去重不重复起。
+        # 任务机制退役（2026-10-06）：不再接受/绑定任务，task_id 参数保留兼容但忽略。
+        pid = _pid_of_session(sid)
+        bb = _project(pid).bb
+        if _session_job_running(sid):
+            return {"session_id": sid, "already_running": True}
+        # 重启后/历史孤儿窗：内存未命中时按黑板 sessions 行 rehydrate 再开跑。
+        agent = _ensure_agent(pid, sid)
+        bb.set_session_meta(sid, {"worker_armed": True, "close_pending": None})
+        job_id = _submit_worker(pid, agent, origin="human-work")
+        return {"job_id": job_id, "session_id": sid}
+
+    def _worker_loop(agent: AgentSession, *, manual: bool = False,
+                     tail: dict | None = None) -> Callable[[], int]:
+        pid = agent.project_id
+        tail = tail if tail is not None else {}
+
+        def _paused() -> bool:
+            # autonomy.paused 实时重读：在跑 worker 做完当前任务后不再认领新任务
+            try:
+                return bool(autonomy.autonomy_of(
+                    agent.bb.get_project(pid)["config"], track=agent.track)["paused"])
+            except Exception:  # noqa: BLE001 —— 读配置失败不该杀死 worker，照常认领
+                return False
+
+        def run() -> int:
+            done = 0
+            stopped_by_pause = False
+            while True:
+                # F9 优雅关窗：排水标记命中（close_pending）→ 不再接活，自关后退出。
+                # 检查点在委托收尾之后、下一轮会话轮之前——当前委托完整跑完。
+                try:
+                    meta_raw = (agent.bb.get_session(agent.session["id"])
+                                or {}).get("meta")
+                    meta = json.loads(meta_raw) if isinstance(meta_raw, str) else (meta_raw or {})
+                    if meta.get("close_pending"):
+                        _do_close_session(agent.session["id"])
+                        break
+                except Exception:  # noqa: BLE001 —— 读 meta 失败不该杀死 worker
+                    pass
+                # paused 只约束自动消费（C/kick/批准即跑）；人显式「跑队列」/恢复
+                # 是人工 override，暂停下照常接活（DESIGN §6.8 行为表：人手动作照常）
+                if not manual and _paused():
+                    stopped_by_pause = True
+                    break
+                try:
+                    # 会话轮（2026-09-25 会话中心化）：有委托干活 / 无委托对话，
+                    # 工具面一致；委托做完 while 再入自动接窗内下一件；都没有
+                    # 返回 None 空退、窗回待命。
+                    turned = agent.run_session()
+                    if turned is None:
+                        break
+                except Exception as exc:  # noqa: BLE001 —— 委托级兜底在 _fail_task_on_error
+                    # （起跑/收尾阶段的意外异常也不得静默杀死 worker 线程：
+                    #   委托悬 claimed + 孤儿心跳续租，看板永远「执行中」）
+                    # 2026-09-26：真实异常文案+会话归属进 llm.error——429 配额
+                    # 耗尽杀死的对话轮此前只留笼统文案且无 session_id，用户侧
+                    # 表现为「已发送→正在回复→石沉大海」。
+                    log.exception("worker 循环异常退出 pid=%s sid=%s", pid, agent.session["id"])
+                    _emit_llm_error(pid, "worker", exc, session_id=agent.session["id"])
+                    break
+                done += 1
+            # 批 5（§6.8）：自动 worker 遇暂停退出 → 停链；队列空退出
+            # （last_claim_idle）→ 触发点 A 尝试续 L2 链（闸门②会拦住 paused 链）。
+            if stopped_by_pause:
+                _stop_chain(pid, "paused")
+            elif agent.last_claim_idle:
+                _maybe_mission_auto_tick(pid, reason=f"worker-idle:{agent.session['id']}")
+                _maybe_auto_tick(pid, reason=f"worker-idle:{agent.session['id']}")
+            return done
+        return run
+
+    def _maybe_auto_resume(pid: str, agent: AgentSession) -> None:
+        """C4：L2 档步数耗尽（budget_paused）自动续跑——不等人工，缺省 +200 步。
+        闸（每次实时重读）：档位 ==L2、全局未暂停、token 预算未硬阻断（token 即
+        总闸，不另设次数上限）；任一不满足保持 paused 等人工「▶ 继续」。
+        awaiting_human 挂起不受此路径影响（C1 宁严勿松：不自动处置）。"""
+        try:
+            st = agent._resume_state
+            if not (agent.paused and st and st.get("reason") == "budget"):
+                return
+            cfg = _auto_cfg(pid)
+            if cfg["level"] != "L2" or cfg["paused"]:
+                return
+            tok = autonomy.usage_view(agent.bb, pid).get("tokens", {})
+            if tok.get("pct") is not None and tok["pct"] >= 100:
+                return  # token 预算硬闸：保持暂停等人工
+            sid = agent.session["id"]
+            agent.paused = False
+            agent._pause_req.clear()
+            agent._abort_req.clear()
+            old = agent.dispatcher.max_steps
+            agent.dispatcher.max_steps = old + 200
+            agent.bb.append_event(
+                pid, "step.budget_extended",
+                {"session_id": sid, "task_id": st.get("task_id"),
+                 "old_max": old, "new_max": old + 200, "by": "l2-auto"},
+                session_id=sid, author="l2-auto")
+            agent.bb.append_event(
+                pid, "session.resumed", {"session_id": sid, "by": "l2-auto"},
+                session_id=sid, author="l2-auto")
+            agent.bb.set_session_status(sid, "running")
+            agent.bb.set_session_meta(sid, {"worker_armed": True})  # F9：自动续跑=已启动
+            _submit_worker(pid, agent, auto=True, origin="l2-auto-resume")
+        except Exception:  # noqa: BLE001 —— 自动续跑失败保持暂停，等人工
+            log.exception("C4 L2 自动续跑失败 pid=%s", pid)
+
+    def _team_worker_loop(pid: str, agent: AgentSession, context: ExecutionContext,
+                           run_member_id: str, team_id: str, run_id: str) -> Callable[[], Any]:
+        def run() -> Any:
+            ts = TeamStore(agent.bb, packs_root=app.state.packs_root)
+            try:
+                result = agent.run_team_execution(context)
+                ts.mark_member(run_member_id, "completed", outcome=str(result or "完成"))
+                return result
+            except Exception as exc:  # noqa: BLE001
+                ts.mark_member(run_member_id, "failed", error=str(exc), outcome="Team execution 异常")
+                raise
+            finally:
+                ts.reconcile_run(pid, team_id, run_id)
+        return run
+
+    def _submit_worker(pid: str, agent: AgentSession, **extra_meta) -> str:
+        """agent-work job 的唯一提交口（批 5）。
+
+        开窗只创建 idle 会话；真正提交 worker 时才切换为 running，worker
+        完成且没有 successor worker 时再归回 idle。armed 只是自动接活开关，
+        不参与 active_sessions 计数。"""
+        sid = agent.session["id"]
+        if extra_meta.get("task_id"):
+            agent.dispatcher.current_task_id = str(extra_meta["task_id"])
+        manual = not bool(extra_meta.get("auto"))
+        tail: dict = {}
+        bb = _project(pid).bb
+        row = bb.get_session(sid)
+        if row is not None and row.get("status") not in {"closed", "paused"}:
+            try:
+                bb.set_session_status(sid, "running")
+            except ValueError:
+                pass
+
+        def on_done(_job: dict | None) -> None:
+            # 先执行续跑/自动链回调：这些回调可能立即提交 successor worker，
+            # 因此必须在回调之后判断，不能把新 worker 的 running 状态覆盖成 idle。
+            _maybe_auto_resume(pid, agent)  # C4：L2 下 budget_paused 自动续跑
+            _maybe_mission_auto_tick(pid, reason=f"worker-done:{sid}")  # C2 L1 自动派生
+            _maybe_auto_tick(pid, reason=f"worker-done:{sid}")
+            if _session_job_running(sid):
+                return
+            current = bb.get_session(sid)
+            if current and current.get("status") not in {"closed", "paused"}:
+                try:
+                    bb.set_session_status(sid, "idle")
+                except ValueError:
+                    pass
+
+        team_context = extra_meta.get("team_context")
+        if team_context is not None:
+            run_member_id = str(extra_meta["run_member_id"])
+            team_id = str(extra_meta["team_id"])
+            run_id = str(extra_meta["run_id"])
+            return app.state.jobs.submit(
+                "agent-work", _team_worker_loop(pid, agent, team_context, run_member_id, team_id, run_id),
+                meta={"project_id": pid, "session_id": sid, **extra_meta})
+        return app.state.jobs.submit(
+            "agent-work", _worker_loop(agent, manual=manual, tail=tail),
+            meta={"project_id": pid, "session_id": sid, **extra_meta},
+            on_done=on_done)
+
+    # ---------- L2 全自动链（批 5，DESIGN §6.8：事件驱动，无调度器/无轮询） ----------
+
+    def _auto_cfg(pid: str) -> dict:
+        proj = _project(pid)
+        return autonomy.autonomy_of(proj.bb.get_project(pid)["config"], track=proj.track)
+
+    def _worker_jobs_running(pid: str) -> list[dict]:
+        return [j for j in app.state.jobs.all_jobs()
+                if j["status"] == "running" and j["kind"] == "agent-work"
+                and j["meta"].get("project_id") == pid]
+
+    def _orch_jobs_running(pid: str) -> bool:
+        """tick（手动/自动）/ 重排 / 节流 wait job 统一软去重（A5 含 replan 两类）。"""
+        return any(j["status"] == "running"
+                   and j["meta"].get("project_id") == pid
+                   and j["kind"] in {"orchestrator-tick", "orchestrator-auto-tick",
+                                     "orchestrator-auto-wait",
+                                     }
+                   for j in app.state.jobs.all_jobs())
+
+    def _start_chain(pid: str) -> bool:
+        """L2 链启动（幂等）：chain_active=1/ticks=0 + 本进程标记 + chain_started。
+        DB 活但本进程无标记 = 重启急停后的手动恢复：chain_ticks 清零重算预算，
+        以 manual_recovery 重新发 chain_started（否则旧 ticks 可能立即撞顶）。"""
+        bb = _project(pid).bb
+        st = orch_state.load_or_create(bb, pid)
+        if pid in app.state.active_chains and st["chain_active"]:
+            return False  # 真幂等：本进程链已活
+        reason = ("manual_recovery"
+                  if st["chain_active"] and pid not in app.state.active_chains
+                  else "manual_tick")
+        app.state.active_chains.add(pid)
+        orch_state.save_fields(bb, pid, chain_active=1, chain_ticks=0,
+                               last_auto_tick_at="")
+        bb.append_event(pid, "orch.chain_started",
+                        {"reason": reason}, author="orchestrator")
+        return True
+
+    def _stop_chain(pid: str, reason: str, **extra) -> bool:
+        """链停止（幂等）：清 chain_active/进程标记 + orch.chain_stopped{reason,...}。"""
+        try:
+            bb = _project(pid).bb
+        except HTTPException:
+            return False
+        st = orch_state.load_or_create(bb, pid)
+        if not st["chain_active"] and pid not in app.state.active_chains:
+            return False
+        # 顺序关键：先落 DB 不活、后摘进程标记。若反过来，两步之间别的线程做重启
+        # 判定会看到「标记缺 + DB 仍活」误落 restart（本顺序的中间态是「标记在 +
+        # DB 不活」，闸门安全 return，不会误判）。
+        orch_state.save_fields(bb, pid, chain_active=0)
+        app.state.active_chains.discard(pid)
+        bb.append_event(pid, "orch.chain_stopped",
+                        {"reason": reason, "chain_ticks": int(st["chain_ticks"]), **extra},
+                        author="orchestrator")  # 链停止=编排器事件（前端 __orch 页签按 author 收录）
+        return True
+
+    def _kick_workers(pid: str) -> list[str]:
+        """给每个没有在跑 worker 的非关闭/非暂停武装会话提交一个 agent-work job。
+        无委托无消息的会话轮零成本空退。返回新提交的 sid 列表。
+        F9 armed 闸：未启动（meta.worker_armed 非 true）的窗不自动接活——所有
+        自动唤醒（D/E/B/tick）统一在此被拦。
+        会话中心化（2026-09-25）：不再有「无绑定/绑定终态跳过」——武装 idle 窗
+        都可能有窗内排队委托或待回应消息，一律踢；终态「续聊窗」=普通待命窗。"""
+        proj = _project(pid)
+        submitted: list[str] = []
+        for row in proj.bb.list_sessions(pid):
+            sid = row["id"]
+            if row.get("status") in {"closed", "paused"} or _session_job_running(sid):
+                continue
+            meta = row.get("meta")
+            meta = json.loads(meta) if isinstance(meta, str) else (meta or {})
+            if not meta.get("worker_armed"):
+                continue  # F9：未启动，不自动接活
+            try:
+                agent = _ensure_agent(pid, sid)  # 重启后 rehydrate；陈旧 running→idle
+            except HTTPException:
+                continue
+            if agent.paused:
+                continue
+            _submit_worker(pid, agent, auto=True, origin="kick")
+            submitted.append(sid)
+        return submitted
+
+    def _auto_tick_age(st: dict) -> float | None:
+        """距上一个自动 tick 的秒数；从未自动 tick 返回 None（不节流）。"""
+        raw = st.get("last_auto_tick_at") or ""
+        if not raw:
+            return None
+        try:
+            return (datetime.now(timezone.utc) - datetime.fromisoformat(raw)).total_seconds()
+        except ValueError:
+            return None
+
+    def _emit_llm_error(pid: str, source: str, err: Any,
+                        session_id: str | None = None) -> None:
+        """LLM 调用失败落 llm.error 事件（2026-09-18：此前只有 job error+后端 log，
+        额度/限流对用户完全不可见）。同 pid+错误文案 60s 节流防重试风暴刷屏；
+        文案命中配额特征加 kind_hint=quota（前端据此提示）。
+        session_id（2026-09-26）：带上归属会话——新壳会话流按 session_id 圈定，
+        不带则对话轮的死亡对用户仍不可见（只能翻事件流）。"""
+        msg = str(err)[:300]
+        key = f"{pid}:{msg}"
+        now_t = time.monotonic()
+        if now_t - app.state.llm_error_seen.get(key, 0.0) < 60.0:
+            return
+        app.state.llm_error_seen[key] = now_t
+        hint = "quota" if re.search(
+            r"429|quota|insufficient|余额|配额|rate.?limit", msg, re.I) else ""
+        try:
+            _project(pid).bb.append_event(
+                pid, "llm.error",
+                {"source": source, "error": msg,
+                 **({"kind_hint": hint} if hint else {})},
+                session_id=session_id, author="system")
+        except Exception:  # noqa: BLE001 —— 事件落库失败不掩盖原始错误
+            log.exception("llm.error 事件落库失败 pid=%s", pid)
+
+    def _maybe_mission_auto_tick(pid: str, reason: str, *,
+                                 require_idle: bool = False) -> None:
+        """C2 mission 自动派生（§6.9）：L1 档专属补位——auto_derive 开启 + 判据存在
+        （goal>mission>模板>内置，永远有判据）+ worker 空退 → 自动编排一轮派生下一批
+        任务（开窗仍走 L1 审批）。
+        L2 不走此路径（既有自动链已覆盖）。闸全部实时重读；防空转：上轮派生
+        tick 零发布且此后无新事件 → 跳过，直到黑板有变化。
+        require_idle=True（轮询触发专用）：额外要求任务队列无 open/claimed 行——
+        claimed 说明 worker 在跑，其收尾会自然触发，轮询不得抢跑。"""
+        try:
+            proj = _project(pid)
+        except HTTPException:
+            return
+        try:
+            bb = proj.bb
+            if require_idle:
+                # 任务机制退役（2026-10-06）：改看会话 worker——有在跑 worker 说明
+                # 系统正忙，其收尾会自然触发，轮询不得抢跑。
+                if autonomy.count_active_sessions(bb, pid) > 0:
+                    return
+            cfg = autonomy.autonomy_of(bb.get_project(pid)["config"], track=proj.track)
+            # 闸①开关显式开启
+            if not cfg.get("auto_derive"):
+                return
+            # 闸②档位：仅 L1 补位（L2 由既有自动链覆盖；L0 全手动）
+            if cfg["level"] != "L1" or cfg["paused"]:
+                return
+            # 闸③判据存在（四层解析：goal > mission 存量 > 所选模板 > 轨内置默认）
+            resolved = judgments.resolve_criteria(
+                bb.get_project(pid)["config"], app.state.judgments_dir,
+                track=proj.track, goal=(proj.meta or {}).get("phase_goal"))
+            # 闸④token 预算硬阻
+            tok = autonomy.usage_view(bb, pid).get("tokens", {})
+            if tok.get("pct") is not None and tok["pct"] >= 100:
+                return
+            # 闸⑤防空转：上轮派生零发布且黑板无新事件 → 跳过（有新事件即重置）
+            st = app.state.mission_derive.setdefault(pid, {"tip": 0, "empty": False})
+            tip = bb.latest_event_id(pid)
+            if st["empty"] and tip <= st["tip"]:
+                return
+            st["tip"] = tip
+            st["empty"] = True  # tick 发布了任务则由其 on_done 复位
+            owner = f"mission-derive-{uuid.uuid4().hex}"
+            try:
+                orch_state.acquire_tick_lease(bb, pid, owner)
+            except orch_state.TickLeaseError:
+                return
+            try:
+                orch = _build_orchestrator(pid, TickIn(), owner)
+            except HTTPException:
+                orch_state.release_tick_lease(bb, pid, owner)
+                return
+            bb.append_event(
+                pid, "mission.derive",
+                {"reason": reason, "criteria_source": resolved["source"]},
+                author="orchestrator")
+
+            def _run_mission_tick() -> dict:
+                try:
+                    result = orch.tick()
+                    _post_tick(pid, result, manual=False)
+                    return result
+                except Exception as exc:
+                    _emit_llm_error(pid, "orchestrator", exc)
+                    raise
+                finally:
+                    orch_state.release_tick_lease(bb, pid, owner)
+
+            def _mission_on_done(job: dict) -> None:
+                """派生 tick 收尾：结果落 orchestrator_state（last_derive_*，状态灯
+                消费）+ mission.derive.result 事件（事件流可见）。error → st.empty
+                复位允许下次触发重试（轮询 60s 兜底）；零发布 → 置空转标记（配合
+                闸⑤防 LLM 空转循环）。"""
+                try:
+                    if job.get("status") == "error":
+                        err = str(job.get("error") or "unknown")[:200]
+                        orch_state.save_fields(
+                            bb, pid, last_derive_at=datetime.now(timezone.utc).isoformat(),
+                            last_derive_result=f"error:{err}")
+                        bb.append_event(pid, "mission.derive.result",
+                                        {"error": err}, author="orchestrator")
+                        st["empty"] = False
+                        return
+                    result = job.get("result") or {}
+                    teams = result.get("teams") or []
+                    produced = teams or result.get("published") or []
+                    orch_state.save_fields(
+                        bb, pid, last_derive_at=datetime.now(timezone.utc).isoformat(),
+                        last_derive_result=f"teams:{len(teams)}")
+                    bb.append_event(pid, "mission.derive.result",
+                                    {"teams": len(teams),
+                                     "spawned": len(result.get("spawned") or [])},
+                                    author="orchestrator")
+                    if not produced:
+                        st["empty"] = True
+                        st["tip"] = bb.latest_event_id(pid)
+                    else:
+                        st["empty"] = False
+                except Exception:  # noqa: BLE001 —— on_done 不能炸
+                    log.exception("mission 派生收尾失败 pid=%s", pid)
+
+            app.state.jobs.submit("orchestrator-tick", _run_mission_tick,
+                                  meta={"project_id": pid},
+                                  on_done=lambda _j: (_mission_on_done(_j),
+                                                      _maybe_auto_tick(pid, reason=f"mission-done:{pid}"),
+                                                      None)[-1])
+        except Exception:  # noqa: BLE001 —— 后台线程不能炸
+            log.exception("mission 自动派生失败 pid=%s", pid)
+
+    def _mission_poll_sweep() -> None:
+        """mission 自动派生兜底轮询（2026-09-18）：判跳原本纯事件驱动
+        （worker-idle/worker-done 两个触发点），编排停摆（worker 全部收尾）后
+        「任务空自动派生」永不判跳——这里每 mission_poll_interval 秒扫一次全项目，
+        队列空 + auto_derive + L1 未暂停 → 补一次判跳（require_idle=True）。
+        预算/防空转/租约闸全部在 _maybe_mission_auto_tick 内复用；异常全吞。"""
+        try:
+            for meta in store.list_projects():
+                pid = meta["id"]
+                try:
+                    if pid in app.state.projects_closing:
+                        continue
+                    proj = _project(pid)
+                    # chat 僵尸轮兜底对账（2026-10-11）：即便前端从不刷新工作台，
+                    # 后台也保证「轮次线程已死但 status=running」的线程被归位 idle，
+                    # 杜绝永久「执行中」。异常吞掉（单项目失败不拖垮 sweep）。
+                    try:
+                        _chat_running_reconcile(proj)
+                    except Exception:  # noqa: BLE001
+                        log.exception("chat 僵尸轮兜底对账失败 pid=%s", pid)
+                    cfg = autonomy.autonomy_of(
+                        proj.bb.get_project(pid)["config"], track=proj.track)
+                    if (not cfg.get("auto_derive") or cfg["level"] != "L1"
+                            or cfg["paused"]):
+                        continue
+                    _maybe_mission_auto_tick(pid, reason="poll-idle",
+                                             require_idle=True)
+                except HTTPException:
+                    continue  # 删除闸门 409 / LLM 未就绪 503 等直接跳过
+                except Exception:  # noqa: BLE001 —— 单项目失败不拖垮 sweep
+                    log.exception("mission 轮询判跳失败 pid=%s", pid)
+        except Exception:  # noqa: BLE001 —— 后台线程不能炸
+            log.exception("mission 轮询 sweep 失败")
+
+    app.state.mission_poll_sweep = _mission_poll_sweep  # 测试直调口
+    if mission_poll_interval > 0:
+        def _poll_loop() -> None:
+            while True:
+                time.sleep(mission_poll_interval)
+                _mission_poll_sweep()
+        threading.Thread(target=_poll_loop, name="mission-poll",
+                         daemon=True).start()
+
+    def _maybe_auto_tick(pid: str, reason: str) -> None:
+        """自动续 tick 的唯一入口（触发点 A）：只判闸门 + submit job，不直接跑 LLM。
+        防失控七闸顺序见 DESIGN §6.8；任何异常吞掉记 log（后台线程不能炸）。"""
+        try:
+            proj = _project(pid)
+        except HTTPException:
+            return
+        try:
+            bb = proj.bb
+            cfg = autonomy.autonomy_of(bb.get_project(pid)["config"], track=proj.track)
+            # 闸①档位重读：降级直接停链
+            if cfg["level"] != "L2":
+                if orch_state.load_or_create(bb, pid)["chain_active"]:
+                    _stop_chain(pid, "level_changed")
+                return
+            # 闸②暂停
+            if cfg["paused"]:
+                _stop_chain(pid, "paused")
+                return
+            st = orch_state.load_or_create(bb, pid)
+            # 重启=急停：DB 活但本进程无标记 → 落一次 restart 停链，绝不自动续
+            if pid not in app.state.active_chains:
+                if st["chain_active"]:
+                    _stop_chain(pid, "restart")
+                return
+            if not st["chain_active"]:
+                return
+            # 闸⑦预算硬闸：两类自主动作都被拦才停（LLM 还能改道时照常续）
+            if (autonomy.hard_block_reason(bb, pid, "publish_task")
+                    and autonomy.hard_block_reason(bb, pid, "spawn_session")):
+                _stop_chain(pid, "budget_blocked")
+                return
+            # 还有 worker 在跑：最后一个退出的 worker 才续，防过早 tick 误判收敛
+            if _worker_jobs_running(pid):
+                return
+            # 闸⑤软去重：tick / wait job 在跑（硬去重 = 下面 job 内抢 tick 租约）
+            if _orch_jobs_running(pid):
+                return
+            # 闸③链预算
+            if int(st["chain_ticks"]) >= int(cfg["max_chain_ticks"]):
+                _stop_chain(pid, "max_chain_ticks")
+                return
+            # 闸⑥节流：踩间隔内 → wait job 睡满重入（不丢触发，防链搁浅）
+            age = _auto_tick_age(st)
+            if age is not None and age < AUTO_TICK_MIN_INTERVAL:
+                delay = AUTO_TICK_MIN_INTERVAL - age
+                # 重入必须挂 on_done（runner 内重入会因 wait job 自身仍 running
+                # 被 _orch_jobs_running 挡住而搁浅）；睡满时 age 必达标，直接续 tick
+                app.state.jobs.submit(
+                    "orchestrator-auto-wait",
+                    _auto_wait_runner(delay),
+                    meta={"project_id": pid, "delay": round(delay, 2)},
+                    on_done=lambda _j, _r=reason:
+                        _maybe_auto_tick(pid, reason=f"{_r}:throttled"))
+                return
+            app.state.jobs.submit(
+                "orchestrator-auto-tick", _auto_tick_runner(pid, reason),
+                meta={"project_id": pid, "reason": reason},
+                on_done=lambda _j: _maybe_auto_tick(pid, reason="auto-tick-done"))
+        except Exception:  # noqa: BLE001
+            log.exception("_maybe_auto_tick 判定异常 pid=%s reason=%s", pid, reason)
+
+    def _auto_wait_runner(delay: float) -> Callable[[], dict]:
+        def run() -> dict:
+            time.sleep(max(0.0, delay))
+            return {"waited": round(delay, 2)}
+        return run
+
+    def _build_orchestrator(pid: str, body: TickIn, owner: str,
+                            analyze_only: bool = False) -> Orchestrator:
+        """手动 tick 与自动 tick 共用同一套 Orchestrator 装配（鸭子回调注入）。"""
+        proj = _project(pid)
+        exec_llm, plan_llm = _llms()
+        factory = _registered_session_factory(pid, exec_llm, plan_llm)
+        # 批 6：L0=提案模式（publish/spawn 校验照跑但不写实体，只发 orch.proposed）
+        lvl = autonomy.autonomy_of(proj.bb.get_project(pid)["config"],
+                                   track=proj.track)["level"]
+        orch = Orchestrator(project_id=pid, bb=proj.bb, llm=plan_llm,
+                            session_factory=factory,
+                            config=OrchestratorConfig(
+                                max_steps=body.max_steps,
+                                allowed_roles=body.allowed_roles,
+                                max_sessions=body.max_sessions,
+                                digest_every=body.digest_every,
+                                propose_only=(lvl == "L0"),
+                                analyze_only=analyze_only),
+                            packs_root=app.state.packs_root, track=proj.track,
+                            campaign=app.state.campaign)
+        # 复用进程内已开窗口（跨 tick 保活）
+        orch.live_sessions = {sid: a for sid, a in app.state.agents.items()
+                              if a.project_id == pid}
+
+        def _gate(action: str) -> str | None:
+            return autonomy.hard_block_reason(_project(pid).bb, pid, action)
+
+        orch.gate = _gate
+        orch.autonomy_provider = lambda: autonomy.autonomy_of(
+            _project(pid).bb.get_project(pid)["config"], track=_project(pid).track)
+        orch.state_loader = lambda: orch_state.load_or_create(proj.bb, pid)
+        orch.state_saver = lambda **fields: orch_state.save_fields(proj.bb, pid, **fields)
+        orch.heartbeat = lambda: orch_state.renew_tick_lease(proj.bb, pid, owner)
+        # 对话化编排器（M1/M2）：goal_section/persona 段实时读 project.json meta
+        orch.meta_loader = lambda: _project(pid).meta or {}
+        return orch
+
+    # ---------- 分阶段工作流：过门分流（M2，§6.8 自主档） ----------
+
+    def _phase_gate_check(pid: str) -> None:
+        """阶段门已达 → 过门动作按自主档分流（每次 tick 出口调用）。
+        L0=事件提示（人工点「进入渗透测试」）；L1=审批单（批准即流转）；
+        L2=自动流转。同目标已分流过（gate_open_notified）不重复。
+        B3 单一事实源：无论过门与否都把评估结论写 project meta
+        phase_gate_state——注入侧 _phase_section 只读该状态不重算，消除
+        「注入用上轮 idle、判定在轮末」的矛盾窗口；动作侧 gate_block_reason
+        保持 publish 时现算确定性。内容不变跳过写盘（save_gate_state 内判）。"""
+        proj = _project(pid)
+        book = _phase_book_of(proj)
+        if not book:
+            return
+        cur = phases_mod.current_spec(book, proj.meta or {})
+        if cur is None:
+            return
+        cur_id, spec = cur
+        gate = spec.get("gate") or {}
+        if not gate:
+            phases_mod.save_gate_state(
+                proj, {"phase": cur_id, "gate": False, "passed": False, "unmet": []})
+            return
+        idle = int(orch_state.load_or_create(proj.bb, pid)["derive_idle_rounds"])
+        metrics = phases_mod.gate_metrics(proj.bb, pid, idle_rounds=idle)
+        met, unmet = phases_mod.evaluate_gate(gate, metrics)
+        phases_mod.save_gate_state(
+            proj, {"phase": cur_id, "gate": True, "passed": met, "unmet": unmet})
+        fwd = phases_mod.forward_targets(book, spec)
+        if not fwd:
+            return
+        target = fwd[0]
+        if phases_mod.read_state(proj.meta or {})["notified"] == target:
+            return  # 已分流过（等人工/等审批），抵达目标阶段时重置
+        if not met:
+            return
+        cfg = _auto_cfg(pid)
+        summary = (f"阶段流转：{spec['name']} → {book[target]['name']}"
+                   f"（资产 {metrics['assets']}、"
+                   f"verified {metrics['verified']}、空闲 {metrics['idle_rounds']} 轮）")
+        if cfg["level"] == "L2":
+            phases_mod.enter_phase(proj, target, by="orchestrator", auto=True,
+                                   packs_root=app.state.packs_root,
+                                   reason="门指标达成自动流转", idle_rounds=idle)
+            return
+        if cfg["level"] == "L1":
+            pending = proj.bb.conn.execute(
+                "SELECT action FROM approvals WHERE project_id=? AND status='pending'",
+                (pid,)).fetchall()
+            for row in pending:
+                try:
+                    a = json.loads(row["action"])
+                except ValueError:
+                    continue
+                if isinstance(a, dict) and a.get("op") == "phase_transition" \
+                        and a.get("to") == target:
+                    return  # 同目标审批单在途，不重复提
+            proj.bb.request_approval(
+                pid, {"op": "phase_transition", "from": cur_id, "to": target,
+                      "summary": summary, "metrics": metrics},
+                risk="low", requested_by="orchestrator")
+        else:
+            proj.bb.append_event(pid, "phase.gate_open",
+                                 {"from": cur_id, "to": target, "summary": summary,
+                                  "metrics": metrics}, author="orchestrator")
+        phases_mod.set_gate_notified(proj, target)
+
+    def _phase_post_tick(pid: str, result: dict) -> None:
+        """tick 出口的阶段维护：空闲轮计数（零发布 +1 / 有发布复位）+ 过门分流。
+        先于挡位闸——L0 项目也要事件提示。"""
+        proj = _project(pid)
+        produced = bool(result.get("published") or result.get("teams")
+                        or result.get("spawned"))
+        idle = int(orch_state.load_or_create(proj.bb, pid)["derive_idle_rounds"])
+        orch_state.save_fields(
+            proj.bb, pid, derive_idle_rounds=0 if produced else idle + 1)
+        _phase_gate_check(pid)
+
+    app.state.phase_gate_check = _phase_gate_check  # 测试直调口
+    app.state.phase_post_tick = _phase_post_tick    # 测试直调口
+
+    # ---------- 异常订阅唤醒（对话化编排器 M4，§4.6） ----------
+
+    app.state.orch_wake_pending: set[str] = set()  # 已提交唤醒待完成的项目（防重复）
+
+    def _maybe_orch_wake(pid: str) -> str:
+        """白名单事件扫描 → 提交自起对话轮（Job orchestrator-wake）。
+        返回 submitted/duplicate/empty；租约占用/构造失败在 runner 内静默放弃
+        （宁少勿扰），唤醒轮完成才摘 pending（期间重复触发不再提交）。"""
+        proj = _project(pid)
+        triggers = Orchestrator.collect_wake_triggers(proj.bb, pid)
+        if not triggers:
+            return "empty"
+        if pid in app.state.orch_wake_pending:
+            return "duplicate"
+        app.state.orch_wake_pending.add(pid)
+
+        def run() -> dict:
+            owner = f"wake-{uuid.uuid4().hex}"
+            try:
+                bb = _project(pid).bb
+            except Exception:  # noqa: BLE001 —— 项目已删：直接放弃
+                app.state.orch_wake_pending.discard(pid)
+                return {"skipped": "gone"}
+            try:
+                orch_state.acquire_tick_lease(bb, pid, owner)
+            except orch_state.TickLeaseError:
+                return {"skipped": "lease"}  # tick/对话在跑：静默跳过
+            try:
+                try:
+                    orch = _build_orchestrator(pid, TickIn(), owner)
+                except Exception:  # noqa: BLE001 —— LLM 缺席等：放弃不重试
+                    log.exception("唤醒轮构造编排器失败 pid=%s", pid)
+                    return {"skipped": "build"}
+                try:
+                    return orch.chat_turn(
+                        Orchestrator.wake_brief_text(triggers), wake=triggers)
+                except Exception as exc:  # noqa: BLE001
+                    _emit_llm_error(pid, "orchestrator", exc)
+                    return {"error": str(exc)[:200]}
+            finally:
+                try:
+                    orch_state.release_tick_lease(bb, pid, owner)
+                except Exception:  # noqa: BLE001
+                    log.exception("唤醒轮释放租约失败 pid=%s", pid)
+                app.state.orch_wake_pending.discard(pid)
+
+        app.state.jobs.submit("orchestrator-wake", run, meta={"project_id": pid})
+        return "submitted"
+
+    app.state.orch_wake_check = _maybe_orch_wake  # 测试直调口
+
+    def _post_tick(pid: str, result: dict, *, manual: bool) -> None:
+        """触发点 B（手动/自动 tick 共用后处理）：自动 kick + L2 链状态机。
+
+        零产出：自动 tick=收敛停链；手动 tick 仅在链已活跃时收敛停链。
+        有产出：确保链启动并 kick；全项目零非 closed 会话 → no_sessions 停链。"""
+        # 分阶段工作流（M2）：空闲轮计数 + 过门分流（先于挡位闸，异常不炸链）
+        try:
+            _phase_post_tick(pid, result)
+        except HTTPException:
+            return  # 项目删除中/不存在
+        except Exception:  # noqa: BLE001 —— 阶段护栏故障不阻断链后处理
+            log.exception("阶段过门分流失败 pid=%s", pid)
+        cfg = _auto_cfg(pid)
+        # 异常订阅唤醒（M4）：paused 不打扰，L0/L1/L2 全唤醒（挡位闸之前）
+        if not cfg["paused"]:
+            try:
+                _maybe_orch_wake(pid)
+            except Exception:  # noqa: BLE001 —— 唤醒失败不阻断链后处理
+                log.exception("异常唤醒提交失败 pid=%s", pid)
+        if cfg["level"] not in {"L1", "L2"} or cfg["paused"]:
+            return
+        _kick_workers(pid)
+        if cfg["level"] != "L2":
+            return
+        produced = bool(result.get("published") or result.get("spawned")
+                       or result.get("teams"))
+        if not produced:
+            if not manual or orch_state.load_or_create(_project(pid).bb, pid)["chain_active"]:
+                _stop_chain(pid, "converged")
+            return
+        _start_chain(pid)
+        if autonomy.count_active_sessions(_project(pid).bb, pid) == 0:
+            _stop_chain(pid, "no_sessions")
+
+    def _auto_tick_runner(pid: str, reason: str) -> Callable[[], dict]:
+        def run() -> dict:
+            proj = _project(pid)
+            bb = proj.bb
+            owner = f"auto-{uuid.uuid4().hex}"
+            try:
+                orch_state.acquire_tick_lease(bb, pid, owner)
+            except orch_state.TickLeaseError:
+                return {"skipped": "lease"}  # 闸⑤硬去重：不报错不计数
+            try:
+                cfg = autonomy.autonomy_of(bb.get_project(pid)["config"], track=proj.track)
+                if cfg["level"] != "L2":
+                    _stop_chain(pid, "level_changed")
+                    return {"skipped": "level_changed"}
+                if cfg["paused"]:
+                    _stop_chain(pid, "paused")
+                    return {"skipped": "paused"}
+                st = orch_state.load_or_create(bb, pid)
+                if not st["chain_active"] or pid not in app.state.active_chains:
+                    if st["chain_active"]:
+                        _stop_chain(pid, "restart")
+                    return {"skipped": "chain_inactive"}
+                # 拿租约成功才计数（抢租约的 loser 不污染 chain_ticks）
+                orch_state.increment_counters(bb, pid, chain_ticks=1, auto_ticks_total=1)
+                orch_state.save_fields(
+                    bb, pid,
+                    last_auto_tick_at=datetime.now(timezone.utc).isoformat())
+                orch = _build_orchestrator(pid, TickIn(), owner)
+                try:
+                    result = orch.tick()
+                except Exception as e:  # noqa: BLE001 —— 异常停链但不炸线程
+                    err = f"{type(e).__name__}: {e}"
+                    log.exception("自动 tick 执行失败 pid=%s", pid)
+                    _stop_chain(pid, "error", error=err)
+                    return {"error": err}
+                _post_tick(pid, result, manual=False)
+                return result
+            finally:
+                orch_state.release_tick_lease(bb, pid, owner)
+        return run
+
+    # ---------- Orchestrator ----------
+
+    @app.post("/api/projects/{pid}/orchestrator/chat")
+    def orchestrator_chat(pid: str, body: OrchChatIn):
+        """对话化编排器（M1，§6.4）：与编排器对话——插队轮。租约同步 acquire
+        （busy → 409 不排队），人类消息落 orch.chat {role:"human"}，回复由
+        chat_turn 落 {role:"orch", text(截2000), tool_trace}；工具面与 tick 全
+        闸门同源（dedup/gate/L0 提案/L1 审批），对话轮只读态势不推进游标。"""
+        text = body.text.strip()
+        if not text:
+            raise HTTPException(422, "消息不能为空")
+        proj = _project(pid)
+        owner = f"chat-{uuid.uuid4().hex}"
+        try:
+            orch_state.acquire_tick_lease(proj.bb, pid, owner)
+        except orch_state.TickLeaseError as e:
+            raise HTTPException(409, "编排器正在思考（巡检/对话/重排任一在跑），稍后再发") from e
+        try:
+            orch = _build_orchestrator(pid, TickIn(), owner)
+        except HTTPException:
+            orch_state.release_tick_lease(proj.bb, pid, owner)
+            raise
+        proj.bb.append_event(
+            pid, "orch.chat", {"role": "human", "text": text[:2000]}, author="human")
+
+        def _run_chat() -> dict:
+            try:
+                return orch.chat_turn(text)
+            except Exception as exc:
+                _emit_llm_error(pid, "orchestrator", exc)
+                raise
+            finally:
+                orch_state.release_tick_lease(proj.bb, pid, owner)
+
+        job_id = app.state.jobs.submit(
+            "orchestrator-chat", _run_chat, meta={"project_id": pid})
+        return {"job_id": job_id}
+
+    @app.post("/api/projects/{pid}/orchestrator/compact")
+    def orchestrator_compact(pid: str):
+        """手动持久压缩指挥对话历史（直播间「指挥」页签 `/compact`，2026-10-06）：
+        较早 orch.chat 消息经 LLM 压成摘要落 orch.compact 事件，后续对话轮从
+        「摘要 + 近期消息」起跑。与对话轮同租约（巡检/对话在跑 → 409）。"""
+        proj = _project(pid)
+        owner = f"compact-{uuid.uuid4().hex}"
+        try:
+            orch_state.acquire_tick_lease(proj.bb, pid, owner)
+        except orch_state.TickLeaseError as e:
+            raise HTTPException(409, "编排器正在思考（巡检/对话在跑），稍后再压缩") from e
+        try:
+            orch = _build_orchestrator(pid, TickIn(), owner)
+        except HTTPException:
+            orch_state.release_tick_lease(proj.bb, pid, owner)
+            raise
+        try:
+            return orch.compact_chat()
+        finally:
+            orch_state.release_tick_lease(proj.bb, pid, owner)
+
+    @app.get("/api/projects/{pid}/orchestrator/context")
+    def orchestrator_context(pid: str):
+        """指挥上下文用量快照（直播间指挥页签 `/context`，2026-10-06）：只读，
+        不抢租约；窗口 = 供应商 model_context（缺省 256K）。"""
+        _project(pid)
+        orch = _build_orchestrator(pid, TickIn(), f"ctx-{uuid.uuid4().hex}")
+        return orch.context_usage()
+
+    @app.get("/api/projects/{pid}/goal")
+    def get_project_goal(pid: str):
+        """阶段目标 + 编排器拟人身份（M2/M3 前端数据源；读 project.json meta）。"""
+        proj = _project(pid)
+        meta = proj.meta or {}
+        return {"phase_goal": meta.get("phase_goal"),
+                "persona": meta.get("orchestrator_persona")}
+
+    @app.put("/api/projects/{pid}/goal")
+    def set_project_goal(pid: str, body: PhaseGoalIn):
+        """阶段目标确认（M2，§4.3）：写 meta.phase_goal + goal.confirm 事件
+        （payload 带全文快照，变更历史=事件流可回放）；text 为空 = 清空重议
+        （goal.clear）。criteria 是人话验收口径（LLM 评估用），不做机读联动。"""
+        text = body.text.strip()
+        proj = _project(pid)
+        if not text:
+            store.update_phase_goal(pid, None, project=proj)
+            proj.bb.append_event(pid, "goal.clear", {}, author="human")
+            return {"status": "cleared"}
+        goal = {
+            "text": text[:2000],
+            "criteria": [str(c).strip()[:300]
+                         for c in (body.criteria or []) if str(c).strip()][:20],
+            "phase": (body.phase or "").strip()[:40] or None,
+            "source": "chat",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "confirmed_by": "human",
+        }
+        store.update_phase_goal(pid, goal, project=proj)
+        proj.bb.append_event(pid, "goal.confirm", {"goal": goal}, author="human")
+        return {"status": "confirmed", "goal": goal}
+
+    @app.put("/api/projects/{pid}/orchestrator/persona")
+    def set_orchestrator_persona(pid: str, body: OrchPersonaIn):
+        """编排器拟人身份（M3，§4.4）：meta.orchestrator_persona={display_name,
+        persona}；两字段全空 = 恢复缺省（剥键）。persona 只注入对话轮系统提示。"""
+        proj = _project(pid)
+        display = body.display_name.strip()
+        persona = body.persona.strip()
+        if not display and not persona:
+            store.update_orchestrator_persona(pid, None, project=proj)
+            return {"status": "cleared"}
+        # 人设是 Markdown 文档，不能按旧的短句字段截断；保留完整 UTF-8 文本。
+        persona_val = {"display_name": display[:40] or "编排器",
+                       "persona": persona}
+        store.update_orchestrator_persona(pid, persona_val, project=proj)
+        return {"status": "ok", "persona": persona_val}
+
+    # ---------- 分阶段工作流（pentest-phased-workflow M1/M2） ----------
+
+    def _phase_book_of(proj: Project) -> dict[str, dict]:
+        """项目轨阶段剧本（轨级默认 + 项目 config.phases 覆写；空=未启用）。"""
+        return phases_mod.load_track_phases(
+            app.state.packs_root, proj.track, (proj.meta or {}).get("config"))
+
+    @app.get("/api/projects/{pid}/phase")
+    def get_project_phase(pid: str):
+        """阶段工作流状态（M4 前端阶段条数据源）：当前阶段/门进度/历史/分流标记。"""
+        proj = _project(pid)
+        book = _phase_book_of(proj)
+        if not book:
+            return {"enabled": False}
+        cur_id, spec = phases_mod.current_spec(book, proj.meta or {})
+        st = phases_mod.read_state(proj.meta or {})
+        idle = int(orch_state.load_or_create(proj.bb, pid)["derive_idle_rounds"])
+        metrics = phases_mod.gate_metrics(proj.bb, pid, idle_rounds=idle)
+        met, unmet = phases_mod.evaluate_gate(spec.get("gate") or {}, metrics)
+        return {"enabled": True, "current": cur_id, "spec": spec,
+                # 全阶段序（M4 阶段条渲染三阶段步骤条用，按 order 排序）
+                "phases": [{"id": _id, "name": book[_id].get("name") or _id,
+                            "order": int(book[_id].get("order") or 0)}
+                           for _id in sorted(book, key=lambda k: int(book[k].get("order") or 0))],
+                "gate": {"metrics": metrics, "met": met, "unmet": unmet,
+                         "forward": phases_mod.forward_targets(book, spec)},
+                "history": st["history"], "notified": st["notified"]}
+
+    @app.post("/api/projects/{pid}/phase")
+    def transition_project_phase(pid: str, body: PhaseTransitionIn):
+        """人工流转阶段（人工最终——不走门；目标限当前阶段剧本 next 清单内）。"""
+        proj = _project(pid)
+        book = _phase_book_of(proj)
+        if not book:
+            raise HTTPException(
+                422, f"项目轨 {proj.track} 无阶段剧本，阶段工作流未启用")
+        cur_id, spec = phases_mod.current_spec(book, proj.meta or {})
+        to = body.to.strip()
+        if to not in book:
+            raise HTTPException(422, f"目标阶段不存在: {to}（本轨阶段: {sorted(book)}）")
+        if to not in (spec.get("next") or []):
+            raise HTTPException(
+                422, f"不允许的流转: {cur_id} → {to}（允许: {spec.get('next') or []}）")
+        idle = int(orch_state.load_or_create(proj.bb, pid)["derive_idle_rounds"])
+        r = phases_mod.enter_phase(proj, to, by="human",
+                                   packs_root=app.state.packs_root,
+                                   reason=body.reason.strip()[:200], idle_rounds=idle)
+        return {"from": r["from"], "to": to, "published": r["published"],
+                "spec": r["spec"]}
+
+    @app.post("/api/projects/{pid}/orchestrator/directive", deprecated=True)
+    def orchestrator_directive(pid: str, body: DirectiveIn):
+        """C2 指挥编排器（§6.4）：人类一次性目标指令——落 orch.directive 事件
+        （最高优先注入下一轮 tick）+ 自动触发一轮编排。持久方向走 mission。
+        **deprecated（对话化编排器 M1，2026-09-21）**：对话窗全替代——UI 入口已删，
+        本端点仅保留兼容 CLI/脚本；存量未消费指令仍由 tick 消费。"""
+        text = body.text.strip()
+        if not text:
+            raise HTTPException(422, "指令不能为空")
+        proj = _project(pid)
+        event_id = proj.bb.append_event(
+            pid, "orch.directive",
+            {"text": text[:2000], "status": "pending"}, author="human")
+        # 自动触发一轮编排（复用手动 tick 同款租约/job 路径）
+        owner = f"directive-{uuid.uuid4().hex}"
+        try:
+            orch_state.acquire_tick_lease(proj.bb, pid, owner)
+        except orch_state.TickLeaseError as e:
+            raise HTTPException(409, str(e)) from e
+        try:
+            orch = _build_orchestrator(pid, TickIn(), owner)
+        except HTTPException:
+            orch_state.release_tick_lease(proj.bb, pid, owner)
+            raise
+
+        def _run_directive_tick() -> dict:
+            try:
+                result = orch.tick()
+                _post_tick(pid, result, manual=False)
+                return result
+            finally:
+                orch_state.release_tick_lease(proj.bb, pid, owner)
+
+        job_id = app.state.jobs.submit(
+            "orchestrator-tick", _run_directive_tick, meta={"project_id": pid},
+            on_done=lambda _j: _maybe_auto_tick(pid, reason="directive-done"))
+        return {"event_id": event_id, "job_id": job_id, "status": "dispatched"}
+
+    @app.get("/api/judgment-templates")
+    def list_judgment_templates():
+        """C2 判据模板：内置（渗透/红队默认）+ 用户自定义（config/judgment_templates.json）。"""
+        return {"builtin": judgments.BUILTIN_TEMPLATES,
+                "user": judgments.load_user_templates(app.state.judgments_dir)}
+
+    @app.put("/api/judgment-templates")
+    def save_judgment_templates(body: dict):
+        """整表保存用户模板（{name: criteria}）；空名/空判据条目剔除。"""
+        judgments.save_user_templates(app.state.judgments_dir, body or {})
+        return {"saved": len(judgments.load_user_templates(app.state.judgments_dir))}
+
+    @app.delete("/api/judgment-templates/{name}")
+    def delete_judgment_template(name: str):
+        templates = judgments.load_user_templates(app.state.judgments_dir)
+        if name not in templates:
+            raise HTTPException(404, f"模板不存在: {name}")
+        del templates[name]
+        judgments.save_user_templates(app.state.judgments_dir, templates)
+        return {"deleted": name}
+
+    @app.post("/api/projects/{pid}/artex/plan")
+    def artex_plan(pid: str, body: ArtexPlanIn):
+        """将目标拆解为 ARTEX 父子 Intent，并可选择启动项目 Engine。"""
+        proj = _project(pid)
+        from core.blackboard.artex_planner import plan_intents
+        _exec, planner = _llms()
+        allowed = body.allowed_experts
+        if allowed is None:
+            allowed = expert_allowed_roles(
+                app.state.packs_root, proj.track, proj.experts)
+        try:
+            result = plan_intents(
+                bb=proj.bb, project_id=pid, llm=planner, goal=body.goal,
+                track=proj.track, allowed_experts=allowed,
+                asset_ids=body.asset_ids, task_id=body.task_id,
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if body.start_engine:
+            app.state.start_artex_engine(pid)
+        return result
+
+    @app.get("/api/projects/{pid}/artex/tasks")
+    def artex_task_list(pid: str, limit: int = 100):
+        """返回项目级 ARTEX 任务汇总，供工作台切换多个任务图。"""
+        proj = _project(pid)
+        from core.blackboard.artex_intents import list_intents
+        from core.blackboard.artex_goals import goals_stats, list_goals
+        from core.blackboard.artex_coverage import task_coverage
+        from core.blackboard.artex_runtime import get_runtime
+        rows = list_intents(proj.bb, pid, limit=1000)
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            task_id = str(row.get("task_id") or "").strip()
+            # 历史脏数据过滤（artex-plan-only，2026-10-19 事故修复）：旧版
+            # `call_expert` 拿**线程 id** 冒充 task_id 建过 Intent，于是任务列表
+            # 里出现了 `chat-xxxxxxxx` 这种「任务」——它没有 Planner、没有目标、
+            # 没有探索图，点进去是一片空白，用户会以为系统坏了。新代码已不再
+            # 产生（见 core/chat/runtime.py 的 `_tool_call_expert`），这里把存量
+            # 挡住，不让幽灵任务继续占列表。
+            if not task_id or task_id.startswith("chat-"):
+                continue
+            grouped.setdefault(task_id, []).append(row)
+        engine = app.state.artex_engines.get(pid)
+        tasks = []
+        for task_id, intents in grouped.items():
+            counts: dict[str, int] = {}
+            for intent in intents:
+                status = str(intent.get("status") or "")
+                counts[status] = counts.get(status, 0) + 1
+            latest = max((str(item.get("updated_at") or item.get("created_at") or "")
+                          for item in intents), default="")
+            root = next((item for item in intents if not item.get("parent_id")), intents[0])
+            goal_rows = list_goals(proj.bb, pid, task_id)
+            goal_stats = goals_stats(proj.bb, pid, task_id)
+            # 任务级运行态由目标驱动推导（有注册目标时不再靠「有 fact 即达成」）。
+            runtime = get_runtime(proj.bb, pid, task_id) or {}
+            try:
+                coverage = task_coverage(proj.bb, pid, task_id)
+            except Exception:  # noqa: BLE001 —— 覆盖度读取失败不阻任务列表
+                coverage = {"enabled": False}
+            tasks.append({
+                "task_id": task_id,
+                "objective": root.get("objective", ""),
+                "status": root.get("status", ""),
+                "runtime_status": str(runtime.get("status") or ""),
+                "counts": counts,
+                "intent_count": len(intents),
+                "goal_count": goal_stats["total"],
+                "goal_met_count": goal_stats["met"],
+                "goal_open_count": goal_stats["open"],
+                "goals": goal_rows,
+                "coverage": coverage,
+                "updated_at": latest,
+                "running": bool(engine and engine.running and any(
+                    item.get("status") in {"claimed", "running"} for item in intents)),
+            })
+        tasks.sort(key=lambda item: item["updated_at"], reverse=True)
+        return {"tasks": tasks[:max(1, min(limit, 200))]}
+
+    @app.get("/api/projects/{pid}/artex/tasks/{task_id}")
+    def artex_task_graph(pid: str, task_id: str):
+        proj = _project(pid)
+        from core.blackboard.artex_intents import task_graph
+        return task_graph(proj.bb, pid, task_id)
+
+    @app.get("/api/projects/{pid}/artex/tasks/{task_id}/runtime")
+    def artex_task_runtime(pid: str, task_id: str):
+        proj = _project(pid)
+        from core.blackboard.artex_runtime import evaluate_task
+        return evaluate_task(proj.bb, pid, task_id, reason="api_read")
+
+    @app.get("/api/projects/{pid}/artex/tasks/{task_id}/coverage")
+    def artex_task_coverage(pid: str, task_id: str, type: str = "",
+                            limit: int = 50, offset: int = 0):
+        """任务资产覆盖度（任务锚点分母 × 事实锚定分子）与未覆盖清单。
+
+        复刻上游 ``Coverage`` 结构（enabled/scope_rows/denominator/tested/pct/
+        by_type），另附 ``scope_source``（锚点 vs 推断）与未测资产分页。
+        """
+        proj = _project(pid)
+        from core.blackboard.artex_coverage import list_untested_assets, task_coverage
+        coverage = task_coverage(proj.bb, pid, task_id)
+        backlog = list_untested_assets(proj.bb, pid, task_id, type_=type,
+                                       limit=limit, offset=offset)
+        return {"coverage": coverage, "untested": backlog}
+
+    @app.get("/api/projects/{pid}/artex/tasks/{task_id}/coverage/graph")
+    def artex_task_coverage_graph(pid: str, task_id: str):
+        """任务覆盖图：范围内资产 + 为连边拉入的范围外祖先（灰）。"""
+        proj = _project(pid)
+        from core.blackboard.artex_coverage import coverage_graph
+        return coverage_graph(proj.bb, pid, task_id)
+
+    @app.post("/api/projects/{pid}/artex/tasks/{task_id}/scope")
+    def artex_task_scope(pid: str, task_id: str, body: ArtexScopeIn):
+        """锚定/摘除任务范围资产（覆盖度分母）；asset_ids 空则只读回覆盖度。"""
+        proj = _project(pid)
+        from core.blackboard.artex_coverage import (
+            anchor_task_assets,
+            task_coverage,
+            unanchor_task_assets,
+        )
+        if not body.asset_ids:
+            return {"changed": False,
+                    "coverage": task_coverage(proj.bb, pid, task_id)}
+        if body.remove:
+            result = unanchor_task_assets(bb=proj.bb, project_id=pid,
+                                          task_id=task_id, asset_ids=body.asset_ids)
+        else:
+            result = anchor_task_assets(bb=proj.bb, project_id=pid, task_id=task_id,
+                                        asset_ids=body.asset_ids, source="api",
+                                        note=body.note)
+        return {"changed": True, "result": result,
+                "coverage": task_coverage(proj.bb, pid, task_id)}
+
+    @app.get("/api/projects/{pid}/artex/exploration")
+    def artex_exploration(pid: str, task_id: str | None = None):
+        proj = _project(pid)
+        from core.blackboard.artex_exploration import exploration_graph
+        return exploration_graph(proj.bb, pid, task_id=task_id)
+
+    @app.get("/api/projects/{pid}/artex/exploration/{node_id}")
+    def artex_exploration_node(pid: str, node_id: str):
+        proj = _project(pid)
+        from core.blackboard.artex_exploration import get_node, list_edges
+        node = get_node(proj.bb, pid, node_id)
+        if node is None:
+            raise HTTPException(404, "探索节点不存在")
+        return {"node": node, "edges": list_edges(proj.bb, pid, node_id=node_id)}
+
+    def _artex_activity_events(proj, pid: str, task_id: str | None,
+                               since_id: int, limit: int = 100) -> list[dict]:
+        kinds = ["artex.intent.created", "artex.intent.claimed", "artex.intent.running",
+                 "artex.intent.completed", "artex.intent.failed", "artex.intent.recovered",
+                 "artex.intent.pause", "artex.intent.resume", "artex.intent.cancel",
+                 "artex.intent.retry", "artex.intent.aggregated", "artex.worker.steer",
+                 "artex.worker.kill", "artex.replan.started", "artex.replan.completed",
+                 "artex.replan.failed", "artex.task.status", "artex.task.paused",
+                 "artex.exploration.node.created",
+                 "artex.exploration.fact.recorded", "chat.spawn", "chat.tool", "chat.steer", "chat.thinking",
+                 "chat.usage", "chat.error", "approval.requested", "approval.approved",
+                 "approval.rejected", "scope.expanded", "asset.new", "asset.imported", "asset.updated",
+                 "asset.reparent", "asset.renamed", "asset.deleted", "asset.merged", "asset.status_changed",
+                 "finding.new", "finding.updated", "finding.deleted", "finding.merged", "finding.retracted"]
+        events = proj.bb.recent_events(pid, since_id=max(0, since_id),
+                                       limit=max(1, min(limit, 500)), kinds=kinds)
+        if task_id:
+            from core.blackboard.artex_intents import list_intents
+            intent_ids = {row["id"] for row in list_intents(proj.bb, pid, limit=1000)
+                          if row.get("task_id") == task_id}
+            events = [event for event in events
+                      if str((event.get("payload") or {}).get("task_id") or "") == task_id
+                      or str((event.get("payload") or {}).get("intent_id") or "") in intent_ids]
+        return events
+
+    @app.get("/api/projects/{pid}/artex/activity")
+    def artex_activity(pid: str, task_id: str | None = None,
+                       since_id: int = 0, limit: int = 100):
+        proj = _project(pid)
+        events = _artex_activity_events(proj, pid, task_id, since_id, limit)
+        return {"events": events, "latest_id": proj.bb.latest_event_id(pid)}
+
+    @app.get("/api/projects/{pid}/artex/activity/stream")
+    async def artex_activity_stream(request: Request, pid: str, task_id: str | None = None,
+                                    since_id: int = 0):
+        """以 SSE 推送 ARTEX 活动；客户端断开后立即结束轮询。"""
+        proj = _project(pid)
+
+        async def generate():
+            cursor = max(0, since_id)
+            while True:
+                if await request.is_disconnected():
+                    break
+                events = await run_in_threadpool(
+                    _artex_activity_events, proj, pid, task_id, cursor, 100)
+                if events:
+                    for event in events:
+                        cursor = max(cursor, int(event.get("id") or 0))
+                        yield f"id: {cursor}\\ndata: {json.dumps(event, ensure_ascii=False)}\\n\\n"
+                else:
+                    yield ": heartbeat\\n\\n"
+                await asyncio.sleep(1.0)
+
+        return StreamingResponse(generate(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "Connection": "keep-alive",
+                                          "X-Accel-Buffering": "no"})
+
+    @app.get("/api/projects/{pid}/artex/engine")
+    def artex_engine_status(pid: str, task_id: str | None = None):
+        proj = _project(pid)
+        from core.blackboard.artex_intents import list_intents
+        rows = list_intents(proj.bb, pid, limit=1000)
+        # **counts 必须与 active 同口径按 task 过滤**（artex-kpi-scope，2026-10-21）：
+        # 此前 counts 统计**整个项目**，而 active 按 task 过滤，前端又用
+        # `graph.nodes.length`（本任务 Intent 数）当分母、`counts.completed`（全项目）
+        # 当分子 → 「总 Intent 12 / 完成 0%」这种分子分母不同源的数字。
+        # 多任务并行时更明显：A 任务的完成数会把 B 任务的进度顶上去。
+        scoped = [row for row in rows
+                  if not task_id or row.get("task_id") == task_id]
+        counts: dict[str, int] = {}
+        for row in scoped:
+            counts[row["status"]] = counts.get(row["status"], 0) + 1
+        engine = app.state.artex_engines.get(pid)
+        active = [row for row in scoped if row["status"] in {"claimed", "running"}]
+        return {"project_id": pid, "running": bool(engine and engine.running),
+                "active_workers": len(active), "counts": counts,
+                "active": active, "task_id": task_id}
+
+    @app.post("/api/projects/{pid}/artex/engine/start")
+    def artex_engine_start(pid: str):
+        _project(pid)
+        engine = app.state.start_artex_engine(pid)
+        return {"project_id": pid, "running": engine.running}
+
+    @app.post("/api/projects/{pid}/artex/engine/stop")
+    def artex_engine_stop(pid: str):
+        _project(pid)
+        drained = app.state.stop_artex_engine(pid)
+        return {"project_id": pid, "running": False, **drained}
+
+    @app.post("/api/projects/{pid}/artex/intents/{intent_id}/control")
+    def artex_intent_control(pid: str, intent_id: str, body: ArtexControlIn):
+        proj = _project(pid)
+        from core.blackboard.artex_intents import control_intent
+        try:
+            return control_intent(proj.bb, pid, intent_id, body.action)
+        except (LookupError, ValueError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/projects/{pid}/artex/intents/{intent_id}/worker-control")
+    def artex_worker_control(pid: str, intent_id: str, body: ArtexWorkerControlIn):
+        _project(pid)
+        engine = app.state.artex_engines.get(pid)
+        if engine is None:
+            raise HTTPException(409, "ARTEX Engine 未启动")
+        try:
+            if body.action == "kill":
+                return engine.kill_work(intent_id, body.message or "人工终止 Worker")
+            return engine.steer_work(intent_id, body.message)
+        except (LookupError, ValueError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/projects/{pid}/orchestrator/tick")
+    def orchestrator_tick(pid: str, body: TickIn):
+        proj = _project(pid)
+        # tick 租约（机制 1.9）：同步先拿，他人租约未过期直接 409，不进 job/不构造 LLM；
+        # 崩溃不释放也会在 900s TTL 后自然到期。owner 仅释放自己的租约。
+        owner = f"tick-{uuid.uuid4().hex}"
+        try:
+            orch_state.acquire_tick_lease(proj.bb, pid, owner)
+        except orch_state.TickLeaseError as e:
+            # 409 带运行时长（2026-09-28，从最近 tick.started 事件算）：让「慢」
+            # 和「死」可分辨——正常研判/链轮几分钟内完，超 15 分钟基本可判卡死。
+            # 整段异常护栏：观测增强绝不能反过来把 409 炸成 500（教训：list_events
+            # 方法名不存在 → AttributeError → 500，即「链自旋收敛：500」横幅的来源）
+            since = ""
+            try:
+                tip = proj.bb.latest_event_id(pid)
+                for ev in reversed(proj.bb.recent_events(
+                        pid, since_id=max(0, tip - 200), limit=200)):
+                    if ev["kind"] == "orch.tick.started":
+                        try:
+                            mins = int((datetime.now(timezone.utc)
+                                        - datetime.fromisoformat(ev["created_at"]))
+                                       .total_seconds() // 60)
+                            since = f"已运行 {mins} 分钟（启动于 {ev['created_at'][11:16]} UTC）"
+                        except ValueError:
+                            pass
+                        break
+            except Exception:  # noqa: BLE001 —— 推导失败只降级为无时长文案
+                log.exception("409 时长推导失败（不影响 409 本身）")
+            raise HTTPException(
+                409, "已有编排 tick 在执行"
+                + (f"（{since}）" if since else "（租约 900s TTL；进程崩溃会自然到期）")
+                + "。编排页签可看进度；确认卡死可在编排页签「⚡ 强制接管」后重启") from e
+        try:
+            # 503（无 LLM key）等同步失败先释放租约
+            orch = _build_orchestrator(pid, body, owner, analyze_only=body.analyze_only)
+        except HTTPException:
+            orch_state.release_tick_lease(proj.bb, pid, owner)
+            raise
+        # 编排开始有痕（2026-09-18）：事件流实时可见，配合作战计划面板的运行时长提示
+        proj.bb.append_event(
+            pid, "orch.tick.started",
+            {"reason": "analyze" if body.analyze_only else "manual"},
+            author="orchestrator")
+
+        def _run_tick() -> dict:
+            try:
+                result = orch.tick()
+                if body.analyze_only:
+                    # auto-attack 研判轮（2026-09-28）：计划全文落 analyzed 事件
+                    # （流内呈现「分析报告 + 开跑按钮」的载体）。不调 _post_tick——
+                    # 分析不产出任务，不能误启自动链；确认开跑由前端二次触发普通 tick。
+                    proj.bb.append_event(pid, "orch.auto_attack.analyzed", {
+                        "budget_ticks": body.budget_ticks,
+                        "summary": str(result.get("analysis")
+                                       or result.get("summary") or ""),
+                    }, author="orchestrator")
+                else:
+                    _post_tick(pid, result, manual=True)  # 触发点 B：kick + L2 链状态机
+                return result
+            except Exception as exc:
+                _emit_llm_error(pid, "orchestrator", exc)
+                raise
+            finally:
+                orch_state.release_tick_lease(proj.bb, pid, owner)
+
+        # tick 状态翻 done 后再评估一次续链：worker 可能在 tick 收尾期间已空退
+        # （其 A 触发会因 tick job 仍 running 而跳过），由这里兜底，防链搁浅。
+        job_id = app.state.jobs.submit(
+            "orchestrator-tick", _run_tick, meta={"project_id": pid},
+            on_done=lambda _j: _maybe_auto_tick(pid, reason="tick-done"))
+        return {"job_id": job_id}
+
+    @app.post("/api/projects/{pid}/orchestrator/tick/force-acquire")
+    def orchestrator_tick_force_acquire(pid: str):
+        """强制接管（2026-09-28 人工救济）：无条件清 tick 租约，卡死轮的补救
+        出口——409 长时间不解除（心跳停/时长异常）时，清租约即可重新点火。
+        旧轮若仍存活，其产出照常落事件（任务发布由编排器判重），短暂双跑窗口
+        为已知代价；orch.tick.forced 落事件留痕。"""
+        proj = _project(pid)
+        if not orch_state.force_release_tick_lease(proj.bb, pid):
+            raise HTTPException(409, "当前无 tick 租约可接管")
+        proj.bb.append_event(pid, "orch.tick.forced",
+                             {"by": "human"}, author="orchestrator")
+        return {"released": True}
+
+    @app.post("/api/projects/{pid}/orchestrator/auto-attack/stop")
+    def orchestrator_auto_attack_stop(pid: str):
+        """自动渗透人工停止（auto-attack 2026-09-28）：停 L2 链不降档——与
+        档位变更/暂停同走 _stop_chain（幂等），orch.chain_stopped{reason:human}
+        落事件；在跑 worker 任务不受影响（链只管编排轮的自动续转）。"""
+        _project(pid)
+        if not _stop_chain(pid, "human"):
+            raise HTTPException(409, "自动链当前未在运行")
+        return {"stopped": True}
+
+    # ---------- 分类学与包管理（设置页：能力包 / 场景轨 / 角色 / Skill / 红线） ----------
+    # 修改即时生效于「下次开窗」（角色/技能在会话构造时加载），在跑的会话不受影响。
+
+    @app.get("/api/taxonomy")
+    def get_taxonomy():
+        """场景轨目录 + kb 知识方向 + 各轨任务类型注册表（新建项目向导的数据源，§4.5）。"""
+        return {
+            "directions": list_directions(app.state.packs_root),
+            "tracks": list_packs(app.state.packs_root, "track"),
+            "task_types": {
+                t["name"]: load_task_types(app.state.packs_root, t["name"])
+                for t in list_packs(app.state.packs_root, "track")
+            },
+        }
+
+    # ---- Skill 通用序列化 ----
+
+    def _skill_json(sk) -> dict:
+        return {
+            "name": sk.name,
+            "description": sk.description, "keywords": sk.keywords,
+            "features": sk.features, "file_features": sk.file_features,
+            "platforms": sk.platforms, "formats": sk.formats,
+            "vuln_classes": sk.vuln_classes, "task_types": sk.task_types,
+            "required_tools": sk.required_tools, "enabled": sk.enabled,
+            # 展示分组（专家池勾选清单按类别展示；不影响加载/路由）
+            "group": skill_group(sk.name),
+            "mode": sk.mode, "self_contained": sk.is_self_contained,
+            "resources": [p.relative_to(sk.root).as_posix() for p in sk.resources],
+        }
+
+    def _loaded_registry() -> SkillRegistry:
+        reg = SkillRegistry(app.state.packs_root)
+        reg.load()
+        return reg
+
+    def _get_skill(skill_name: str):
+        _check_name(skill_name, "技能名")
+        path = skill_dir(app.state.packs_root, skill_name) / "SKILL.md"
+        if not path.is_file():
+            raise HTTPException(404, f"技能不存在: {skill_name}")
+        return path, _loaded_registry().get(skill_name)
+
+    def _skill_resource(sk, resource: str) -> Path:
+        """Resolve a cc skill resource without allowing traversal or SKILL.md escape."""
+        rel = str(resource or "").replace("\\", "/").strip()
+        if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+            raise HTTPException(422, "技能资源路径非法")
+        if Path(rel).parts[0] not in {"references", "scripts", "examples", "assets"}:
+            raise HTTPException(422, "技能资源必须位于 references/scripts/examples/assets")
+        target = (sk.root / Path(rel)).resolve()
+        root = sk.root.resolve()
+        if root not in target.parents or not target.is_file():
+            raise HTTPException(404, f"技能资源不存在: {rel}")
+        if target not in {p.resolve() for p in sk.resources}:
+            raise HTTPException(404, f"技能资源不存在: {rel}")
+        return target
+
+    def _skill_workspace_dir(skill_name: str) -> Path:
+        """解析技能目录（packs/kb/skills/<name>）供文件工作区使用。"""
+        _check_name(skill_name, "技能名")
+        root = skill_dir(app.state.packs_root, skill_name).resolve()
+        pack_root = Path(app.state.packs_root).resolve()
+        if pack_root not in root.parents or not root.is_dir():
+            raise HTTPException(404, f"技能不存在: {skill_name}")
+        return root
+
+    def _skill_file_path(root: Path, rel: str, *, must_exist: bool = True) -> Path:
+        rel = str(rel or "").replace("\\", "/").strip().strip("/")
+        if not rel or "\x00" in rel or rel.startswith("/") or ".." in Path(rel).parts:
+            raise HTTPException(422, "技能文件路径非法")
+        if ".history" in Path(rel).parts:
+            raise HTTPException(422, "历史备份目录不能通过技能工作区访问")
+        target = (root / Path(rel)).resolve()
+        if target != root and root not in target.parents:
+            raise HTTPException(422, "技能文件必须位于当前技能目录")
+        if must_exist and not target.exists():
+            raise HTTPException(404, f"技能文件不存在: {rel}")
+        return target
+
+    def _skill_file_entry(root: Path, path: Path) -> dict:
+        rel = path.relative_to(root).as_posix()
+        st = path.stat()
+        is_text = path.suffix.lower() in {".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".py", ".js", ".ts", ".tsx", ".css", ".html", ".xml", ".csv", ".ini", ".cfg", ".sh", ".bat", ".java", ".c", ".cpp", ".h", ".hpp", ".rs", ".go"}
+        return {"path": rel, "name": path.name, "is_dir": path.is_dir(),
+                "size": 0 if path.is_dir() else st.st_size,
+                "modified": st.st_mtime, "kind": "text" if is_text else ("image" if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"} else "binary")}
+
+    def _skill_catalog(pid: str | None = None) -> dict:
+        reg = _loaded_registry()
+        experts = []
+        if pid:
+            try:
+                experts = list(_project(pid).experts or [])
+            except HTTPException:
+                pass
+        rows: list[dict] = []
+        for sk in reg.all():
+            row = _skill_json(sk)
+            refs = []
+            base = Path(app.state.packs_root) / "experts"
+            if base.is_dir():
+                for f in sorted(base.glob("*.yaml")):
+                    eid = f.stem
+                    if pid and eid not in experts:
+                        continue
+                    try:
+                        allowed = _parse_expert_yaml(f).get("skills")
+                        if allowed is not None and row["name"] in (allowed or []):
+                            refs.append(eid)
+                    except Exception:
+                        continue
+            row["expert_refs"] = refs
+            # 直接读 sk.path：分组技能目录（skills/01-入口分诊/<name>）与扁平
+            # 布局不一致，再按 skill_dir(name)/SKILL.md 拼会 FileNotFoundError → 500。
+            try:
+                text = sk.path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            row["estimated_tokens"] = max(1, len(text) // 4)
+            rows.append(row)
+        return {"skills": rows, "skill_count": len(rows),
+                "estimated_tokens": sum(r["estimated_tokens"] for r in rows)}
+
+    @app.get("/api/skills/catalog")
+    def get_skill_catalog(pid: str | None = None):
+        return _skill_catalog(pid)
+
+    @app.get("/api/skills/{skill_name}/files")
+    def list_skill_files(skill_name: str):
+        root = _skill_workspace_dir(skill_name)
+        entries = []
+        for path in sorted(root.rglob("*"), key=lambda p: (not p.is_dir(), p.relative_to(root).as_posix().lower())):
+            if ".history" in path.relative_to(root).parts:
+                continue
+            entries.append(_skill_file_entry(root, path))
+        return {"root": f"skills/{skill_name}", "files": entries}
+
+    @app.get("/api/skills/{skill_name}/files/content")
+    def read_skill_file(skill_name: str, path: str):
+        root = _skill_workspace_dir(skill_name)
+        target = _skill_file_path(root, path)
+        if target.is_dir():
+            raise HTTPException(422, "目录不能读取内容")
+        entry = _skill_file_entry(root, target)
+        if entry["kind"] == "text":
+            return {**entry, "content": target.read_text(encoding="utf-8", errors="replace")}
+        if entry["kind"] == "image" and target.stat().st_size <= 5 * 1024 * 1024:
+            mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp", ".svg": "image/svg+xml"}.get(target.suffix.lower(), "application/octet-stream")
+            return {**entry, "preview": f"data:{mime};base64,{base64.b64encode(target.read_bytes()).decode()}"}
+        return entry
+
+    @app.post("/api/skills/{skill_name}/files")
+    def create_skill_file(skill_name: str, body: SkillFileWriteIn):
+        root = _skill_workspace_dir(skill_name)
+        target = _skill_file_path(root, body.path, must_exist=False)
+        if target.exists():
+            raise HTTPException(409, "技能文件已存在")
+        with pack_write_lock():
+            if body.is_dir:
+                target.mkdir(parents=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(body.content, encoding="utf-8")
+        return {"status": "ok", "path": body.path}
+
+    @app.put("/api/skills/{skill_name}/files")
+    def update_skill_file(skill_name: str, body: SkillFileWriteIn):
+        root = _skill_workspace_dir(skill_name)
+        target = _skill_file_path(root, body.path)
+        if target.is_dir():
+            raise HTTPException(422, "目录不能写入内容")
+        with pack_write_lock():
+            _pack_history_backup(target)
+            target.write_text(body.content, encoding="utf-8")
+        return {"status": "ok", "path": body.path}
+
+    @app.post("/api/skills/{skill_name}/files/rename")
+    def rename_skill_file(skill_name: str, body: SkillFileRenameIn):
+        root = _skill_workspace_dir(skill_name)
+        src = _skill_file_path(root, body.path)
+        dest = _skill_file_path(root, body.new_path, must_exist=False)
+        if dest.exists():
+            raise HTTPException(409, "目标路径已存在")
+        with pack_write_lock():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+        return {"status": "ok", "path": body.new_path}
+
+    @app.delete("/api/skills/{skill_name}/files")
+    def delete_skill_file(skill_name: str, path: str):
+        root = _skill_workspace_dir(skill_name)
+        target = _skill_file_path(root, path)
+        if target == root or target.name == "SKILL.md":
+            raise HTTPException(422, "不能删除技能根目录或 SKILL.md")
+        if target.is_dir() and any(target.iterdir()):
+            raise HTTPException(409, "只能删除空目录")
+        with pack_write_lock():
+            if target.is_dir(): target.rmdir()
+            else:
+                _pack_history_backup(target)
+                target.unlink()
+        return {"status": "ok", "path": path}
+
+    # ---- Skill 列表/读写（技能扁平 packs/kb/skills/<name>）----
+
+    @app.get("/api/skills")
+    def list_skills():
+        reg = _loaded_registry()
+        return [_skill_json(sk) for sk in reg.all()]
+
+    # ---- 词汇表聚合（七类 frontmatter 字段 + 使用计数，前端 datalist 补全） ----
+    # 注意：必须注册在 /api/skills/{skill_name} 之前，否则被路径参数路由吃掉。
+    @app.get("/api/skills/vocab")
+    def skills_vocab():
+        fields = ("keywords", "features", "file_features", "platforms",
+                  "formats", "vuln_classes", "task_types")
+        vocab: dict[str, dict[str, int]] = {f: {} for f in fields}
+        for sk in _loaded_registry().all():
+            for f in fields:
+                for v in getattr(sk, f, None) or []:
+                    vocab[f][v] = vocab[f].get(v, 0) + 1
+        return {f: [{"value": k, "count": c} for k, c in sorted(
+                    vocab[f].items(), key=lambda kv: (-kv[1], kv[0]))]
+                for f in fields}
+
+    @app.get("/api/skills/{skill_name}")
+    def get_skill(skill_name: str):
+        path, sk = _get_skill(skill_name)
+        return {"name": skill_name, "meta": parse_frontmatter(path.read_text(encoding="utf-8")),
+                "skill": _skill_json(sk) if sk else None,
+                "raw": path.read_text(encoding="utf-8"),
+                "resources": ([p.relative_to(path.parent).as_posix() for p in sk.resources]
+                              if sk else [])}
+
+    @app.get("/api/skills/{skill_name}/resources/{resource:path}")
+    def get_skill_resource(skill_name: str, resource: str):
+        _path, sk = _get_skill(skill_name)
+        if sk is None:
+            raise HTTPException(404, "技能未注册")
+        target = _skill_resource(sk, resource)
+        return {"path": resource.replace("\\", "/"),
+                "content": target.read_text(encoding="utf-8", errors="replace")}
+
+    @app.put("/api/skills/{skill_name}")
+    def update_skill(skill_name: str, body: SkillUpdateIn):
+        path, _ = _get_skill(skill_name)
+        meta = parse_frontmatter(body.content)
+        if meta.get("name") != skill_name:
+            raise HTTPException(422, f"frontmatter name（{meta.get('name')!r}）必须与技能名（{skill_name}）一致")
+        with pack_write_lock():
+            _pack_history_backup(path)
+            path.write_text(body.content, encoding="utf-8")
+        return {"status": "ok"}
+
+    @app.post("/api/skills", status_code=201)
+    def create_skill(body: SkillCreateIn):
+        """新建自包含技能（packs/kb/skills/<name>）。重名 409、非法名 422。"""
+        _check_name(body.name, "技能名")
+        dest = skill_dir(app.state.packs_root, body.name)
+        with pack_write_lock():  # 存在性检查+建目录+写文件同一临界区（防并发重名）
+            if dest.exists():
+                raise HTTPException(409, f"技能已存在: {body.name}")
+            dest.mkdir(parents=True)
+            (dest / "SKILL.md").write_text(_dump_new_skill(body.name, body), encoding="utf-8")
+        return {"status": "ok", "name": body.name, "path": f"skills/{body.name}"}
+
+    @app.delete("/api/skills/{skill_name}")
+    def delete_skill(skill_name: str):
+        """删除技能：整目录移入 skills/.history/trash/ 可恢复。"""
+        _check_name(skill_name, "技能名")
+        path = skill_dir(app.state.packs_root, skill_name)
+        with pack_write_lock():
+            if not path.is_dir():
+                raise HTTPException(404, f"技能不存在: skills/{skill_name}")
+            dest = _trash_move(path)
+        return {"status": "ok", "name": skill_name, "trash": dest.name}
+
+    @app.patch("/api/skills/{skill_name}/enabled")
+    def toggle_skill(skill_name: str, body: SkillEnabledIn):
+        """enabled 快速开关：只改 frontmatter，正文不动，自动留 .history 备份。"""
+        path, _ = _get_skill(skill_name)
+        backup = _set_skill_enabled(path, body.enabled)
+        return {"status": "ok", "name": skill_name, "enabled": body.enabled,
+                "backup": backup.name if backup else None}
+
+    # ---- 场景轨：红线 / 角色 / owner 规则 / 任务类型注册表 ----
+
+    @app.get("/api/tracks/{track}/rules")
+    def get_track_rules(track: str):
+        _check_name(track, "场景轨")
+        path = redline_path(app.state.packs_root, track)
+        # 缺失是常态（doctor 的 missing-redlines 预警），返回 200+exists:false，不走 404 噪声
+        if not path.is_file():
+            return {"content": "", "exists": False}
+        return {"content": path.read_text(encoding="utf-8"), "exists": True}
+
+    @app.put("/api/tracks/{track}/rules")
+    def update_track_rules(track: str, body: FileContentIn):
+        _check_name(track, "场景轨")
+        path = redline_path(app.state.packs_root, track)
+        with pack_write_lock():
+            _pack_history_backup(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body.content, encoding="utf-8")
+        return {"status": "ok"}
+
+    @app.get("/api/tracks/{track}/roles")
+    def list_track_roles(track: str):
+        """专家池清单（expert-pool M2：roles/ 退役，数据源切 experts/ 按轨过滤，
+        响应形状与旧角色视图兼容——前端只读消费零改动；写端点退役返 410，
+        专家管理 UI 随 M3 落地）。"""
+        _check_name(track, "场景轨")
+        out = []
+        for name in list_experts(app.state.packs_root, track):
+            e = load_expert(app.state.packs_root, name, track)
+            out.append({"name": e.get("name") or name,
+                        "description": e.get("description"),
+                        "persona": e.get("persona"),
+                        "skills": e.get("skills"),
+                        "tools": e.get("tools"),
+                        "max_steps": e.get("max_steps"),
+                        "file": name})
+        return out
+
+    @app.put("/api/tracks/{track}/roles/{role_name}")
+    def update_track_role(track: str, role_name: str, body: dict):
+        raise HTTPException(
+            410, "角色已退役（expert-pool M2）：专家由 packs/experts/ 单文件池管理，"
+                 "专家管理前端随 M3 落地")
+
+    @app.post("/api/tracks/{track}/roles")
+    def create_track_role(track: str, body: dict):
+        raise HTTPException(
+            410, "角色已退役（expert-pool M2）：专家由 packs/experts/ 单文件池管理，"
+                 "专家管理前端随 M3 落地")
+
+    @app.delete("/api/tracks/{track}/roles/{role_name}")
+    def delete_track_role(track: str, role_name: str):
+        raise HTTPException(
+            410, "角色已退役（expert-pool M2）：专家由 packs/experts/ 单文件池管理，"
+                 "管理端点见 /api/experts（M3）")
+
+    # ---- 专家池管理（expert-pool M3）：packs/experts/ 单文件池 CRUD ----
+
+    def _experts_base() -> Path:
+        return Path(app.state.packs_root) / "experts"
+
+    def _expert_view(name: str) -> dict:
+        """专家全字段读视图（管理 UI 编辑回填；raw 平铺解析，不应用轨变体）。
+        variant_<track>_<field> 重组回 {track: {field: value}}。
+
+        **控制器类智能体（controller-tool-select，2026-10-20 定稿）**：
+        它们的工具面历史上由代码常量决定、**不读** yaml 的 `tools`，于是设置页
+        对控制器一律回填 `tools: null` → 显示「全部（未限制）」54 个全勾，而
+        运行期真实只有 8 个（ARTEX 主控）。
+
+        用户诉求是**勾选启动**（自己决定开哪些），不是只读展示。故这里：
+
+        - `tools` 回填**当前实际生效的面**——yaml 有 `tools` 就用它，没有就
+          回落 `controller_tool_face()` 的代码默认。这样界面不再是「全部（未限制）」，
+          而是真实的 8 个勾上、其余不勾。
+        - `tools_runtime` 给出**可勾选候选全集**（`controller_tool_candidates`），
+          必须含 `artex_*` / `ctf_*` / `todo_write` / `call_expert`——它们不在
+          `AGENT_TOOLS` 里（走专用 dispatch 分支），不额外下发就永远勾不到。
+        - `tools_locked` 语义改为「这是控制器，候选由后端下发，UI 要合并
+          `AGENT_TOOLS ∪ tools_runtime`」——**不是**只读。
+        """
+        path = _experts_base() / f"{name}.yaml"
+        raw = _parse_expert_yaml(path)
+        variants: dict[str, dict] = {}
+        for k, v in raw.items():
+            if k.startswith("variant_"):
+                tr, _, field = k[len("variant_"):].partition("_")
+                variants.setdefault(tr, {})[field] = v
+        from core.chat.runtime import (controller_tool_candidates,
+                                       controller_tool_face)
+        # 设置页回填用**并集口径**（track=None）：yaml 的 `tools` 是跨轨共享
+        # 的一份清单，按单轨回填会把另一条轨的工具当成「未勾选」，保存即清掉。
+        default_face = controller_tool_face(name, None)
+        is_controller = default_face is not None
+        # 回填值：yaml 显式勾过就用它（含 []），否则用代码默认面。
+        yaml_tools = raw.get("tools")
+        if is_controller:
+            tools_view = (yaml_tools if isinstance(yaml_tools, list)
+                          else list(default_face or []))
+        else:
+            tools_view = yaml_tools
+        return {"id": name,
+                "name": raw.get("name") or name,
+                "description": raw.get("description"),
+                "persona": raw.get("persona"),
+                "tracks": raw.get("tracks"),
+                "skills": raw.get("skills"),
+                "knowledge": raw.get("knowledge"),
+                "tools": tools_view,
+                # 控制器：可勾选候选全集（含无 REGISTRY 条目的专属工具）。
+                # 非控制器为 None —— UI 直接用 AGENT_TOOLS 即可。
+                "tools_runtime": (controller_tool_candidates(name)
+                                  if is_controller else None),
+                # 语义 = 「这是控制器，候选集需合并后端下发的 tools_runtime」。
+                # **不是只读**：勾选照常提交并真实生效（yaml tools 是开关）。
+                "tools_controller": is_controller,
+                "mcp_servers": raw.get("mcp_servers"),
+                "max_steps": raw.get("max_steps"),
+                "protected": _yaml_flag(raw.get("protected")),
+                # 表单没有这俩的控件，但**必须回传**：全字段覆写的语义是
+                # 「请求体即文件最终态」，前端拿不到就带不回去，一保存就丢。
+                # （已踩两次：protected 让 _generalist 可被删、intent_free
+                # 让 worker 重新被意图闸卡住。）
+                "intent_free": _yaml_flag(raw.get("intent_free")),
+                "variants": variants,
+                "file": f"experts/{name}.yaml"}
+
+    def _validate_expert_body(body: ExpertSaveIn) -> None:
+        """写端点前置校验（宁严勿松，doctor 同口径前移）：tracks 合法轨、
+        variants 轨名/字段名、max_steps 正整数、skills 注册表存在
+        （doctor expert-skill-missing）、knowledge 方向存在。
+
+        task_types 不再校验（2026-10-21 退役）：字段已无运行时消费，校验只会
+        让旧客户端提交历史值时报 422；它会被序列化端直接忽略。"""
+        valid_tracks = {t["name"] for t in list_packs(app.state.packs_root, "track")}
+        bad = sorted(set(body.tracks or []) - valid_tracks)
+        if bad:
+            raise HTTPException(422, f"非法场景轨: {bad}（合法: {sorted(valid_tracks)}）")
+        for vt, fields in (body.variants or {}).items():
+            if vt not in valid_tracks:
+                raise HTTPException(422, f"轨变体非法场景轨: {vt}（合法: {sorted(valid_tracks)}）")
+            if not isinstance(fields, dict) or not fields:
+                raise HTTPException(422, f"轨变体 {vt} 必须是非空字段对象")
+            if any(not re.fullmatch(r"[a-z_]+", str(k)) for k in fields):
+                raise HTTPException(422, f"轨变体 {vt} 字段名非法（仅小写字母/下划线）")
+        if body.max_steps is not None and body.max_steps <= 0:
+            raise HTTPException(422, "max_steps 必须为正整数")
+        if body.skills:
+            reg = _loaded_registry()
+            unknown = sorted({s for s in body.skills if reg.get(s.strip()) is None})
+            if unknown:
+                raise HTTPException(422, f"未知技能: {unknown}（先建技能或修正拼写）")
+        if body.knowledge:
+            dirs = set(list_directions(app.state.packs_root))
+            unknown = sorted({d for d in body.knowledge if d.strip() not in dirs})
+            if unknown:
+                raise HTTPException(422, f"未知知识库方向: {unknown}（合法: {sorted(dirs)}）")
+
+    def _dump_expert_yaml(body: ExpertSaveIn) -> str:
+        """专家 yaml 序列化（平铺约定：key: value、内联列表 [a, b]、空值不落键
+        = null 语义）。值含 ": " 或行内注释风险时双引号包裹（解析端剥外层引号）。
+
+        能力白名单三件套（skills/tools/mcp_servers）例外：空列表必须落成
+        ``key: []``——勾选模式里「全不选」是明确的「一个都不启用」，
+        若按空值丢弃会退化成 null（全量），与界面语义相反。
+
+        ``tracks`` 同属此列（2026-10-25，tracks 语义反转后）：现在「不勾任何轨」
+        就是「不启用」，与 skills/tools 完全同构。此前它按普通空值丢弃，于是
+        设置页保存一次就把 ``tracks: [pentest, redteam, ctf]`` 整行抹掉，
+        专家静默掉出全部轨的专家池——``artex-controller.yaml`` 就是这么被清空的
+        （doctor 报 expert-track-empty 才暴露）。**这与下方 docstring 记载的
+        `intent_free` 事故是同一家族：yaml 有、表单有、代码在读，但序列化漏了。**
+
+        ``knowledge``（kb 方向）不在此列：它是两态字段，null 与 [] 都表示
+        「不限方向」（见 core/skills/experts.expert_directions），空列表照常丢弃。
+        """
+        _EMPTY_LIST_KEYS = {"skills", "tools", "mcp_servers", "tracks"}
+
+        def _emit(key: str, val: Any, lines: list[str]) -> None:
+            if val is None or val == "":
+                return
+            if isinstance(val, list):
+                if not val and key not in _EMPTY_LIST_KEYS:
+                    return
+                lines.append(f"{key}: [{', '.join(str(v).strip() for v in val)}]")
+                return
+            s = str(val).strip()
+            # 多行 persona/Markdown 必须使用 YAML block scalar；把整段文本包进
+            # 双引号会让换行和其中的引号破坏 YAML，保存后 reload 即变空。
+            if "\n" in s or "\r" in s:
+                normalized = s.replace("\r\n", "\n").replace("\r", "\n")
+                lines.append(f"{key}: |-")
+                lines.extend(f"  {line}" for line in normalized.split("\n"))
+                return
+            if ": " in s or " #" in s or s.startswith(("'", '"', "[", "{", "-", "?", "!", "&", "*")):
+                # 使用 JSON 字符串转义，确保 Markdown 中的引号不会破坏 YAML。
+                import json
+                s = json.dumps(s, ensure_ascii=False)
+            lines.append(f"{key}: {s}")
+        lines: list[str] = []
+        for key in ("name", "description", "tracks", "persona", "skills",
+                    "knowledge", "tools", "mcp_servers", "max_steps"):
+            _emit(key, getattr(body, key), lines)
+        # protected / intent_free 只落 `true`（缺省/False 不落键）。解析端
+        # _parse_inline_value 把 "false" 读成字符串 "false"（真值为 True），
+        # 落 false 会反转语义；而这两个标记都没有「关闭」的 UI 入口
+        # （protected 只能靠改文件取消，intent_free 亦然），不落键才是
+        # 「未启用」的正确表达。顺序沿用历史文件（protected 在前），
+        # 免得同一份 yaml 每保存一次就因键序抖动刷出无意义 diff。
+        if body.protected:
+            lines.append("protected: true")
+        if body.intent_free:
+            lines.append("intent_free: true")
+        for vt in sorted(body.variants or {}):
+            for field in sorted(body.variants[vt] or {}):
+                _emit(f"variant_{vt}_{field}", body.variants[vt][field], lines)
+        return "\n".join(lines) + "\n"
+
+    @app.get("/api/experts")
+    def list_all_experts(pid: str | None = None):
+        """全池清单（管理 UI；不按轨过滤，tracks 字段由前端分组/过滤）。
+        对话化编排器 M3（§4.4）：恒追加虚拟单例 {id:"orchestrator", kind:"virtual"}
+        ——不入 experts/*.yaml 文件池、不认领任务不执行命令、删不掉（运行态注册，
+        名字/persona 存项目 meta）；绑定页/组队选择器/管理面板按 kind 过滤。
+        带 pid 时 name 取该项目 meta.orchestrator_persona.display_name。"""
+        base = _experts_base()
+        rows = [] if not base.is_dir() else [
+            _expert_view(p.stem) for p in sorted(base.glob("*.yaml"))]
+        display = "编排器"
+        if pid:
+            try:
+                persona = (_project(pid).meta or {}).get("orchestrator_persona") or {}
+                display = str(persona.get("display_name") or "编排器")
+            except HTTPException:
+                pass  # 未知 pid 宽容：虚拟条目仍以缺省名返回
+        rows.append({"id": "orchestrator", "name": display, "kind": "virtual",
+                     "description": "编排器虚拟专家（不认领任务、不执行命令）",
+                     "tracks": None, "protected": True})
+        return rows
+
+    @app.get("/api/experts/{expert_id}")
+    def get_expert(expert_id: str):
+        path = _experts_base() / f"{expert_id}.yaml"
+        if not path.is_file():
+            raise HTTPException(404, f"专家不存在: {expert_id}")
+        return _expert_view(expert_id)
+
+    @app.post("/api/experts", status_code=201)
+    def create_expert(body: ExpertCreateIn):
+        """新建专家 yaml。重名 409；id 强制 ASCII slug（文件名/命令引用面）。"""
+        eid = body.id.strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,47}", eid):
+            raise HTTPException(422, f"非法专家 id: {eid}（小写字母/数字/连字符，≤48 字符）")
+        _validate_expert_body(body)
+        base = _experts_base()
+        with pack_write_lock():  # 存在性检查+写文件同一临界区（防并发重名）
+            dest = base / f"{eid}.yaml"
+            if dest.exists():
+                raise HTTPException(409, f"专家已存在: {eid}")
+            payload = body.model_copy(update={"name": body.name or eid})
+            base.mkdir(parents=True, exist_ok=True)
+            dest.write_text(_dump_expert_yaml(payload), encoding="utf-8")
+        return {"status": "ok", "id": eid, "file": f"experts/{eid}.yaml"}
+
+    @app.put("/api/experts/{expert_id}")
+    def update_expert(expert_id: str, body: ExpertSaveIn,
+                      auto: bool = Query(False, description="改动即存（自动保存）")):
+        """全字段覆写（表单即最终态）。_generalist 可编辑不可删。
+
+        ``protected`` / ``intent_free`` 是**文件属性而非表单字段**：请求体没带时
+        继承原值，不能被全字段覆写静默抹掉（2026-10-21 实测两次：UI 保存一次后
+        `_generalist` 的 `protected: true` 消失，DELETE 从 409 变 200；`worker.yaml`
+        的 `intent_free: true` 消失，worker 每次调工具又被要求先声明意图）。
+
+        ``auto=true``（设置页「改动即存」，2026-10-21 用户要求去掉保存按钮）：
+        相比手动保存加两道闸，**语义完全一致、只是不为无意义的写入留痕**：
+        1) 内容与原文件逐字节相同 → 直接返回 ``changed=false``，不备份、不写盘
+           （否则取消勾选又勾回来、输入后删回原样都会刷出一个「新版本」）；
+        2) 内容真的变了也按 ``_AUTO_HISTORY_MIN_INTERVAL`` 节流备份——自动保存
+           下每次击键都是一次 PUT，不节流会把 `.history` 从「版本历史」变成
+           「撤销栈」，回滚面板里全是中间态，真正想找回的旧版本反而被淹没。
+        """
+        path = _experts_base() / f"{expert_id}.yaml"
+        _validate_expert_body(body)
+        with pack_write_lock():
+            if not path.is_file():
+                raise HTTPException(404, f"专家不存在: {expert_id}")
+            current = path.read_text(encoding="utf-8")
+            payload = body
+            # 表单未暴露的标记字段：请求里是 None 才继承（显式传 false 尊重调用方）。
+            # 用 _yaml_flag 而非 bool()：盘上若被手改成 `false`，bool("false") 是
+            # True，会把「已关闭」的标记当开启再写回去。
+            if body.protected is None or body.intent_free is None:
+                raw = _parse_expert_yaml(path)
+                inherit: dict[str, Any] = {}
+                if body.protected is None:
+                    inherit["protected"] = _yaml_flag(raw.get("protected"))
+                if body.intent_free is None:
+                    inherit["intent_free"] = _yaml_flag(raw.get("intent_free"))
+                payload = body.model_copy(update=inherit)
+            text = _dump_expert_yaml(payload)
+            # 顶部说明注释必须拼回去（`_dump_expert_yaml` 按字段重建文件，注释
+            # 没有对应字段，否则打一个字就被抹掉）。只保留头部连续块，见
+            # `_leading_comments` 里为什么不保留全文注释。
+            head = _leading_comments(current)
+            if head:
+                text = head + text
+            if auto and text == current:
+                return {"status": "ok", "id": expert_id,
+                        "file": f"experts/{expert_id}.yaml", "changed": False}
+            _pack_history_backup(
+                path, min_interval=_AUTO_HISTORY_MIN_INTERVAL if auto else None)
+            path.write_text(text, encoding="utf-8")
+        return {"status": "ok", "id": expert_id,
+                "file": f"experts/{expert_id}.yaml", "changed": True}
+
+    @app.delete("/api/experts/{expert_id}")
+    def delete_expert(expert_id: str):
+        """删除专家：移入 experts/.history/trash/ 可恢复；protected 拒删。"""
+        path = _experts_base() / f"{expert_id}.yaml"
+        with pack_write_lock():
+            if not path.is_file():
+                raise HTTPException(404, f"专家不存在: {expert_id}")
+            # 必须走 _yaml_flag 而不是裸真值判断：盘上若写 `protected: false`，
+            # 解析出来是字符串 "false"（真值），会把「不受保护」读成「拒删」，
+            # 专家就永远删不掉了。与 update_expert 的继承逻辑同口径。
+            if _yaml_flag(_parse_expert_yaml(path).get("protected")):
+                raise HTTPException(409, f"受保护专家不可删除: {expert_id}")
+            dest = _trash_move(path)
+        return {"status": "ok", "id": expert_id, "trash": dest.name}
+
+    # ---- 场景档（expert-pool M4a）：tracks/<track>/profiles/ 只读清单 ----
+
+    @app.get("/api/tracks/{track}/profiles")
+    def list_track_profiles_ep(track: str):
+        """轨内置场景档清单（创建页选档数据源；档案=文件，写走 packs 直改）。"""
+        _check_name(track, "场景轨")
+        return load_track_profiles(app.state.packs_root, track)
+
+    @app.get("/api/tracks/{track}/task-types")
+    def get_track_task_types(track: str):
+        """轨任务类型注册表（task_types.yaml + 内置 generic）。"""
+        _check_name(track, "场景轨")
+        return load_task_types(app.state.packs_root, track)
+
+    # ---- 平台规则（文件即规则：删文件=停用、新建=扩展；owner 命中才注入；渗透独有） ----
+
+    @app.get("/api/platform-rules")
+    def list_platform_rules():
+        base = platform_rules_dir(app.state.packs_root)
+        if not base.is_dir():
+            return []
+        return [{"tag": f.stem, "content": f.read_text(encoding="utf-8")}
+                for f in sorted(base.glob("*.md"))]
+
+    @app.put("/api/platform-rules/{tag}")
+    def update_platform_rule(tag: str, body: FileContentIn):
+        _check_name(tag, "owner 标签")
+        path = platform_rules_dir(app.state.packs_root) / f"{tag}.md"
+        with pack_write_lock():
+            _pack_history_backup(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body.content, encoding="utf-8")
+        return {"status": "ok", "tag": tag}
+
+    @app.delete("/api/platform-rules/{tag}")
+    def delete_platform_rule(tag: str):
+        path = platform_rules_dir(app.state.packs_root) / f"{tag}.md"
+        with pack_write_lock():
+            if not path.is_file():
+                raise HTTPException(404, f"平台规则不存在: {tag}")
+            _pack_history_backup(path)  # 删除也留回滚件
+            path.unlink()
+        return {"status": "ok", "tag": tag}
+
+    # ---- 评级与价值口径（F11，同「文件即规则」哲学；渗透独有；
+    #      注入带判级硬指令，rating_basis 落 findings.rating_basis） ----
+
+    @app.get("/api/ratings")
+    def list_ratings():
+        base = rating_dir(app.state.packs_root)
+        if not base.is_dir():
+            return []
+        return [{"tag": f.stem, "content": f.read_text(encoding="utf-8")}
+                for f in sorted(base.glob("*.md"))]
+
+    @app.put("/api/ratings/{tag}")
+    def update_rating(tag: str, body: FileContentIn):
+        _check_name(tag, "评级标签")
+        path = rating_dir(app.state.packs_root) / f"{tag}.md"
+        with pack_write_lock():
+            _pack_history_backup(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body.content, encoding="utf-8")
+        return {"status": "ok", "tag": tag}
+
+    @app.delete("/api/ratings/{tag}")
+    def delete_rating(tag: str):
+        path = rating_dir(app.state.packs_root) / f"{tag}.md"
+        with pack_write_lock():
+            if not path.is_file():
+                raise HTTPException(404, f"评级规则不存在: {tag}")
+            _pack_history_backup(path)  # 删除也留回滚件
+            path.unlink()
+        return {"status": "ok", "tag": tag}
+
+    # ---- pack doctor（角色/技能/知识源静态体检，三级 error/warning/info） ----
+
+    def _route_zero_hit_issues() -> list[dict]:
+        """K7 路由效果追踪（2026-09-20；2026-09-24 修正为真使用口径）：扫
+        workspaces 各项目 blackboard.db——skill.routed 的 route_points（真注入过，
+        route_index>0）与 kb.open 的 module（手册真被打开）逐项目配对；point 被
+        注入过且其 kb 在任一项目被打开过才算 used，否则 → info issue。
+
+        旧实现 used 只由 route_points 构建，实际报的是「从未被注入」，注入后
+        被忽略的条目永远报不出来。
+
+        只读旁路（直接 sqlite mode=ro，不经 Blackboard），扫不动就静默跳过——
+        doctor 的静态体检永远不能被动态统计拖垮。"""
+        from core.skills.routeindex import parse_entries
+        from core.skills.doctor import Issue, _LEVEL_ORDER
+        root = Path(app.state.packs_root)
+        index_file = root / "kb" / "route_index.yaml"
+        if not index_file.is_file():
+            return []
+        try:
+            point_kb = {e.point: e.kb for e in parse_entries(
+                index_file.read_text(encoding="utf-8"))}
+        except Exception:  # noqa: BLE001 —— 坏索引由静态体检报，本段跳过
+            return []
+        all_injected: set[str] = set()
+        used: set[str] = set()
+        ws = Path(workspace_root)
+        for proj_file in ws.glob("*/project.json"):
+            db = proj_file.parent / "blackboard.db"
+            if not db.is_file():
+                continue
+            try:
+                conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                try:
+                    routed = conn.execute(
+                        "SELECT payload FROM events WHERE kind='skill.routed'"
+                    ).fetchall()
+                    opened_rows = conn.execute(
+                        "SELECT payload FROM events WHERE kind='kb.open'"
+                    ).fetchall()
+                finally:
+                    conn.close()
+            except (sqlite3.Error, OSError):
+                continue
+
+            def _payloads(rows):
+                out = []
+                for (raw,) in rows:
+                    try:
+                        p = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(p, dict):
+                        out.append(p)
+                return out
+
+            injected = set()
+            for p in _payloads(routed):
+                # 只统计真的注入过路由索引条目的事件（route_index>0）
+                if int(p.get("route_index") or 0) > 0:
+                    pts = p.get("route_points")
+                    if isinstance(pts, list):
+                        injected.update(str(x) for x in pts if x)
+            opened = {str(p.get("module") or "").strip().replace("\\", "/")
+                      for p in _payloads(opened_rows)}
+            all_injected.update(injected)
+            for point in injected:
+                kb = point_kb.get(point)
+                if kb and kb in opened:
+                    used.add(point)
+        issues: list[Issue] = []
+        for point in sorted(all_injected - used):
+            dom = (point_kb.get(point) or "").split("/", 1)[0]
+            issues.append(Issue(
+                "info", "route-index-zero-hit",
+                f"kb/route_index.yaml:{dom}",
+                f"测试点「{point}」→ {point_kb.get(point)}：曾被注入路由索引"
+                "但对应手册从未被 kb_open 打开（提示被忽略，考虑精简触发词"
+                "或合并条目）"))
+        return [i.__dict__ for i in sorted(
+            issues, key=lambda x: (_LEVEL_ORDER[x.level], x.code, x.target))]
+
+    def _kb_cleanup_issues() -> list[dict]:
+        """经验沉淀 M3「kb 模块待清理建议」段：跨项目聚合 kb 模块三象限反馈
+        （traces.kb_module_feedback 同源口径）——长期打开但从无 verified 贡献
+        （正向零）提示人工复核；真失败任务窗内打开多次（甲负向反馈）标「优先」。
+        阈值：opened≥3 或 negative≥2 才报（打开且失败≠手册误导，试错正常，
+        宁少勿滥）；处置（降权/归档/删除）一律走提案制人工决策，只呈现不自动动。
+
+        只读旁路照抄 _route_zero_hit_issues 先例（sqlite mode=ro，扫不动静默跳过）。"""
+        from core.blackboard.traces import kb_module_feedback
+        from core.skills.doctor import Issue, _LEVEL_ORDER
+        agg: dict[str, dict] = {}
+        ws = Path(workspace_root)
+        for proj_file in ws.glob("*/project.json"):
+            db = proj_file.parent / "blackboard.db"
+            if not db.is_file():
+                continue
+            try:
+                conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                conn.row_factory = sqlite3.Row
+                try:
+                    rows = conn.execute("SELECT id FROM projects").fetchall()
+                    for r in rows:
+                        for m, d in kb_module_feedback(conn, r["id"]).items():
+                            a = agg.setdefault(
+                                m, {"opened": 0, "positive": 0, "negative": 0})
+                            for k in a:
+                                a[k] += d.get(k, 0)
+                finally:
+                    conn.close()
+            except (sqlite3.Error, OSError):
+                continue
+        issues: list[Issue] = []
+        for m, d in sorted(agg.items()):
+            if d["positive"] > 0:
+                continue  # 有 verified 贡献，不在清理视野
+            if d["opened"] < 3 and d["negative"] < 2:
+                continue
+            priority = d["negative"] >= 2
+            issues.append(Issue(
+                "info", "kb-cleanup-candidate", f"kb:{m}",
+                f"kb 模块 {m}：{'正向零贡献且负向多次（优先复核）' if priority else '正向零贡献'}"
+                f"——累计打开 {d['opened']} 次 / 真失败任务中打开 {d['negative']} 次 / "
+                "verified 贡献 0。仅提示人工复核（打开且失败≠手册误导，试错正常）；"
+                "降权/归档/删除走提案制人工决策"))
+        return [i.__dict__ for i in sorted(
+            issues, key=lambda x: (_LEVEL_ORDER[x.level], x.code, x.target))]
+
+    @app.get("/api/packs/doctor")
+    def packs_doctor():
+        report = diagnose(app.state.packs_root,
+                          tools_root=app.state.tools_root).to_dict()
+        try:  # K7 零命中统计只增补 info，失败不拖垮静态体检
+            existing = {x["target"] for x in report["issues"]}
+            extra = [i for i in _route_zero_hit_issues() if i["target"] not in existing]
+            report["issues"] += extra
+            report["counts"]["info"] += len(extra)
+            report["issues"].sort(key=lambda x: ({"error": 0, "warning": 1, "info": 2}[x["level"]],
+                                                 x["code"], x["target"]))
+        except Exception:  # noqa: BLE001
+            pass
+        try:  # 经验沉淀 M3：kb 模块待清理建议（info，失败不拖垮静态体检）
+            extra = [i for i in _kb_cleanup_issues()
+                     if i["target"] not in {x["target"] for x in report["issues"]}]
+            report["issues"] += extra
+            report["counts"]["info"] += len(extra)
+            report["issues"].sort(key=lambda x: ({"error": 0, "warning": 1, "info": 2}[x["level"]],
+                                                 x["code"], x["target"]))
+        except Exception:  # noqa: BLE001
+            pass
+        return report
+
+    # ---- .history 版本管理（列版本 / 看 diff / 一键回滚；兼容两种备份命名） ----
+
+    @app.get("/api/packs/history")
+    def packs_history_list(file: str = Query(..., description="packs 内相对路径")):
+        path = _resolve_managed_file(app, file)
+        versions = _history_versions(path)
+        return {"file": file, "exists": path.is_file(), "versions": versions}
+
+    @app.get("/api/packs/history/diff")
+    def packs_history_diff(file: str = Query(...), version: str = Query(...)):
+        path = _resolve_managed_file(app, file)
+        _check_name(version, "版本")
+        backup = path.parent / ".history" / version
+        if not backup.is_file() or os.path.commonpath(
+                [str((path.parent / ".history").resolve()),
+                 str(backup.resolve())]) != str((path.parent / ".history").resolve()):
+            raise HTTPException(404, f"历史版本不存在: {version}")
+        old_lines = backup.read_text(encoding="utf-8").splitlines(keepends=True)
+        new_lines = (path.read_text(encoding="utf-8").splitlines(keepends=True)
+                     if path.is_file() else [])
+        diff = "".join(difflib.unified_diff(
+            old_lines, new_lines,
+            fromfile=f"{version}（历史版）", tofile=f"{path.name}（当前）"))
+        return {"file": file, "version": version, "diff": diff}
+
+    @app.post("/api/packs/history/rollback")
+    def packs_history_rollback(file: str = Query(...), version: str = Query(...)):
+        """一键回滚：先把当前版再备份一次（保证可往返），再用历史版覆盖。"""
+        path = _resolve_managed_file(app, file)
+        _check_name(version, "版本")
+        hist = path.parent / ".history"
+        backup = hist / version
+        if not backup.is_file() or os.path.commonpath(
+                [str(hist.resolve()), str(backup.resolve())]) != str(hist.resolve()):
+            raise HTTPException(404, f"历史版本不存在: {version}")
+        with pack_write_lock():  # 回滚=备份当前+覆盖，须与其他写互斥防覆盖
+            current_backup = _pack_history_backup(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup, path)
+        return {"status": "ok", "file": file, "rolled_back": version,
+                "current_backed_up": current_backup.name if current_backup else None}
+
+    # ---- 路由试算器（调试 skill 命中：调 SkillRouter 真评分） ----
+
+    @app.post("/api/skills/route-preview")
+    def route_preview(body: RoutePreviewIn):
+        track = body.track
+        if not track and body.domain:  # 旧客户端兼容
+            track = LEGACY_DOMAIN_MAP.get(body.domain, (body.domain, []))[0]
+        role_skills = None
+        if body.role and track:
+            try:
+                role_skills = load_expert(
+                    app.state.packs_root, body.role, track).get("skills")
+            except FileNotFoundError:
+                raise HTTPException(404, f"专家不存在: {track}/{body.role}")
+        hits = SkillRouter(registry=_loaded_registry()).route(
+            query=body.query, features=body.features,
+            file_features=body.file_features, labels=body.labels,
+            role_skills=role_skills, top_k=10,
+            include_disabled=body.include_disabled)
+        return [{"name": h.skill.name,
+                 "description": h.skill.description, "enabled": h.skill.enabled,
+                 "score": h.score, "matched": h.matched,
+                 "breakdown": h.breakdown} for h in hits]
+
+    # ---- kb 本地基线（C2：列举/读/新建/改写/删除/改名联动/版本/引用） ----
+    # 纪律：中文多级目录允许，限 .md，1 MiB 上限；写经 writing.py 同一把 packs 锁。
+
+    def _kb_error_map(fn, *args, status: int = 422, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except writing.KbError as e:
+            raise HTTPException(status, str(e))
+
+    @app.get("/api/capabilities/{cap}/kb")
+    def kb_list(cap: str):
+        return {"cap": cap, "sources": _kb_error_map(
+            writing.list_kb, app.state.packs_root, cap)}
+
+    @app.get("/api/capabilities/{cap}/kb/routes")
+    def kb_routes(cap: str):
+        """kb 任务导航路由表（kb/route.json 原样；前端 KbTree「按任务类型」分组）。
+
+        `cap` 可为「全部」哨兵（writing.KB_ALL_CAP）：合并全部方向的 route.json
+        （前缀本就是全局形态 `<域>/…`，合并后与聚合树的带前缀路径同形）。"""
+        from core.skills.kbindex import load_kb_routes
+        return {"cap": cap, "routes": load_kb_routes(
+            app.state.packs_root,
+            writing.kb_directions_for(app.state.packs_root, cap))}
+
+    @app.get("/api/campaign-memory")
+    def campaign_memory(limit: int = Query(50, ge=1, le=200)):
+        """⑥ 战役记忆全局库浏览（按时间倒序；召回注入在编排 tick 态势里）。"""
+        return {"items": app.state.campaign.list_recent(limit)}
+
+    @app.get("/api/workspace-hygiene")
+    def workspace_hygiene():
+        """工作区卫生体检（workspace-hygiene D6，纯只读不处置）：①workspaces 根
+        陌生条目（无 project.json 的目录/散文件，白名单 .trash/CLAUDE.md——
+        campaign.db 迁移失败降级留老位置时从这里可见）；②各项目膨胀目录
+        （.tmp/scratch/spill/browser-profile 超阈值报条目+大小）；③.trash 规模。
+        处置入口指向已有能力（scratch/clear、回收站手动移回），端点零写副作用。"""
+        def _du_mb(path: Path) -> float:
+            total = 0
+            for p in path.rglob("*"):
+                try:
+                    if p.is_file():
+                        total += p.stat().st_size
+                except OSError:
+                    continue
+            return total / (1024 * 1024)
+
+        ws = Path(workspace_root)
+        strays: list[dict] = []
+        projects: list[dict] = []
+        try:
+            entries = sorted(ws.iterdir(), key=lambda p: p.name)
+        except OSError:
+            entries = []
+        for entry in entries:
+            if entry.name == ".trash":
+                continue
+            if entry.is_dir():
+                if (entry / "project.json").is_file():
+                    bloat = []
+                    for d in (".tmp", "scratch", "spill", "browser-profile"):
+                        p = entry / d
+                        if not p.is_dir():
+                            continue
+                        mb = _du_mb(p)
+                        if mb >= HYGIENE_BLOAT_MB:
+                            bloat.append({
+                                "dir": d, "mb": round(mb, 1),
+                                "level": "error" if mb >= HYGIENE_BLOAT_ERROR_MB
+                                else "warning"})
+                    projects.append({"slug": entry.name, "bloat": bloat})
+                else:
+                    strays.append({"name": entry.name, "kind": "dir", "size": 0})
+            else:
+                if entry.name == "CLAUDE.md":
+                    continue  # 契约内合法文件
+                try:
+                    size = entry.stat().st_size
+                except OSError:
+                    size = 0
+                strays.append({"name": entry.name, "kind": "file", "size": size})
+        trash_dir = ws / ".trash"
+        trash_count, trash_mb = 0, 0.0
+        if trash_dir.is_dir():
+            try:
+                trash_count = sum(1 for _ in trash_dir.iterdir())
+            except OSError:
+                pass
+            trash_mb = round(_du_mb(trash_dir), 1)
+        bloat_rows = [b for pr in projects for b in pr["bloat"]]
+        return {
+            "root": str(ws),
+            "strays": strays,
+            "projects": projects,
+            "trash": {"count": trash_count, "mb": trash_mb},
+            "summary": {
+                "strays": len(strays),
+                "bloats": len(bloat_rows),
+                "errors": sum(1 for b in bloat_rows if b["level"] == "error"),
+            },
+        }
+
+    @app.get("/api/capabilities/{cap}/kb/search")
+    def kb_search(cap: str, q: str = Query(""), limit: int = Query(50, ge=1, le=200),
+                  tag: str | None = Query(None, description="分面标签过滤"
+                      "（K5 升级项 C，phase/vuln_class 值，如 sqli、jwt、recon）")):
+        """kb 正文搜索。`cap` 可为「全部」哨兵（writing.KB_ALL_CAP）：逐方向检索后
+        合并，命中路径补方向前缀成全局 module 形态（与聚合树/`kb_open` 同口径），
+        排序与单方向口径一致（命中次数降序、同分按路径）再截断到 limit。
+
+        注意：**这里不做轨道加权**（知识库工作台是人工浏览，权重只作用于 Agent
+        侧检索，见 core/skills/taxonomy.TRACK_KB_DIRECTION_WEIGHTS）。"""
+        directions = writing.kb_directions_for(app.state.packs_root, cap)
+        if len(directions) == 1:
+            results = _kb_error_map(writing.search_kb, app.state.packs_root,
+                                    directions[0], q, limit, tag=tag)
+        else:
+            results = []
+            for direction in directions:
+                for row in _kb_error_map(writing.search_kb, app.state.packs_root,
+                                         direction, q, limit, tag=tag):
+                    results.append({**row, "path": f"{direction}/{row['path']}",
+                                    "cap": direction})
+            results.sort(key=lambda r: (-r.get("matches", 0), r["path"]))
+            results = results[:max(1, limit)]
+        return {"cap": cap, "q": q, "tag": tag, "results": results}
+
+    @app.get("/api/capabilities/{cap}/kb/file")
+    def kb_read(cap: str, path: str = Query(...)):
+        target = _kb_error_map(writing.resolve_kb, app.state.packs_root, cap, path)
+        if not target.path.is_file():
+            raise HTTPException(404, f"kb 文件不存在: {target.module}")
+        hits = refs_mod.find_module_refs(app.state.packs_root, target.module)
+        return {"cap": cap, "path": target.module, "source": target.source.id,
+                "size": target.path.stat().st_size,
+                "content": target.path.read_text(encoding="utf-8"),
+                "refs": [h.to_dict() for h in hits]}
+
+    @app.post("/api/capabilities/{cap}/kb/file", status_code=201)
+    def kb_create(cap: str, body: KbWriteIn):
+        target = _kb_error_map(writing.resolve_kb, app.state.packs_root, cap, body.path)
+        if target.path.exists():
+            raise HTTPException(409, f"文件已存在: {target.module}（改写请用 PUT）")
+        out = _kb_error_map(writing.write_kb_file, app.state.packs_root, cap,
+                            body.path, body.content, create=True)
+        return {"status": "ok", **out}
+
+    @app.put("/api/capabilities/{cap}/kb/file")
+    def kb_update(cap: str, body: KbWriteIn):
+        target = _kb_error_map(writing.resolve_kb, app.state.packs_root, cap, body.path)
+        if not target.path.is_file():
+            raise HTTPException(404, f"文件不存在: {target.module}（新建请用 POST）")
+        out = _kb_error_map(writing.write_kb_file, app.state.packs_root, cap,
+                            body.path, body.content, create=False)
+        return {"status": "ok", **out}
+
+    @app.delete("/api/capabilities/{cap}/kb/file")
+    def kb_delete(cap: str, path: str = Query(...), force: bool = False):
+        target = _kb_error_map(writing.resolve_kb, app.state.packs_root, cap, path)
+        if not target.path.is_file():
+            raise HTTPException(404, f"文件不存在: {target.module}")
+        hits = refs_mod.find_module_refs(app.state.packs_root, target.module)
+        if hits and not force:
+            raise HTTPException(
+                409, {"message": f"文件被 {len(hits)} 处引用，默认拒绝删除；"
+                                 "确认后带 force=true 强删（引用会悬空，请先改名联动或修文档）",
+                      "refs": [h.to_dict() for h in hits]})
+        out = _kb_error_map(writing.delete_kb_file, app.state.packs_root, cap, path)
+        return {"status": "ok", **out, "refs": [h.to_dict() for h in hits]}
+
+    @app.post("/api/capabilities/{cap}/kb/rename")
+    def kb_rename(cap: str, body: KbRenameIn):
+        """同源改名 + 全仓引用完整路径替换（被改文件各自备份），同一临界区完成。"""
+        try:
+            with pack_write_lock():
+                move = writing.rename_kb_move(
+                    app.state.packs_root, cap, body.path, body.new_path)
+                cascade = refs_mod.rewrite_module(
+                    app.state.packs_root, cap, body.path, body.new_path)
+        except writing.KbError as e:
+            raise HTTPException(422, str(e))
+        return {"status": "ok", **move, **cascade}
+
+    @app.get("/api/capabilities/{cap}/kb/versions")
+    def kb_versions(cap: str, path: str = Query(...)):
+        return {"path": path,
+                "versions": _kb_error_map(
+                    writing.kb_versions, app.state.packs_root, cap, path)}
+
+    @app.get("/api/capabilities/{cap}/kb/diff")
+    def kb_diff(cap: str, path: str = Query(...), version: str = Query(...)):
+        try:
+            target = writing.resolve_kb(app.state.packs_root, cap, path)
+            backup = writing.kb_version_path(app.state.packs_root, cap, path, version)
+        except writing.KbError as e:
+            raise HTTPException(422, str(e))
+        if not backup.is_file():
+            raise HTTPException(404, f"历史版本不存在: {version}")
+        old_lines = backup.read_text(encoding="utf-8").splitlines(keepends=True)
+        new_lines = (target.path.read_text(encoding="utf-8").splitlines(keepends=True)
+                     if target.path.is_file() else [])
+        return {"path": path, "version": version,
+                "diff": "".join(difflib.unified_diff(
+                    old_lines, new_lines,
+                    fromfile=f"{version}（历史版）", tofile=f"{path}（当前）"))}
+
+    @app.post("/api/capabilities/{cap}/kb/rollback")
+    def kb_rollback(cap: str, path: str = Query(...), version: str = Query(...)):
+        try:
+            out = writing.rollback_kb_file(
+                app.state.packs_root, cap, path, version)
+        except writing.KbError as e:
+            # 版本不存在语义上是 404；路径/版本名非法才 422
+            if "不存在" in str(e):
+                raise HTTPException(404, str(e))
+            raise HTTPException(422, str(e))
+        return {"status": "ok", **out}
+
+    @app.get("/api/capabilities/{cap}/kb/refs")
+    def kb_refs(cap: str, path: str = Query(...)):
+        target = _kb_error_map(writing.resolve_kb, app.state.packs_root, cap, path)
+        hits = refs_mod.find_module_refs(app.state.packs_root, target.module)
+        return {"path": target.module, "count": len(hits),
+                "refs": [h.to_dict() for h in hits]}
+
+    # ---- 统一变更提案（C4：skill edit / kb 四模式，只落 pending，人类审批） ----
+
+    def _proposal_event_payload(p: dict, **extra) -> dict:
+        return {"id": p["id"], "kind": p["target"].get("kind"),
+                "mode": p["mode"], "origin": p.get("origin"),
+                "target": p["target"], "summary": p.get("summary"), **extra}
+
+    @app.post("/api/proposals", status_code=201)
+    def proposal_create(body: ProposalIn):
+        payload = body.model_dump(exclude={"origin"})
+        try:
+            p = proposals_mod.create_proposal(
+                app.state.packs_root, payload, origin=body.origin)
+        except (ProposalError, writing.KbError) as e:
+            raise HTTPException(422, str(e))
+        if body.project:
+            try:
+                _project(body.project).bb.append_event(
+                    body.project, "proposal.created",
+                    _proposal_event_payload(p), author=body.origin)
+            except HTTPException:
+                pass
+        return p
+
+    @app.get("/api/proposals")
+    def proposal_list(status: str | None = Query(None)):
+        if status is not None and status not in {"pending", "approved", "rejected"}:
+            raise HTTPException(422, f"非法状态过滤: {status}")
+        return proposals_mod.list_proposals(app.state.packs_root, status)
+
+    # 注意：必须注册在 /api/proposals/{pid} 之前，否则被路径参数路由吃掉
+    # （与 /api/skills/vocab 同一坑）。
+    @app.get("/api/proposals/rules")
+    def proposal_rules(pid: str | None = None):
+        """知识库迭代的触发规则（「变更提案」页展示用）。
+
+        规则表与判定逻辑同源（core/skills/kbiteration.TRIGGER_RULES），页面看到的
+        阈值就是实际生效的阈值。`pid` 给出时附带该项目当前的开关状态。
+        """
+        from core.skills import kbiteration
+        doc = kbiteration.rules_doc()
+        doc["enabled"] = None
+        if pid:
+            try:
+                proj = _project(pid)
+                doc["enabled"] = kbiteration.is_enabled(proj.meta.get("config"))
+            except HTTPException:
+                doc["enabled"] = None
+        return doc
+
+    @app.get("/api/proposals/{pid}")
+    def proposal_detail(pid: str):
+        try:
+            return proposals_mod.proposal_detail(app.state.packs_root, pid)
+        except ProposalStateError as e:
+            raise HTTPException(404, str(e))
+
+    def _get_proposal_or_404(pid: str) -> dict:
+        try:
+            return proposals_mod.get_proposal(app.state.packs_root, pid)
+        except ProposalStateError as e:
+            raise HTTPException(404 if "不存在" in str(e) else 409, str(e))
+
+    @app.post("/api/proposals/{pid}/apply")
+    def proposal_apply(pid: str, body: ProposalDecisionIn):
+        p = _get_proposal_or_404(pid)
+        try:
+            out = proposals_mod.apply_proposal(
+                app.state.packs_root, pid, body.decided_by)
+        except ProposalStateError as e:
+            raise HTTPException(409, str(e))
+        except (ProposalError, writing.KbError) as e:
+            raise HTTPException(422, f"应用前复核失败: {e}")
+        if p.get("project"):
+            try:
+                _project(p["project"]).bb.append_event(
+                    p["project"], "proposal.applied",
+                    _proposal_event_payload(p, decided_by=body.decided_by),
+                    author=body.decided_by)
+            except HTTPException:
+                pass
+        return out
+
+    @app.post("/api/proposals/{pid}/reject")
+    def proposal_reject(pid: str, body: ProposalDecisionIn):
+        p = _get_proposal_or_404(pid)
+        try:
+            out = proposals_mod.reject_proposal(
+                app.state.packs_root, pid, body.decided_by, body.note)
+        except ProposalStateError as e:
+            raise HTTPException(409, str(e))
+        if p.get("project"):
+            try:
+                _project(p["project"]).bb.append_event(
+                    p["project"], "proposal.rejected",
+                    _proposal_event_payload(p, decided_by=body.decided_by,
+                                            note=body.note),
+                    author=body.decided_by)
+            except HTTPException:
+                pass
+        return out
+
+    @app.post("/api/proposals/{pid}/revise")
+    def proposal_revise(pid: str, body: ProposalReviseIn):
+        _get_proposal_or_404(pid)
+        try:
+            return proposals_mod.revise_proposal(
+                app.state.packs_root, pid, body.by, body.changes, body.note)
+        except ProposalStateError as e:
+            raise HTTPException(409, str(e))
+        except (ProposalError, writing.KbError) as e:
+            raise HTTPException(422, str(e))
+
+    # ---- 复盘沉淀（C4）：planner_llm 后台复盘任务 → 逐条校验落 pending 提案 ----
+
+    @app.post("/api/sessions/{sid}/review")
+    def session_review_job(sid: str):
+        # F8 会话级复盘：单个会话对它跑过的任务复盘（取代项目级 review-proposals）
+        pid = _pid_of_session(sid)  # 不存在的会话 → 404
+        proj = _project(pid)
+        sess = proj.bb.get_session(sid)
+        _exec, plan_llm = _llms()  # 无 key/无启用供应商 → 503
+        if plan_llm is None:
+            raise HTTPException(503, "planner LLM 未配置，复盘沉淀不可用")
+
+        def _run() -> dict:
+            bb, root = proj.bb, app.state.packs_root
+            # 会话级事件流（kb.open/命令/路由/发现），天然有界
+            events = bb.recent_events(pid, session_id=sid, limit=300)
+            kb_opens = [{"ts": e.get("created_at", ""),
+                         "module": e.get("payload", {}).get("module"),
+                         "source": e.get("payload", {}).get("source")}
+                        for e in events if e.get("kind") == "kb.open"]
+            cmd_log = [{"kind": e.get("kind"), "ts": e.get("created_at", ""),
+                        "detail": json.dumps(e.get("payload", {}), ensure_ascii=False)[:200]}
+                       for e in events
+                       if e.get("kind") in ("command", "command.result", "skill.routed")]
+            # 工作单元 = 本会话承接的 Team 成员执行（任务机制退役，2026-10-06）：
+            # 执行履历在 execution_audits（带 outcome），team_run_members 无 outcome 列。
+            runs_view = [{"objective": (r["objective"] or "")[:300],
+                          "role": r["role"],
+                          "status": r["status"],
+                          "outcome": (r["outcome"] or "")[:300]}
+                         for r in bb.conn.execute(
+                             "SELECT objective, role, status, outcome FROM execution_audits"
+                             " WHERE session_id=? ORDER BY created_at, execution_id",
+                             (sid,)).fetchall()]
+            findings_view = [{"title": f.get("title", ""),
+                              "vuln_class": f.get("vuln_class", ""),
+                              "severity": f.get("severity"),
+                              "status": f.get("status")}
+                             for f in bb.list_findings(pid) if f.get("author") == sid][:50]
+            # 显式文件清单：LLM 只能在清单内给路径，防猜名（越界提案校验时也会被拒）
+            # expert-pool M2：能力面按 directions_effective 推导（专家绑定项目同口径）
+            eff_caps = directions_effective(
+                app.state.packs_root, proj.track, proj.experts,
+                fallback=proj.capabilities)
+            file_list: dict[str, list[str]] = {}
+            for cap in eff_caps:
+                try:
+                    file_list[cap] = [f["path"]
+                                      for src in writing.list_kb(root, cap)
+                                      for f in src["files"]]
+                except writing.KbError:
+                    continue
+            skills_list = [s.name for s in _loaded_registry().all()]
+            system_msg = (
+                "你是安全行动复盘编辑。基于一次会话执行的证据（该会话承接的团队执行、"
+                "跑过的命令、引用过的文档、产出的发现），提出对知识库/技能文档的沉淀提案。"
+                "严格规则：(1) 仅限三种情形——文档互相矛盾、文档缺失、手法已被本次任务"
+                "验证有效；(2) 路径只能从给出的文件清单里选，禁止猜路径；"
+                "新经验一律 create 新 .md 文件，禁止覆盖/翻译英文原文；技能只许 edit；"
+                "(3) 每条必须在 reason 附任务证据；(4) 无值得沉淀的内容就返回空列表。"
+                '只输出 JSON：{"proposals":[{"kind":"kb|skill","mode":"edit|create|rename|delete",'
+                '"target":{...},"content":"...","summary":"≤300字","reason":"证据"}]}')
+            user_msg = json.dumps(
+                {"directions": eff_caps,
+                 "session": {"id": sid, "role": sess.get("role")},
+                 "kb_files": file_list, "skills": skills_list,
+                 "kb_open_sequence": kb_opens[-50:],
+                 "command_log": cmd_log[-100:],
+                 "runs": runs_view, "findings": findings_view},
+                ensure_ascii=False)
+            resp = plan_llm.chat(
+                [{"role": "user", "content": user_msg}], system=system_msg)
+            text = (resp.text or "").strip()
+            if text.startswith("```"):
+                text = re.sub(r"^```[a-zA-Z]*\n?", "", text).strip()
+                text = re.sub(r"\n?```$", "", text).strip()
+            m = re.search(r"\{.*\}", text, re.S)
+            try:
+                data = json.loads(m.group(0) if m else text)
+            except (json.JSONDecodeError, ValueError):
+                return {"landed": [], "rejected": [],
+                        "error": "LLM 输出不是合法 JSON", "raw_head": text[:500]}
+            landed, rejected = [], []
+            for item in (data.get("proposals") or [])[:10]:
+                target = item.get("target") if isinstance(item, dict) else None
+                if not isinstance(target, dict):
+                    rejected.append({"summary": str(item)[:120],
+                                     "error": "target 不是对象"})
+                    continue
+                payload = {"target": {"kind": item.get("kind"), **target},
+                           "mode": item.get("mode"),
+                           "content": item.get("content"),
+                           "summary": item.get("summary", ""),
+                           "reason": item.get("reason", ""),
+                           "project": pid, "task": item.get("task"),
+                           "evidence": "复盘 Job：基于本会话命令/文档引用/任务成败/findings"}
+                try:
+                    p = proposals_mod.create_proposal(root, payload, origin="review")
+                except (ProposalError, writing.KbError) as e:
+                    rejected.append({"summary": str(item.get("summary"))[:120],
+                                     "error": str(e)})
+                    continue
+                bb.append_event(pid, "proposal.created",
+                                _proposal_event_payload(p), author="review")
+                landed.append({"id": p["id"], "summary": p["summary"]})
+            return {"landed": landed, "rejected": rejected}
+
+        return {"job_id": app.state.jobs.submit(
+            "session-review", _run, meta={"project_id": pid, "session_id": sid})}
+
+    # ---- MCP 配置层（运行时工具桥后续批次；本端点只管 config/mcp.json） ----
+
+    @app.get("/api/mcp")
+    def get_mcp():
+        if not MCP_CONFIG_PATH.is_file():
+            return {"servers": []}
+        return json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    @app.put("/api/mcp")
+    def update_mcp(body: McpConfigIn):
+        from core.tools.decompiler import _is_loopback_url
+
+        names = [s.name for s in body.servers]
+        if len(names) != len(set(names)):
+            raise HTTPException(422, "MCP server 名称重复")
+        for s in body.servers:
+            if not _NAME_RE.fullmatch(s.name):
+                raise HTTPException(422, f"非法 MCP server 名称: {s.name}")
+            bad_domains = [d for d in s.domains if d not in _MCP_DOMAIN_WHITELIST]
+            if bad_domains:
+                raise HTTPException(
+                    422, f"MCP server {s.name} 含未登记领域: {bad_domains}"
+                         f"（白名单 {sorted(_MCP_DOMAIN_WHITELIST)}；新域消费时先在 app.py 登记）")
+            is_http = s.transport in _MCP_TRANSPORTS_HTTP
+            if is_http:
+                if not s.url:
+                    raise HTTPException(422, f"MCP server {s.name} 为 http 传输但 url 为空")
+                if not _is_loopback_url(s.url):
+                    # 红线：平台只连本机 MCP（IDA 进程内插件），不连远端
+                    raise HTTPException(422, f"MCP server {s.name} 的 url 必须是本机 loopback 地址: {s.url}")
+            elif s.transport == "stdio" and not s.command:
+                raise HTTPException(422, f"MCP server {s.name} 为 stdio 传输但 command 为空")
+        with pack_write_lock():  # config/ 受控写与 packs 同锁（设置页写串行化）
+            MCP_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _pack_history_backup(MCP_CONFIG_PATH)
+            MCP_CONFIG_PATH.write_text(
+                json.dumps({"servers": [s.model_dump() for s in body.servers]},
+                           ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        return {"status": "ok", "count": len(body.servers)}
+
+    # ---- 智能体工作台（K9，2026-09-29）：新独立轻量对话运行时 ----
+    # 与会话窗/任务队列解耦：线程/消息存 chat_threads/chat_messages（core/chat/store.py），
+    # 轮次由 core/chat/runtime.py 的 ChatTurn 跑（主控轻专家重，call_expert spawn
+    # 持久子线程）。流式走 chat.delta/chat.tool/chat.message 事件（现有事件管道）。
+
+    def _chat_agents(pid: str) -> list[dict]:
+        from core.chat.runtime import ORCHESTRATOR_ID
+        from core.skills.experts import expert_exists, load_expert
+        proj = _project(pid)
+        # 主控也**走服务轨过滤**（controller-track-filter，2026-10-25）：此前主控
+        # 是硬编码追加的，yaml 里的 tracks 只给人看——于是 CTF 项目的工作台里
+        # 也能选到「渗透测试主控」，选进去才发现派不出该轨的专家（它的
+        # `_delegatable_experts` 就是本轨专家池交集的空集）。口径与专家池一致：
+        # `expert_exists`（= 文件在 且 tracks 含本轨）为假就不进菜单。
+        rows = ([{"id": ORCHESTRATOR_ID, "kind": "orchestrator"}]
+                if expert_exists(app.state.packs_root, ORCHESTRATOR_ID, proj.track)
+                else [])
+        experts = [eid for eid in list_experts(app.state.packs_root, proj.track)
+                   if eid not in {"_generalist", ORCHESTRATOR_ID}]
+        # 主控排最上（controller-first，2026-10-30）：控制器类智能体（软件开发主控 /
+        # 渗透 / CTF / 激进 / ARTEX）是顶层对话入口，恒排在子专家前面——智能体选择器
+        # 里主控最显眼，打开项目默认也落在主控上（前端 pickAgent 与后端同序）。
+        from core.chat.runtime import CONTROLLER_IDS
+        experts.sort(key=lambda eid: 0 if eid in CONTROLLER_IDS else 1)
+        for eid in experts:
+            rows.append({"id": eid, "kind": "expert"})
+        out = []
+        for r in rows:
+            try:
+                e = load_expert(app.state.packs_root, r["id"], proj.track)
+                out.append({**r, "name": e.get("name", r["id"]),
+                            "description": e.get("description", "")})
+            except FileNotFoundError:
+                continue
+        return out
+
+    def _chat_bridge(proj):
+        bridges = getattr(app.state, "chat_mcp_bridges", None)
+        if bridges is None:
+            bridges = {}
+            app.state.chat_mcp_bridges = bridges
+        bridge = bridges.get(proj.id)
+        if bridge is None:
+            from core.chat.mcp_bridge import MCPBridge
+            from core.skills.experts import directions_effective
+            from core.skills.taxonomy import LEGACY_DOMAIN_MAP
+            # 域推导与 ChatTurn capabilities 同口径（2026-09-30 修复：此前用盘上原始
+            # capabilities——M3 起恒空，且 config 里 ida 等 server 域是旧域 "reverse"，
+            # 交集恒空 → 逆向项目永远加载不了配置的 MCP）。
+            # directions_effective：无专家/无显式能力时按轨默认补（research→binary）。
+            # 旧域反向匹配：research+binary = 旧 reverse 域 → 放行 "reverse" 域 server；
+            # pentest/ctf 旧域名=轨名已在集合内，无需特判。
+            caps = directions_effective(app.state.packs_root, proj.track,
+                                  proj.experts, fallback=proj.capabilities)
+            domains = sorted({*caps, proj.track})
+            for d, (t, cs) in LEGACY_DOMAIN_MAP.items():
+                if t == proj.track and set(cs) <= (set(caps) | {proj.track}):
+                    domains.append(d)
+            bridge = MCPBridge(
+                MCP_CONFIG_PATH,
+                domains=domains,
+                project_id=proj.id,
+                browser_pool=(app.state.browser_pool
+                              if proj.track in ("pentest", "redteam", "ctf")
+                              else None),
+            )
+            bridges[proj.id] = bridge
+        return bridge
+
+    def _chat_running_set() -> set:
+        running = getattr(app.state, "chat_running", None)
+        if running is None:
+            running = set()
+            app.state.chat_running = running
+        return running
+
+    def _chat_abort_event(tid: str, *, create: bool = False) -> threading.Event | None:
+        """每线程一个中止事件（stop 端点 set / ChatTurn 轮询）。
+        轮次收尾弹出；create=False 且不存在时返回 None（线程没在跑）。"""
+        events = getattr(app.state, "chat_abort_events", None)
+        if events is None:
+            events = {}
+            app.state.chat_abort_events = events
+        if create:
+            ev = events.get(tid)
+            if ev is None:
+                ev = threading.Event()
+                events[tid] = ev
+            return ev
+        return events.get(tid)
+
+    def _chat_hit_interrupt(tid: str) -> threading.Event:
+        """插话「立刻发送」打断信号（2026-11-01）：按线程复用的 Event，端点
+        set、主控 ChatTurn 的 `should_cancel` 读——中断主控 LLM 调用回步边界
+        读插话，不落墓碑、不连坐并行子代理。跨轮复用（轮首 clear）。"""
+        events = getattr(app.state, "chat_hit_interrupts", None)
+        if events is None:
+            events = {}
+            app.state.chat_hit_interrupts = events
+        ev = events.get(tid)
+        if ev is None:
+            ev = threading.Event()
+            events[tid] = ev
+        return ev
+
+    def _chat_task_ident(tid: str):
+        """读该轮后台线程的 OS 线程号（_run 启动时登记；未登记 → None）。"""
+        ids = getattr(app.state, "chat_thread_idents", None)
+        if not ids:
+            return None
+        return ids.get(tid)
+
+    def _chat_running_reconcile(proj) -> list[str]:
+        """运行期存活对账（2026-10-11 事故修复）：DB status=running 的轮次，若其
+        后台线程已不存在（被硬杀/静默死亡），就地归位 idle，杜绝「永久执行中」。
+
+        旧自愈只在**进程重启**后首次打开项目时跑（且只认 chat_running 集合），
+        进程不重启则僵尸行永不回收——前端「思考中/执行中」卡死、停止钮无效。
+
+        存活判据用**原生线程号**（`GetExitCodeThread`）而非 `Thread.is_alive()`：
+        Python 的 is_alive 看 threading 簿记（`_tstate_lock`），Windows 下线程被
+        `TerminateThread` 硬杀时**仍报 True**（实测 exit_code=259→7 而 is_alive
+        恒 True），据此会漏判真僵尸。故以 OS 退出码 259(STILL_ACTIVE) 为准。
+
+        保护：仍在跑（tid ∈ chat_running）跳过；未登记线程号的 running 跳过（可能
+        是本进程启动早期 / 登记竞态，宁可不杀，交给重启清扫兜底）。"""
+        from core.chat import store as chat_store
+        running = _chat_running_set()
+        rows = proj.bb.conn.execute(
+            "SELECT id FROM chat_threads WHERE status='running'").fetchall()
+        dead: list[str] = []
+        for r in rows:
+            tid = r["id"]
+            if tid in running:
+                continue
+            ident = _chat_task_ident(tid)
+            if ident is None:
+                continue  # 未登记：不武断判死（重启清扫兜底）
+            if _native_thread_alive(ident):
+                continue  # 线程还在：可能刚启动、集合登记竞态
+            dead.append(tid)
+        if not dead:
+            return []
+        # 白名单 = 除「已确认死亡」外的**全部** running 线程（仍在跑的、未登记线程号
+        # 的一律保留）——否则 recover_running_threads 会把它们一并当僵尸清扫（错杀
+        # 活轮 / 与 chat_running 登记竞态的新轮）。
+        keep = {r["id"] for r in rows} - set(dead)
+        recovered = chat_store.recover_running_threads(
+            proj.bb, running, skip_ids=keep,
+            note="（⚠ 本轮执行线程已意外终止（未走正常收尾）；可继续追问或重新发起）")
+        idents = getattr(app.state, "chat_thread_idents", None) or {}
+        for tid in recovered:
+            idents.pop(tid, None)
+        if recovered:
+            log.warning("chat 运行期僵尸轮对账归位: %s", recovered)
+        return recovered
+
+    @app.get("/api/chat/agents")
+    def chat_agents(pid: str):
+        return _chat_agents(pid)
+
+    @app.get("/api/chat/mcp")
+    def chat_mcp_status(pid: str):
+        return {"servers": _chat_bridge(_project(pid)).status()}
+
+    # ---------- 诊断（diagnostics-log，2026-10-14）：会话消息审计 + 失败日志 ----------
+
+    @app.get("/api/projects/{pid}/diagnostics/sessions")
+    def diag_sessions(pid: str):
+        """统一会话清单（审计入口）：工作台对话线程 + 任务链执行会话。
+
+        每行带 msg_count（chat=chat_messages 条数；agent=events 条数）与
+        fail_count（tool.failed/mcp.failed 归属该会话的条数，失败徽标来源）。
+        消息正文不入本端点：chat 走 GET /api/chat/threads/{tid}，agent 走
+        GET /api/projects/{pid}/events?session_id=<sid>（前端分流）。
+        """
+        from core.chat import store as chat_store
+        from core.diagnostics.failog import query_failures
+        proj = _project(pid)
+        bb = proj.bb
+        # 失败归属：chat 行按 payload.thread_id 精确匹配（记录时必带）；
+        # 任务链按 events.session_id。扫描上限与 failog.query_failures 一致。
+        fails = query_failures(bb, pid, limit=_DIAG_FAIL_SCAN)
+        fail_by_chat: dict[str, int] = {}
+        fail_by_session: dict[str, int] = {}
+        for f in fails:
+            p = f.get("payload") or {}
+            tid = str(p.get("thread_id") or "")
+            sid = str(f.get("session_id") or "")
+            if tid:
+                fail_by_chat[tid] = fail_by_chat.get(tid, 0) + 1
+            elif sid:
+                fail_by_session[sid] = fail_by_session.get(sid, 0) + 1
+        chat_rows = []
+        for t in chat_store.list_threads(bb, pid):
+            tid = t["id"]
+            chat_rows.append({
+                "kind": "chat", "id": tid,
+                "name": t.get("title") or "(未命名)",
+                "agent_id": t.get("agent_id") or "",
+                "status": t.get("status") or "idle",
+                "msg_count": chat_store.count_messages(bb, tid),
+                "fail_count": fail_by_chat.get(tid, 0),
+                "updated_at": t.get("updated_at") or "",
+                "created_at": t.get("created_at") or "",
+                "parent_thread_id": t.get("parent_thread_id") or "",
+                "provider": t.get("provider") or "",
+                "model": t.get("model") or "",
+            })
+        agent_rows = []
+        for s in bb.list_sessions(pid):
+            sid = s.get("id") or ""
+            n = bb.conn.execute(
+                "SELECT COUNT(*) FROM events WHERE project_id=? AND session_id=?",
+                (pid, sid)).fetchone()[0]
+            agent_rows.append({
+                "kind": "agent", "id": sid,
+                "name": s.get("name") or s.get("agent_id") or sid,
+                "agent_id": s.get("agent_id") or "",
+                "status": s.get("status") or "",
+                "msg_count": int(n),
+                "fail_count": fail_by_session.get(sid, 0),
+                "updated_at": s.get("updated_at") or "",
+                "created_at": s.get("created_at") or "",
+                "parent_thread_id": "",
+                "provider": "", "model": "",
+            })
+        return {"chat": chat_rows, "agent": agent_rows}
+
+    @app.get("/api/projects/{pid}/diagnostics/failures")
+    def diag_failures(pid: str, kind: str | None = None,
+                      name: str | None = None, author: str | None = None,
+                      limit: int = 200):
+        """工具/MCP 失败日志（倒序，最新在前）。
+
+        kind=tool|mcp 过滤（缺省=两类全要）；name=工具名/全名 mcp__s__t 子串；
+        author=会话/线程作者或 thread_id 子串。行结构与 events 一致
+        （kind/session_id/author/payload/created_at）。
+        """
+        from core.diagnostics.failog import query_failures
+        kinds = (f"{kind}.failed",) if kind in ("tool", "mcp") else None
+        rows = query_failures(_project(pid).bb, pid, kinds=kinds, name=name,
+                              author=author, limit=limit)
+        return {"failures": rows}
+
+    @app.get("/api/projects/{pid}/diagnostics/llm-failover")
+    def diag_llm_failover(pid: str, kind: str | None = None,
+                          category: str | None = None,
+                          provider: str | None = None,
+                          limit: int = 200):
+        """跨供应商兜底记录（provider-failover，2026-10-21）。
+
+        回答一个此前无法回答的问题：**「刚才等了那么久最后报错」到底发生了什么**。
+        三类事件：``llm.provider_failed``（每家失败一条，带 category/status/耗时）、
+        ``llm.failover``（换家 from→to）、``llm.failover.exhausted``（全链耗尽）。
+
+        ``summary`` 用**未过滤**的全量算（类别分布/换家次数/真正停下次数）——
+        过滤只看 rows，否则选了某个类别后分布图就只剩一格。
+        """
+        from core.diagnostics.llm_failover import KINDS, query_failover, summary
+        bb = _project(pid).bb
+        rows = query_failover(bb, pid, kinds=(kind,) if kind in KINDS else None,
+                              category=category, provider=provider, limit=limit)
+        all_rows = query_failover(bb, pid, limit=500)
+        return {"rows": rows, "summary": summary(all_rows), "kinds": list(KINDS)}
+
+    @app.get("/api/projects/{pid}/diagnostics/skills")
+    def diag_skill_usage(pid: str, limit: int = 200):
+        """技能与知识库使用统计（skill-usage，2026-10-21）。
+
+        回答一个此前只能靠翻日志猜的问题：**Agent 到底有没有用技能和知识库**。
+
+        数据源（本项目事件表）：
+        - `skill.routed`：本轮注入了哪些技能（ChatTurn 侧 2026-10-21 才开始上报，
+          更早的项目数据只有 loop.py 任务链的）；
+        - `skill.open`：技能正文真被打开（真使用）；
+        - `kb.search` / `kb.open`：知识库检索/读取次数，`kb.search` 的 hits 用于
+          算零命中率（零命中 = 知识缺口，接 kbiteration 的触发信号）。
+
+        「注入但从未打开」的技能是最该关注的：要么描述不吸引模型，要么专家
+        yaml 白名单配错了。
+        """
+        proj = _project(pid)
+        rows = proj.bb.recent_events(pid, limit=max(1, min(limit * 20, 20000)))
+        injected: dict[str, int] = {}
+        opened: dict[str, int] = {}
+        kb_search = kb_open = kb_zero = 0
+        for e in rows:
+            kind = e.get("kind")
+            payload = e.get("payload") or {}
+            if kind == "skill.routed":
+                for n in (payload.get("injected") or []):
+                    injected[str(n)] = injected.get(str(n), 0) + 1
+            elif kind == "skill.open":
+                n = str(payload.get("name") or "")
+                if n:
+                    opened[n] = opened.get(n, 0) + 1
+            elif kind == "kb.search":
+                kb_search += 1
+                try:
+                    if int(payload.get("hits") or 0) == 0:
+                        kb_zero += 1
+                except (TypeError, ValueError):
+                    pass
+            elif kind == "kb.open":
+                kb_open += 1
+        names = sorted(set(injected) | set(opened))
+        skills = [{"name": n, "injected": injected.get(n, 0),
+                   "opened": opened.get(n, 0),
+                   "opened_rate": (round(opened.get(n, 0) / injected[n], 3)
+                                   if injected.get(n) else None)}
+                  for n in names]
+        skills.sort(key=lambda s: (-(s["opened"] or 0), -(s["injected"] or 0), s["name"]))
+        return {
+            "skills": skills,
+            "totals": {
+                "skill_open": sum(opened.values()),
+                "skill_injected": sum(injected.values()),
+                "distinct_skills_opened": len(opened),
+                "kb_search": kb_search,
+                "kb_open": kb_open,
+                "kb_search_zero": kb_zero,
+                "kb_zero_rate": round(kb_zero / kb_search, 3) if kb_search else None,
+            },
+            "events_scanned": len(rows),
+        }
+
+    @app.get("/api/projects/{pid}/diagnostics/system-prompt")
+    def diag_system_prompt(pid: str, session_id: str):
+        """会话系统提示词快照（diagnostics-system-prompt，2026-10-16）。
+
+        返回该会话**最近一次实际下发给 LLM 的完整 system 正文**：chat 轮=工作台
+        对话线程（session_id=chat-<tid>），任务轮=执行会话（session_id=sess-<id>）。
+        快照自 schema v39 起落库，历史会话不回溯补写 → 无快照返回 404（前端按
+        「该会话尚未产生系统提示快照」提示，不视为错误）。
+        """
+        from core.diagnostics.system_prompt import get_system_prompt
+        snap = get_system_prompt(_project(pid).bb, session_id)
+        if snap is None:
+            raise HTTPException(404, f"该会话暂无系统提示快照: {session_id}")
+        return snap
+
+    # ---------- 诊断：请求体留痕（diagnostics-request-body，2026-10-17） ----------
+    # 开关是**进程级**（config/llm_dump.json），诊断页顶栏切换；开启后每步 LLM
+    # 请求体按 (project_id, session_id) 落 logs/llm_requests/<pid>/<sid>.jsonl，
+    # 每会话保留最近 20 条。关闭 = sink 首行返回，零开销。
+
+    @app.get("/api/diagnostics/llm-dump")
+    def diag_llm_dump():
+        from core.diagnostics import requests as request_log
+        return request_log.summary()
+
+    @app.put("/api/diagnostics/llm-dump")
+    def diag_llm_dump_set(body: dict):
+        """开启/关闭请求体留痕。body={"enabled": true|false}。"""
+        from core.diagnostics import requests as request_log
+        enabled = bool((body or {}).get("enabled"))
+        try:
+            request_log.set_enabled(enabled)
+        except OSError as e:  # 磁盘只读/权限不足
+            raise HTTPException(500, f"开关写入失败: {e}") from e
+        return request_log.summary()
+
+    @app.get("/api/projects/{pid}/diagnostics/requests")
+    def diag_requests(pid: str, session_id: str, limit: int = 20):
+        """会话的请求体清单（最新在前；只含统计，不含正文）。"""
+        from core.diagnostics import requests as request_log
+        return {"enabled": request_log.is_enabled(),
+                "dir": str(request_log.base_dir()),
+                "records": request_log.list_records(pid, session_id, limit=limit)}
+
+    @app.get("/api/projects/{pid}/diagnostics/requests/{rid}")
+    def diag_request_detail(pid: str, rid: str, session_id: str):
+        """单条请求体全文（system / messages / tools 原样）。"""
+        from core.diagnostics import requests as request_log
+        row = request_log.read_record(pid, session_id, rid)
+        if row is None:
+            raise HTTPException(404, f"该请求体记录不存在: {rid}")
+        return row
+
+    # ---------- 诊断：红线一键自检（diagnostics-redline-test，2026-10-17） ----------
+    # 「注没注入 / 送没送到」的实验式判定：模型无法可靠内省系统提示，唯一可信的
+    # 手法是拿该会话真实的 system 正文 + canary 指令打一发。详见
+    # core/diagnostics/redline_test.py 模块 docstring。
+
+    @app.post("/api/projects/{pid}/diagnostics/redline-test")
+    def diag_redline_test(pid: str, body: dict):
+        """一键自检：本地注入 + canary 通道 + 内容引用，返回结构化判定。
+
+        body = {"session_id": "chat-xxx" | "sess-xxx", "provider"?, "model"?}
+        provider/model 缺省 → 线程级覆写 → 全局默认（与真实会话同路径，通道判定才有效）。
+        探测只用无工具的纯 chat，不写黑板、不落任何东西；异常进结果不外抛。
+        """
+        from core.diagnostics.redline_test import run_redline_test
+        session_id = str((body or {}).get("session_id") or "").strip()
+        if not session_id:
+            raise HTTPException(422, "缺少 session_id")
+        return run_redline_test(
+            _project(pid).bb, session_id=session_id,
+            provider=str((body or {}).get("provider") or "").strip(),
+            model=str((body or {}).get("model") or "").strip())
+
+    @app.get("/api/projects/{pid}/chat/threads")
+    def chat_threads_list(pid: str, agent_id: str | None = None):
+        from core.chat import store as chat_store
+        proj = _project(pid)
+        _chat_running_reconcile(proj)  # 运行期自愈：轮次线程已死则就地归位 idle
+        rows = chat_store.list_threads(proj.bb, pid, agent_id=agent_id)
+        # 候选 flag 徽章（2026-10-22）：线程绑定了 CTF 题目且台账里有
+        # verdict=pending 的候选 → 附带 `pending_flags` 计数，前端据此在会话
+        # 线程列表挂黄色徽章（「有待确认的 flag」）。
+        #
+        # **必须批量查**（`challenge_flag_summary` 一次取全部题目）：按线程逐条
+        # 调 `challenge_state` 会 N+1——线程列表是 2~10s 一拍的轮询热路径。
+        # 查不到（旧库无 flag 表）静默跳过，不阻断线程列表本身。
+        cids = sorted({str(r.get("challenge_asset_id") or "") for r in rows
+                       if r.get("challenge_asset_id")})
+        if cids:
+            try:
+                from core.blackboard.challenge_flags import challenge_flag_summary
+                flag_state = challenge_flag_summary(proj.bb, pid, cids)
+                for r in rows:
+                    st = flag_state.get(str(r.get("challenge_asset_id") or ""))
+                    # 只给**绑定了题目**的线程带字段：无题线程（普通专家会话）
+                    # 保持无键，前端 `!!t.pending_flags` 判空才有区分度——
+                    # 全量带 0 会把「没绑题」和「绑了题但无候选」混淆。
+                    if st is not None:
+                        r["pending_flags"] = int(st.get("candidate") or 0)
+            except Exception:  # noqa: BLE001 —— 徽章是附加项，失败不影响列表
+                log.exception("线程列表候选 flag 计数失败 pid=%s", pid)
+        return rows
+
+    def _thread_llm(provider: str, model: str, effort: str = ""):
+        """线程级模型覆写构建（v37 + v48 thinking-effort）：返回 (llm, 失败原因)。
+
+        provider 空 → (None, "") 表示「跟随全局 executor」，调用方回退 ``_llms()``。
+        构建失败**不抛**：设置接口据此 422 不落盘，发送轮次则静默回退全局
+        （配置事后被删/停用不能把线程卡死——与项目 executor 覆写同口径）。
+
+        ``effort`` 必须在**构建时**传入，不能构建完再改属性——`ProviderStore.build()`
+        默认用 `with_fallback()` 包一层 `FallbackProvider`，它的 `__getattr__` 只把属性
+        透传给**当前**供应商实例，事后赋值会写在包装器自己身上，真正出网的
+        provider 一点都改不到（静默无效，最难查的那种）。
+
+        空 provider 但**只有 effort 覆写**时也要建实例：用户可能只想调深度、
+        继续用全局默认模型。此时按全局 executor 那家重新 build 一次并带上 effort。
+        """
+        provider = (provider or "").strip()
+        effort = (effort or "").strip().lower()
+        if not provider:
+            if not effort:
+                return None, ""
+            # 只覆盖强度：沿用全局 executor 的供应商/模型，重新构建一遍带 effort
+            try:
+                t = ModelRouter().target_for("executor")
+                if t is None:
+                    return app.state.llm_store.build(thinking_effort=effort), ""
+                # t[0] 可能为 None（llm.json 里写裸模型名 = 走默认供应商），
+                # 此时 build 的第一个参数必须传 None 而不是空串——空串会被
+                # ProviderStore.get("") 当成「找个叫空的供应商」而抛错。
+                return app.state.llm_store.build(
+                    t[0], t[1], thinking_effort=effort), ""
+            except Exception as e:  # noqa: BLE001
+                return None, str(e)
+        try:
+            return app.state.llm_store.build(
+                provider, (model or "").strip() or None,
+                thinking_effort=effort or None), ""
+        except Exception as e:  # noqa: BLE001
+            return None, str(e)
+
+    @app.post("/api/projects/{pid}/chat/threads", status_code=201)
+    def chat_thread_create(pid: str, body: ChatThreadIn):
+        from core.chat import store as chat_store
+        agents = {a["id"] for a in _chat_agents(pid)}
+        if body.agent_id not in agents:
+            raise HTTPException(422, f"未知智能体: {body.agent_id}")
+        if body.provider:
+            _, err = _thread_llm(body.provider, body.model or "")
+            if err:
+                raise HTTPException(422, f"模型不可用：{err}")
+        return chat_store.create_thread(_project(pid).bb, pid, body.agent_id,
+                                        title=body.title or "",
+                                        provider=body.provider or "",
+                                        model=body.model or "",
+                                        thinking_effort=body.thinking_effort or "",
+                                        challenge_asset_id=body.challenge_asset_id or "",
+                                        web_search=bool(body.web_search))
+
+    @app.put("/api/chat/threads/{tid}/effort")
+    def chat_thread_set_effort(tid: str, body: EffortIn):
+        """线程级思考强度（v48，thinking-effort，2026-10-21）。
+
+        工作台 composer 模型浮层下半部滑块的落点：七档，空=清除覆写跟随供应商。
+        下一轮生效（与模型/联网开关同口径）。坏值 422 不落盘。
+        """
+        from core.llm.effort import GEARS
+        from core.chat import store as chat_store
+        proj = _project(_pid_of_chat(tid))
+        if chat_store.get_thread(proj.bb, tid) is None:
+            raise HTTPException(404, f"线程不存在: {tid}")
+        effort = (body.effort or "").strip().lower()
+        if effort and effort not in GEARS:
+            raise HTTPException(422, f"未知思考强度：{effort}（可选 {'/'.join(GEARS)}）")
+        return chat_store.update_thread(proj.bb, tid, thinking_effort=effort)
+
+    @app.put("/api/chat/threads/{tid}/web-search")
+    def chat_thread_set_web_search(tid: str, body: WebSearchIn):
+        """线程级联网搜索开关（v43，web-search-toggle，2026-10-19）。
+
+        工作台 composer「联网」按钮的落点：开 = 该线程主控与其 spawn 的子代理
+        （call_expert / ARTEX Worker 建线程时从父线程继承）默认启用 web_search
+        工具（SearXNG/ddgs 双后端，core/websearch.py）。**不是专家 yaml 的
+        工具勾选**——会话级用户决定，专家池无需逐个声明。下一轮生效。"""
+        from core.chat import store as chat_store
+        proj = _project(_pid_of_chat(tid))
+        if chat_store.get_thread(proj.bb, tid) is None:
+            raise HTTPException(404, f"线程不存在: {tid}")
+        return chat_store.update_thread(proj.bb, tid,
+                                        web_search=bool(body.enabled))
+
+    @app.put("/api/chat/threads/{tid}/pool-pulse")
+    def chat_thread_set_pool_pulse(tid: str, body: WebSearchIn):
+        """线程级 CTF 池脉冲开关（v54，ctf-pool-pulse-wake，2026-10-31）。
+
+        工作台每主控按钮的落点：关（enabled=false）= 该 CTF 主控不再被 5 分钟
+        池子周期检查唤醒/提示补派（即使池子没满也不打扰）；开 = 恢复。"""
+        from core.chat import store as chat_store
+        proj = _project(_pid_of_chat(tid))
+        if chat_store.get_thread(proj.bb, tid) is None:
+            raise HTTPException(404, f"线程不存在: {tid}")
+        return chat_store.update_thread(proj.bb, tid,
+                                        pool_pulse_on=bool(body.enabled))
+
+    @app.put("/api/chat/threads/{tid}/llm")
+    def chat_thread_set_llm(tid: str, body: SwitchLlmIn):
+        """线程级模型覆写（v37）：该线程后续轮次按此模型跑（下一轮生效）。
+
+        坏值 422 不落盘（先实测构建，同项目 executor 覆写口径）。
+        """
+        from core.chat import store as chat_store
+        proj = _project(_pid_of_chat(tid))
+        if chat_store.get_thread(proj.bb, tid) is None:
+            raise HTTPException(404, f"线程不存在: {tid}")
+        _, err = _thread_llm(body.provider, body.model or "")
+        if err:
+            raise HTTPException(422, f"模型不可用：{err}")
+        return chat_store.update_thread(proj.bb, tid, provider=body.provider,
+                                        model=body.model or "")
+
+    @app.delete("/api/chat/threads/{tid}/llm")
+    def chat_thread_reset_llm(tid: str):
+        """重置线程模型覆写：回跟随全局 executor 默认。"""
+        from core.chat import store as chat_store
+        proj = _project(_pid_of_chat(tid))
+        if chat_store.get_thread(proj.bb, tid) is None:
+            raise HTTPException(404, f"线程不存在: {tid}")
+        return chat_store.update_thread(proj.bb, tid, provider="", model="")
+
+    @app.get("/api/chat/threads/{tid}")
+    def chat_thread_detail(tid: str, after_id: int = 0):
+        from core.chat import store as chat_store
+        proj = _project(_pid_of_chat(tid))
+        _chat_running_reconcile(proj)  # 打开线程即对账：僵死轮不再显示「执行中」
+        thread = chat_store.get_thread(proj.bb, tid)
+        if thread is None:
+            raise HTTPException(404, f"线程不存在: {tid}")
+        # 本主控开启过的会话线程（2026-10-31）：待办卡片据此列「我派出去的手脚」
+        # 并支持点击跳转。
+        #
+        # **看子线程时也列同一家人**：子代理不允许再 spawn（深度=1），所以它自己
+        # 没有子线程；若只查 `parent=tid`，点进任意子线程后这张卡就空了——用户
+        # 在子线程里看不出「主控还开了哪些会话」，也无法在兄弟线程间跳转。
+        # 故：自己没子线程且有父线程时，改查父线程的子线程（= 同一批手足）。
+        # `children_parent_id` 让前端知道这批属于谁（当前行可高亮）。
+        # 键只在**确实有兄弟/子线程**时才带（不制造空数组噪声）。
+        try:
+            children = chat_store.list_children(
+                proj.bb, str(thread["project_id"]), tid)
+            scope = tid
+            if not children and str(thread.get("parent_thread_id") or "").strip():
+                scope = str(thread["parent_thread_id"]).strip()
+                children = chat_store.list_children(
+                    proj.bb, str(thread["project_id"]), scope)
+            if children:
+                thread["children"] = children
+                thread["children_parent_id"] = scope
+        except Exception:  # noqa: BLE001 —— 附加信息，失败不影响线程详情本身
+            log.exception("线程子会话清单读取失败 tid=%s", tid)
+        return {"thread": thread,
+                # work_dir：会话流文件卡把工具参数里的绝对路径落回工作区相对路径
+                # （后端 /files/open 收相对 scope 根的路径，2026-10-03；
+                #  2026-10-30 改为**执行工作区根**——否则「工作区」选了外部目录后
+                #  2s 轮询会把按钮显示打回项目根，绝对路径显示不住）
+                "work_dir": str(_exec_workspace(proj, thread).resolve()),
+                "messages": chat_store.list_messages(proj.bb, tid, after_id=after_id)}
+
+    @app.delete("/api/chat/threads/{tid}", status_code=204)
+    def chat_thread_delete(tid: str):
+        from core.chat import store as chat_store
+        pid = _pid_of_chat(tid)
+        if tid in _chat_running_set():
+            raise HTTPException(409, "线程正在执行中，无法删除")
+        if not chat_store.delete_thread(_project(pid).bb, tid):
+            raise HTTPException(404, f"线程不存在: {tid}")
+
+    def _pid_of_chat(tid: str) -> str:
+        """线程 id → 项目 id（chat-<hex> 主键全局唯一，按索引表反查）。"""
+        from core.chat import store as chat_store
+        row = store_bb_conn(tid)
+        if row is None:
+            raise HTTPException(404, f"线程不存在: {tid}")
+        return row
+
+    def store_bb_conn(tid: str) -> str | None:
+        # chat_threads 无项目索引缓存时直接扫各打开项目（工作台场景项目数有限）
+        for p in app.state.projects.values():
+            try:
+                row = p.bb.conn.execute(
+                    "SELECT project_id FROM chat_threads WHERE id=?",
+                    (tid,)).fetchone()
+            except Exception:  # noqa: BLE001
+                continue
+            if row is not None:
+                return row["project_id"]
+        return None
+
+    @app.post("/api/chat/threads/{tid}/messages", status_code=202)
+    def chat_send(tid: str, body: ChatMessageIn):
+        """发消息即起跑一轮（后台线程）；流式经 chat.delta/chat.tool/chat.message
+        事件（GET /api/projects/{pid}/events 或项目 WS）。
+
+        **本轮仍在跑时不再 409，改为「插话」**（chat-hit，2026-10-21）：消息投进
+        该线程的通知箱，由正在跑的那一轮在下一个可读点（步边界，或等专家返回的
+        等待循环）自己读进去。这样人不必等主控整轮跑完、也不必点停止——
+        而 call_expert 派出的专家**一个都不打断**，照旧跑完并把结果补达。
+
+        返回 `status="queued"` 让前端能明确区分「起了新轮」与「插进了当前轮」。
+        """
+        # 附件随发（2026-10-08）：text 与附件至少一项；附件 id 严格校验（422 不静默丢）。
+        pid = _pid_of_chat(tid)
+        proj = _project(pid)
+        att_refs = _attachment_refs(pid, body.attachment_ids)
+        text = body.text.strip()
+        if not text and not att_refs:
+            raise HTTPException(422, "消息不能为空")
+        # 本轮在跑 → 插话（不打断 call_expert）。判据用「有箱」而不是
+        # `chat_running`：后者只登记顶层轮次，而箱是「这一轮正持有它」的精确信号
+        # （见 core/chat/inbox.py）。线程 status 兜底覆盖「箱刚释放、状态还没落」的窗口。
+        from core.chat import inbox as chat_inbox
+        from core.chat import store as chat_store
+        thread = chat_store.get_thread(proj.bb, tid)
+        if thread is None:
+            raise HTTPException(404, f"线程不存在: {tid}")
+        busy = (tid in chat_inbox.live_thread_ids()
+                or thread.get("status") == "running")
+        if busy:
+            note = _hit_note_text(text, att_refs)
+            # `post` 返回 False = 箱刚被释放（轮次恰好在这一瞬收尾）。此时不能
+            # 当成插话（没人会读了），也不能丢消息——直接往下走正常起轮。
+            if chat_inbox.post(tid, note):
+                # 插话也落库为一条 user 消息（2026-10-31 修复）：此前只投箱不
+                # 落库，前端消息流看不到插话（只有 composer 上方一行小字提示）。
+                # 落库后消息流/刷新/跨轮都可见，主控下一轮从历史读到它当人类
+                # 指令响应。当前轮仍走通知箱及时读到，两者不重复——本轮上下文
+                # 只含 notice 注入，历史要到下一轮 `_load_history` 才装载。
+                hit_text = text
+                if att_refs:
+                    try:
+                        from core.agent.loop import _attachment_lines
+                        # 插话附件：路径渲染用**该线程生效工作区**绝对路径（2026-11-02
+                        # 线程级），避免相对/`/workspace/` 形态在子线程工作区基准下错位。
+                        _al = _attachment_lines(att_refs, _exec_workspace(proj, thread))
+                        if _al:
+                            hit_text = f"{hit_text}\n\n附件：\n" + "\n".join(_al)
+                    except Exception:  # noqa: BLE001 —— 附件渲染失败退回纯文本
+                        log.exception("插话附件渲染失败 thread=%s", tid)
+                try:
+                    chat_store.append_message(proj.bb, tid, "user", hit_text)
+                except Exception:  # noqa: BLE001 —— 落库失败不阻断插话投递
+                    log.exception("插话 user 消息落库失败 thread=%s", tid)
+                proj.bb.append_event(
+                    pid, "chat.hit",
+                    {"thread_id": tid, "text": text[:1500],
+                     "attachments": [a.get("id") for a in att_refs]},
+                    session_id=None, author="human")
+                return {"status": "queued", "thread_id": tid}
+        _chat_launch_turn(pid, tid, text, refs=body.refs, attachments=att_refs)
+        return {"status": "running", "thread_id": tid}
+
+    def _hit_note_text(text: str, att_refs: list[dict]) -> str:
+        """把角色中立的人类插话说明渲染成模型上下文。"""
+        return _chat_hit_note_text(text, att_refs)
+
+    def _chat_launch_turn(pid: str, tid: str, text: str, *,
+                          refs: dict | None = None,
+                          attachments: list[dict] | None = None) -> None:
+        """起一轮对话（后台线程）——**人类发消息与系统唤醒共用同一个入口**。
+
+        抽出来是因为候选 flag 唤醒（`core/chat/ctf_wake.py`）必须走**完全相同**的
+        装配：漏传 artifacts_dir/browser_pool 就是子专家工具全灭（同规则链透传
+        缺口的经典形态），漏清 abort_event 就是刚唤醒就被上一轮的 stop 信号掐掉。
+        两个入口各写一份装配代码，迟早分叉。
+
+        失败语义：线程不存在 404、同线程并发 409、LLM 未就绪 503——与原先
+        `chat_send` 一致，调用方按 HTTP 语义处理。
+        """
+        from core.chat import store as chat_store
+        from core.chat.runtime import ARTEX_CONTROLLER_ID, CONTROLLER_IDS, ChatTurn
+        proj = _project(pid)
+        thread = chat_store.get_thread(proj.bb, tid)
+        if thread is None:
+            raise HTTPException(404, f"线程不存在: {tid}")
+        running = _chat_running_set()
+        if tid in running or thread.get("status") == "running":
+            raise HTTPException(409, "上一轮仍在执行中，稍候再发")
+        # 线程级模型覆写（v37，2026-10-13）：命中则按覆写构建 LLM；坏值静默回退
+        # 全局 executor（配置事后被删/停用不能把线程卡死）。无覆写才要求全局就绪
+        # ——否则「全局没配但线程指定了可用模型」会被误判 503。
+        ov_llm, ov_err = _thread_llm(thread.get("provider") or "",
+                                     thread.get("model") or "",
+                                     thread.get("thinking_effort") or "")
+        if ov_llm is not None:
+            exec_llm, plan_llm = ov_llm, None
+        else:
+            if ov_err:
+                log.warning("线程模型覆写构建失败，回退全局 executor: tid=%s %s",
+                            tid, ov_err)
+            exec_llm, plan_llm = _llms()
+        agents = {a["id"] for a in _chat_agents(pid)}
+        # 控制器类智能体（pentest-controller + 激进主控）才拿可委派专家池；
+        # 子专家线程 expert_names=[]（spawn 深度=1，call_expert 恒拒）。
+        expert_names = (sorted(agents)
+                        if thread["agent_id"] in CONTROLLER_IDS else [])
+        running.add(tid)
+        abort_ev = _chat_abort_event(tid, create=True)
+        abort_ev.clear()
+        hit_ev = _chat_hit_interrupt(tid)
+        hit_ev.clear()
+
+        def _run() -> None:
+            try:
+                cfg = proj.bb.get_project(pid)["config"] or {}
+                # 重装备工厂（与任务链会话工厂同款材料）：decompiler 每线程一
+                # 实例（runner 走自建 gateway 审计、ida_db/ghidra_tmp 落项目
+                # artifacts），browser 按轨注入共享池（轨外 None → no-tool 降级）
+                from core.tools.decompiler import (
+                    build_headless_service, gateway_runner, resolve_headless_timeout)
+
+                def _decompiler_factory(session_id: str, author: str):
+                    return build_headless_service(
+                        proj.artifacts_dir / "decompiler-cache",
+                        runner=gateway_runner(ExecutionGateway(bb=proj.bb),
+                                              project_id=pid,
+                                              session_id=session_id,
+                                              author=author,
+                                              timeout=resolve_headless_timeout(),
+                                              workspace=_exec_workspace(proj, thread)),
+                        global_cache_dir=app.state.decompiler_cache_dir,
+                        ida_db_dir=proj.artifacts_dir / "decompiler-db",
+                        ghidra_tmp_dir=proj.artifacts_dir / "ghidra-tmp")
+                # route-C（2026-11-02 Nan 选择）：对话轨 Agent 不再按需拉起 IDA-MCP
+                # （IDA 插件单进程串行，CTF 多线程齐点会排队超时）；分析走
+                # analyze_sample（Ghidra headless 批处理）落缓存，点查只读缓存。
+
+                # 主控产物按题隔离（challenge-dirs 方案 A，2026-11-01 Nan 要求
+                # 「一个主控一个题目 → 题目单独文件夹」）：ctf-controller 绑定题目
+                # → artifacts 落 `challenges/<cid>/artifacts`（与子代理一致）；
+                # 未绑定/非 CTF → 项目根（历史行为）。exec_workspace 保持项目根
+                # （容器 /workspace 挂载基准不动，附件原件仍共享只读）。
+                _main_artifacts = proj.artifacts_dir
+                if (thread.get("agent_id") in CONTROLLER_IDS
+                        and proj.track == "ctf"):
+                    try:
+                        _cid = chat_store.resolve_challenge_asset_id(
+                            proj.bb, tid) or ""
+                        if _cid:
+                            _ca = (Path(_exec_workspace(proj, thread))
+                                   / "challenges" / _cid / "artifacts")
+                            _ca.mkdir(parents=True, exist_ok=True)
+                            _main_artifacts = str(_ca)
+                    except Exception:  # noqa: BLE001 —— 建不了就回退项目根
+                        log.exception("ctf 主控产物目录创建失败 tid=%s", tid)
+
+                turn = ChatTurn(
+                    bb=proj.bb, llm=exec_llm, project_id=pid, thread_id=tid,
+                    packs_root=app.state.packs_root, track=proj.track,
+                    capabilities=directions_effective(
+                        app.state.packs_root, proj.track, proj.experts,
+                        fallback=proj.capabilities),
+                    mcp_bridge=_chat_bridge(proj),
+                    expert_names=expert_names,
+                    abort_event=abort_ev,
+                    # 线程级中止注册表（2026-10-31）：子代理构造时 setdefault
+                    # 自己的中止事件，与 stop 端点 `_chat_abort_event(sub_id)`
+                    # 同一份字典——单独停子线程才停得住。
+                    abort_events=(getattr(app.state, "chat_abort_events", None)),
+                    # 插话「立刻发送」打断（2026-11-01）：只中断本线程 LLM 调用，
+                    # 回步边界立刻读插话继续；子代理不传此信号 → 不连坐。
+                    hit_interrupt=hit_ev,
+                    owner_tags=proj.bb.owner_tags(pid),
+                    rule_profiles=cfg.get("rule_profiles"),
+                    artifacts_dir=_main_artifacts,
+                    exec_workspace=_exec_workspace(proj, thread),
+                    browser_pool=(app.state.browser_pool
+                                  if proj.track in ("pentest", "redteam", "ctf")
+                                  else None),
+                    decompiler_factory=_decompiler_factory,
+                    containers=app.state.session_containers,
+                    # ARTEX 主控（artex-fusion）：把项目级 Engine 暴露给对话主控，
+                    # 让它用 artex_plan/status/hint/control 操舵，而不是自己
+                    # call_expert 派活。引擎惰性获取——首次操舵时才创建。
+                    # **worker_llm=exec_llm**（2026-10-20）：把主控本轮实际用的
+                    # 模型交给 Engine，Worker 跟随它而不是全局默认供应商。
+                    artex_engine_provider=((lambda: app.state.get_artex_engine(
+                        pid, worker_llm=exec_llm))
+                        if thread["agent_id"] == ARTEX_CONTROLLER_ID
+                        else None),
+                    artex_planner_llm=plan_llm,
+                    # 主控线程绑定的任务（v47「一个主控只绑一个任务」）：
+                    # artex_plan 新建任务时写入，此后本会话操舵恒指该任务，
+                    # 不再按「最近活跃」猜（两个主控会话不会互相抢任务）。
+                    artex_task_id=str(thread.get("artex_task_id") or ""),
+                    recovery=_environment_recovery(proj))
+                turn.run(text, refs=refs, attachments=attachments)
+            except Exception as e:  # noqa: BLE001 —— 状态已在 ChatTurn.run 归位
+                log.exception("chat 轮后台执行失败 thread=%s", tid)
+                # 构造期异常（ChatTurn(...) 抛错，run() 未进入）不会归位状态——
+                # 线程会永久卡在 running，前端显示「执行中」且无错误卡片。
+                # 这里兜底：仅当状态仍为 running 时归位为 error（run() 内部已置
+                # error 的情形不覆盖其更精确的分类）。
+                try:
+                    from core.chat.runtime import _classify_error
+                    th = chat_store.get_thread(proj.bb, tid)
+                    if th and th.get("status") == "running":
+                        chat_store.update_thread(proj.bb, tid, status="error",
+                                                 error=_classify_error(e))
+                except Exception:  # noqa: BLE001 —— 兜底失败不掩盖原始异常
+                    log.exception("chat 失败状态归位失败 thread=%s", tid)
+            finally:
+                running.discard(tid)
+                idents = getattr(app.state, "chat_thread_idents", None)
+                if idents is not None:
+                    idents.pop(tid, None)
+                events = getattr(app.state, "chat_abort_events", None)
+                if events is not None:
+                    events.pop(tid, None)
+                # 通知箱由 `ChatTurn.run()` 的 finally 释放（见 `_release_notice_box`）。
+                # 这里再兜一次：构造期抛错（run 未进入）时箱没人释放，登记表会
+                # 留着一条「死线程仍在跑」的记录，让后续通知投进黑洞。
+                try:
+                    from core.chat.inbox import drop_box
+                    drop_box(tid)
+                except Exception:  # noqa: BLE001 —— 兜底释放失败不影响收尾
+                    log.exception("通知箱兜底释放失败 thread=%s", tid)
+
+        worker = threading.Thread(target=_run, name=f"chat-{tid[-12:]}",
+                                  daemon=True)
+        worker.start()
+        # 登记 OS 线程号：运行期对账据此判「轮次线程是否还活着」（_chat_running_reconcile）。
+        # 线程若在 start() 前后异常早退，Python 侧可能仍记它存活，故以原生线程号为准。
+        idents = getattr(app.state, "chat_thread_idents", None)
+        if idents is None:
+            idents = {}
+            app.state.chat_thread_idents = idents
+        if worker.ident is not None:
+            idents[tid] = worker.ident
+        return None
+
+    @app.post("/api/chat/threads/{tid}/stop", status_code=204)
+    def chat_stop(tid: str):
+        """中止执行中的轮次：置中止事件 → ChatTurn 在步间/流式帧/工具分发点
+        退出并落「已停止」说明。轮次刚结束时按幂等成功处理，避免前端状态刷新竞态。
+
+        2026-10-11 修复：线程不在本进程 running 集合、但 DB 仍 status=running 时，
+        旧实现直接 `return`（空操作）——僵尸轮下停止钮**永远无效**。现改为对账归位：
+        就地清扫该 tid（僵尸→idle + 落中断说明），让前端退出「执行中」。"""
+        from core.chat import store as chat_store
+        if tid not in _chat_running_set():
+            proj = _project(_pid_of_chat(tid))
+            thread = chat_store.get_thread(proj.bb, tid)
+            if thread is None:
+                raise HTTPException(404, f"线程不存在: {tid}")
+            if thread.get("status") == "running":
+                # 子代理同步跑在主控线程里（2026-10-31 bug 修复）：子线程没有
+                # 自己的后台 worker，不在 chat_running 集合。父线程在跑 ⇔ 子代理
+                # 此刻正在执行——此时若走下方「僵尸归位」只改 DB（idle+墓碑）而
+                # 不中止执行，子代理继续跑完、继续落消息，前端却已不显示 running
+                # （「停了还在跑」假象）。正确做法：set 子线程自己的中止事件，
+                # 让子代理步间检查（`_aborted`，含 parent_abort_event）协作式退出，
+                # 由 `ChatStopped` 收尾落「已停止」+ 归位 idle。
+                parent = str(thread.get("parent_thread_id") or "")
+                if parent and parent in _chat_running_set():
+                    _chat_abort_event(tid, create=True).set()
+                    return
+                # 真僵尸（进程重启 / 后台线程被硬杀）：原有归位逻辑
+                others = {r["id"] for r in proj.bb.conn.execute(
+                    "SELECT id FROM chat_threads WHERE status='running'").fetchall()}
+                others.discard(tid)
+                chat_store.recover_running_threads(
+                    proj.bb, _chat_running_set(), skip_ids=others,
+                    note="（⚠ 本轮执行线程已意外终止；已按停止处理）")
+                (getattr(app.state, "chat_thread_idents", None) or {}).pop(tid, None)
+            return
+        ev = _chat_abort_event(tid, create=True)
+        ev.set()
+
+    @app.post("/api/chat/threads/{tid}/hit-immediate", status_code=204)
+    def chat_hit_immediate(tid: str):
+        """插话「立刻发送」打断（2026-11-01）：中断该线程**当前 LLM 调用**，
+        让它立刻回步边界读插话继续——**不是停止**（不落墓碑），也不连坐
+        并行子代理（`hit_interrupt` 只挂在本线程的 ChatTurn 上）。"""
+        _pid_of_chat(tid)                     # 线程不存在 → 404
+        _chat_hit_interrupt(tid).set()
+
+    # ---------- 情报面板（E9，全局模块，DESIGN.md §16；与项目黑板无关） ----------
+
+    def _intel() -> IntelStore:
+        if app.state.intel is None:
+            app.state.intel = IntelStore(app.state.intel_dir)
+        return app.state.intel
+
+    def _intel_classifier():
+        """classifier 小模型（打分/简报）；任何构建失败返回 None → 规则降级，不 503。"""
+        if app.state.intel_llm is not None:
+            return app.state.intel_llm
+        try:
+            router = ModelRouter()
+            t = router.target_for("classifier")
+            llm_store: ProviderStore = app.state.llm_store
+            return llm_store.build(*t) if t else llm_store.build()
+        except Exception:  # noqa: BLE001 —— 无 key/无供应商时情报功能照常（降级）
+            return None
+
+    @app.get("/api/intel/overview")
+    def intel_overview():
+        store = _intel()
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        return {"counts": store.counts(), "today": store.get_brief(today),
+                "top_unread": store.list_articles(unread_only=True, limit=5)}
+
+    @app.get("/api/intel/feeds")
+    def intel_feeds():
+        return {"feeds": intel_config.load_feeds(app.state.intel_dir)}
+
+    @app.put("/api/intel/feeds")
+    def intel_update_feeds(body: IntelFeedsIn):
+        with pack_write_lock():
+            _pack_history_backup(Path(app.state.intel_dir) / "feeds.json")
+            feeds = intel_config.save_feeds(
+                [f.model_dump() for f in body.feeds], app.state.intel_dir)
+        return {"status": "ok", "feeds": feeds}
+
+    @app.get("/api/intel/profile")
+    def intel_profile():
+        return intel_config.load_profile(app.state.intel_dir)
+
+    @app.put("/api/intel/profile")
+    def intel_update_profile(body: IntelProfileIn):
+        # 部分更新：画像表单不携带 vault/search/keywords 时沿用磁盘值。
+        patch = body.model_dump(exclude_unset=True)
+        with pack_write_lock():
+            _pack_history_backup(Path(app.state.intel_dir) / "profile.json")
+            prof = intel_config.save_profile(patch, app.state.intel_dir)
+        return {"status": "ok", "profile": prof}
+
+    def _searxng() -> SearXNG:
+        search_cfg = (intel_config.load_profile(app.state.intel_dir).get("search") or {})
+        sx = dict(search_cfg.get("searxng") or {})
+        sx["settings_path"] = str(SEARXNG_SETTINGS_PATH)
+        service = getattr(app.state, "intel_searxng", None)
+        if service is None:
+            service = SearXNG(sx)
+            app.state.intel_searxng = service
+        else:
+            service.config = {**service.config, **sx}
+        return service
+
+    app.state.get_intel_searxng = _searxng
+
+    def _search_intel(query: str, search_config: dict | None = None, **kwargs):
+        cfg = search_config if isinstance(search_config, dict) else {}
+        searx = cfg.get("searxng") or {}
+        if isinstance(searx, dict) and searx.get("enabled"):
+            service = _searxng()
+            if service.status().get("running"):
+                service._start_relay()
+        return search_intel(query, cfg, **kwargs)
+
+    @app.get("/api/intel/searxng/status")
+    def searxng_status():
+        return _searxng().status()
+
+    @app.post("/api/intel/searxng/connection-test")
+    def searxng_connection_test():
+        return _searxng().connection_test()
+
+    @app.post("/api/intel/searxng/validate-search")
+    def searxng_validate_search(body: dict | None = None):
+        return _searxng().validate_search(str((body or {}).get("query") or "权限提升"))
+
+    @app.get("/api/intel/search/history")
+    def intel_search_history(limit: int = 20):
+        return {"items": _intel().list_searches(limit)}
+
+    @app.get("/api/intel/search/history/{cache_key}")
+    def intel_search_history_get(cache_key: str, limit: int = 10, offset: int = 0):
+        item = _intel().get_search(cache_key)
+        if item is None:
+            raise HTTPException(404, "搜索历史不存在")
+        limit = max(1, min(int(limit or 10), 100))
+        offset = max(0, min(int(offset or 0), 500))
+        rows = item["rows"]
+        page = rows[offset:offset + limit]
+        return {**item["meta"], "query": item["query"], "results": page,
+                "total": item["total"], "has_more": offset + len(page) < len(rows),
+                "cache_key": item["cache_key"], "offset": offset, "cached": True,
+                "created_at": item["created_at"]}
+
+    @app.get("/api/intel/search")
+    def intel_search(q: str = "", limit: int = 10, refresh: bool = False,
+                     cache_key: str = "", offset: int = 0):
+        query = str(q or "").strip()[:120]
+        if not query:
+            raise HTTPException(422, "检索语句不能为空")
+        limit = max(1, min(int(limit or 10), 100))
+        offset = max(0, min(int(offset or 0), 500))
+        window = "half_year"
+        # 搜索结果先缓存完整有序候选集，后续 offset 分页不重复发起网络请求。
+        cache = getattr(app.state, "intel_search_cache", {})
+        key = cache_key or hashlib.sha256(query.casefold().encode("utf-8")).hexdigest()[:40]
+        now_mono = time.monotonic()
+        cached = cache.get(key)
+        if cache_key and (cached is None or now_mono - cached["at"] >= 600):
+            saved = _intel().get_search(key)
+            if saved is None:
+                raise HTTPException(410, "搜索历史已不存在，请重新检索")
+            cached = {"at": now_mono, "query": saved["query"].casefold(),
+                      "rows": saved["rows"], "meta": saved["meta"]}
+            cache[key] = cached
+            app.state.intel_search_cache = cache
+        if cache_key and cached.get("query") != query.casefold():
+            raise HTTPException(422, "缓存检索词与当前查询不匹配")
+        if cached and not refresh and now_mono - cached["at"] < 600:
+            rows = cached["rows"]
+            page = rows[offset:offset + limit]
+            return {**cached["meta"], "results": page, "total": len(rows),
+                    "has_more": offset + len(page) < len(rows), "cache_key": key,
+                    "offset": offset, "cached": True}
+        rows: list[dict] = []
+        since = window_start(window)
+        local = _intel().search_articles(query, since=since, limit=200)
+        rows.extend(local)
+        backend = "local"
+        errors: list[str] = []
+        profile = intel_config.load_profile(app.state.intel_dir)
+        try:
+            # num 放宽到 50：SearXNG 走通用网页索引，单次可稳定给出 20~30 条，
+            # 后续排序/过滤才有腾挪空间（Google News 时代 50 也只能召回 18 条）。
+            external, backend = _search_intel(
+                query, profile.get("search"), num=50, time_range=window)
+            for row in external:
+                if not isinstance(row, dict) or not row.get("url"):
+                    continue
+                day = normalize_day(row.get("published_date") or row.get("publishedDate"))
+                if day and day < since:
+                    continue
+                rows.append({"id": "search-" + hashlib.sha1(row["url"].encode("utf-8")).hexdigest()[:16],
+                             "url": row["url"], "title": row.get("title") or row["url"],
+                             "source": row.get("source") or backend, "kind": "article",
+                             "source_site": row.get("source_site") or "",
+                             "summary": row.get("snippet", ""),
+                             "published_at": row.get("published_date", ""),
+                             "published_day": day, "fetched_at": "", "score": 0,
+                             "direction": "", "is_priority": 0,
+                             "score_detail": json.dumps({"via": backend, "window": "近半年"}, ensure_ascii=False),
+                             "brief_date": None, "read": 0, "starred": 0, "via": backend})
+        except WebSearchError as exc:
+            errors.append(str(exc))
+            backend = "searxng"
+        dedup: dict[str, dict] = {}
+        for row in rows:
+            dedup.setdefault(row.get("url", ""), row)
+        rows = list(dedup.values())
+        # 垃圾页直接丢弃（色情导流、博彩、标题符号堆砌），不进结果也不占分页额度。
+        before = len(rows)
+        rows = [r for r in rows if spam_score(r) > 0]
+        dropped_spam = before - len(rows)
+        for row in rows:
+            row["ranking_score"] = ranking_score(row, window=window, query=query)
+            row["date_known"] = bool(row.get("published_day") or row.get("published_at"))
+        rows.sort(key=lambda r: (int(r.get("is_priority", 0)),
+                                 float(r.get("ranking_score", 0)),
+                                 float(r.get("score", 0)),
+                                 r.get("published_day", ""), r.get("fetched_at", "")),
+                  reverse=True)
+        meta = {"backend": backend, "window_label": "近半年", "errors": errors,
+                "dropped_spam": dropped_spam}
+        cache[key] = {"at": now_mono, "query": query.casefold(),
+                      "rows": rows, "meta": meta}
+        app.state.intel_search_cache = cache
+        _intel().save_search(query, rows, meta, cache_key=key)
+        page = rows[offset:offset + limit]
+        return {**meta, "results": page, "total": len(rows),
+                "has_more": offset + len(page) < len(rows), "cache_key": key,
+                "offset": offset, "cached": False}
+
+    @app.get("/api/intel/search/resolve")
+    def intel_search_resolve(url: str):
+        source = str(url or "")
+        if intel_search_module._google_article_id(source):
+            cached_url = _intel().get_resolved_url(source)
+            if cached_url:
+                return {"url": cached_url}
+        try:
+            resolved = intel_search_module.resolve_google_news_url(
+                intel_search_module.WebSearchConfig.from_file(
+                    intel_search_module.DEFAULT_CONFIG_PATH), source)
+        except WebSearchError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        _intel().save_resolved_url(source, resolved)
+        return {"url": resolved}
+
+    @app.post("/api/intel/searxng/start")
+    def searxng_start():
+        return _searxng().start()
+
+    @app.post("/api/intel/searxng/stop")
+    def searxng_stop():
+        return _searxng().stop()
+
+    @app.post("/api/intel/fetch")
+    def intel_fetch_job():
+        _intel()  # 404 前置：先确保存储就绪再提交 Job
+
+        def _run() -> dict:
+            profile = intel_config.load_profile(app.state.intel_dir)
+            searcher = None
+            if ((profile.get("search") or {}).get("searxng") or {}).get("enabled"):
+                searcher = lambda query, **kwargs: _search_intel(
+                    query, profile.get("search"), **kwargs)
+            return intel_run_refresh(
+                _intel(), profile,
+                intel_config.load_feeds(app.state.intel_dir),
+                llm=_intel_classifier(), getter=app.state.intel_getter,
+                searcher=searcher)
+
+        # 幂等（2026-10-20）：切页回来 IntelView 会重建，自动补跑 effect 在简报
+        # 落库前看到 today=None 会再 POST 一次；同一批源并发抓两遍纯浪费。
+        # 复用进行中的 Job id，前端照常轮询到真实结果。
+        job_id, _created = app.state.jobs.submit_unique("intel-refresh", _run)
+        return {"job_id": job_id}
+
+    @app.get("/api/intel/briefs")
+    def intel_briefs():
+        return {"briefs": _intel().list_briefs()}
+
+    @app.get("/api/intel/briefs/{date}")
+    def intel_brief(date: str):
+        b = _intel().get_brief(date)
+        if b is None:
+            raise HTTPException(404, f"无 {date} 简报")
+        return b
+
+    @app.get("/api/intel/articles")
+    def intel_articles(kind: str | None = None, unread: bool = False,
+                       starred: bool = False, limit: int = 50):
+        limit = max(1, min(limit, 200))
+        return {"articles": _intel().list_articles(
+            kind=kind, unread_only=unread, starred_only=starred, limit=limit)}
+
+    @app.patch("/api/intel/articles/{article_id}")
+    def intel_mark_article(article_id: str, body: IntelArticlePatch):
+        row = _intel().mark_article(article_id, read=body.read, starred=body.starred)
+        if row is None:
+            raise HTTPException(404, f"文章不存在: {article_id}")
+        return row
+
+    # ---- E10：Obsidian vault 只读接入 + 学习档案 + 周计划（§16.3；正文不出本机） ----
+
+    def _intel_profile_full() -> dict:
+        return intel_config.load_profile(app.state.intel_dir)
+
+    @app.get("/api/intel/vault")
+    def intel_vault_info():
+        prof = _intel_profile_full()
+        info = _intel().note_stats()
+        info.update(prof.get("vault", {}))
+        info["configured"] = bool(prof.get("vault", {}).get("path"))
+        return info
+
+    @app.put("/api/intel/vault")
+    def intel_update_vault(body: IntelVaultIn):
+        prof = _intel_profile_full()
+        prof["vault"] = {"path": body.path, "enabled": body.enabled}
+        with pack_write_lock():  # profile.json 与画像同文件同锁同备份
+            _pack_history_backup(Path(app.state.intel_dir) / "profile.json")
+            prof = intel_config.save_profile(prof, app.state.intel_dir)
+        job_id = None
+        if prof["vault"]["enabled"] and prof["vault"]["path"]:
+            job_id = _submit_vault_index(prof["vault"]["path"])
+        return {"status": "ok", "vault": prof["vault"], "index_job_id": job_id}
+
+    def _submit_vault_index(vault_path: str) -> str:
+        def _run() -> dict:
+            notes = intel_vault.index_vault(vault_path)
+            n = _intel().replace_notes(notes)
+            return {"indexed": n, "elapsed": None}
+
+        return app.state.jobs.submit("vault-index", _run)
+
+    @app.post("/api/intel/vault/index")
+    def intel_vault_index_job():
+        vpath = _intel_profile_full().get("vault", {}).get("path", "")
+        if not vpath:
+            raise HTTPException(422, "未配置 vault 路径（设置页 → 情报源）")
+        return {"job_id": _submit_vault_index(vpath)}
+
+    @app.get("/api/intel/vault/tree")
+    def intel_vault_tree():
+        notes = _intel().list_notes()
+        if not notes:
+            return {"configured": bool(_intel_profile_full().get("vault", {}).get("path")),
+                    "tree": []}
+        return {"configured": True, "tree": intel_vault.build_tree(notes)}
+
+    @app.get("/api/intel/vault/search")
+    def intel_vault_search(q: str = ""):
+        return {"hits": _intel().search_notes(q)}  # 元数据+snippet，不返回全文
+
+    @app.get("/api/intel/learning/profile")
+    def intel_learning_profile_ep():
+        return intel_learning_profile(_intel(), _intel_profile_full())
+
+    @app.post("/api/intel/learning/plan")
+    def intel_learning_plan_job():
+        _intel()  # 404 前置
+        week = intel_week_start()
+
+        def _run() -> dict:
+            store = _intel()
+            prof = _intel_profile_full()
+            agg = intel_learning_profile(store, prof)
+            brief = store.get_brief(time.strftime("%Y-%m-%d", time.gmtime()))
+            if brief is None:
+                briefs = store.list_briefs()
+                if briefs:
+                    brief = store.get_brief(briefs[0]["date"])
+            articles = store.list_articles(kind="article", limit=15)
+            content, stats = intel_weekly_plan(agg, brief, articles, week,
+                                               llm=_intel_classifier())
+            # 隐私红线：inputs 只存统计，不存笔记正文
+            store.save_plan(week, content, stats)
+            return stats
+
+        return {"job_id": app.state.jobs.submit("learning-plan", _run),
+                "week": week}
+
+    @app.get("/api/intel/learning/plan")
+    def intel_learning_plan_ep(week: str | None = None):
+        plan = _intel().get_plan(week) if week else _intel().latest_plan()
+        if plan is None:
+            raise HTTPException(404, "尚无学习计划")
+        return plan
+
+    @app.get("/api/intel/learning/plans")
+    def intel_learning_plans_ep():
+        return {"plans": _intel().list_plans()}
+
+    # ---------- 阅读器（2026-10-27）：正文提取 + AI 侧栏 ----------
+    # 设计意图：点文章不再交给系统浏览器（那必然撞上广告/弹窗/登录墙），
+    # 而由平台自己把正文剥出来渲染，广告与弹窗在这种渲染方式下**根本不存在**。
+
+    def _intel_reader():
+        """阅读器依赖的注入点：测试可换成不触网的假 getter / renderer。"""
+        return (getattr(app.state, "intel_reader_fetch", None),
+                getattr(app.state, "intel_reader_render", None))
+
+    def _reader_payload(result: reader_mod.ReadResult) -> dict:
+        """阅读器响应统一出口：把正文配图换成走本平台代理的地址。
+
+        **为什么必须代理**（2026-10-27 实测）：媒体站的图片有防盗链，直连
+        `<img src>` 从 localhost 打开一律挂掉（先知社区的图返回 302 + 需要
+        Referer/Cookie，实测 naturalWidth=0，正文里 7 张图全是空的）。
+        由后端带 UA/Referer 取回再转给前端，既不依赖目标站的防盗链策略，
+        也不把用户的 IP 与页面来源暴露给图床。原文 URL 仍留在 `?url=` 参数里，
+        要复制原图链接不受影响。
+        """
+        data = result.to_dict()
+        data["markdown"] = proxy_reader_images(data.get("markdown") or "")
+        return data
+
+    @app.get("/api/intel/read")
+    def intel_read(url: str, refresh: bool = False):
+        """取文章正文。缓存优先；`refresh=true` 强制重抓。
+
+        返回 `cached` 让前端能区分「秒开」与「真去抓了」——抓取有 20~35 秒
+        的渲染兜底路径，没有这个标记用户会以为界面卡住了。
+
+        两条分支都要过 `proxy_reader_images`：正文图普遍有防盗链，直连
+        `<img src>` 从 localhost 打开必挂（实测先知社区 7 张图全 0 宽）。
+        """
+        target = reader_mod.normalize_url(url)
+        if not target:
+            raise HTTPException(422, "只支持 http/https 链接")
+        store = _intel()
+        if not refresh:
+            hit = store.get_read(target, max_age_s=READER_CACHE_TTL_S)
+            if hit is not None:
+                hit = dict(hit)
+                hit["markdown"] = proxy_reader_images(hit.get("markdown") or "")
+                return {**hit, "cached": True}
+        fetch, render = _intel_reader()
+        result = reader_mod.read_article(
+            target, fetch=fetch, render=render,
+            allow_render=getattr(app.state, "intel_reader_render_enabled", True))
+        store.save_read(result.to_dict())
+        return {**_reader_payload(result), "cached": False}
+
+    @app.get("/api/intel/read/imported")
+    def intel_read_imported(url: str):
+        """Return only a recent article explicitly imported from the user's browser."""
+        target = reader_mod.normalize_url(url)
+        if not target:
+            raise HTTPException(422, "只支持 http/https 链接")
+        hit = _intel().get_read(target, max_age_s=READER_CACHE_TTL_S)
+        if hit is None or hit.get("engine") != "browser-import":
+            raise HTTPException(404, "尚无从浏览器导入的文章正文")
+        hit["markdown"] = proxy_reader_images(hit.get("markdown") or "")
+        return {**hit, "cached": True, "imported": True}
+
+    @app.post("/api/intel/read/import-browser")
+    async def intel_read_import_browser(request: Request):
+        """Accept a rendered Zhihu article from the local user-authorized browser."""
+        client_host = request.client.host if request.client else ""
+        if client_host not in {"127.0.0.1", "::1"}:
+            raise HTTPException(403, "只接受本机浏览器导入")
+        electron_bridge = request.headers.get("x-cyberstrike-reader", "") == "electron"
+        if not electron_bridge:
+            raise HTTPException(403, "只接受 CyberStrike 隔离桌面会话导入")
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise HTTPException(415, "只接受 JSON 页面内容")
+        try:
+            declared = int(request.headers.get("content-length", "0"))
+        except ValueError:
+            declared = 0
+        if declared > READER_IMPORT_MAX_BYTES:
+            raise HTTPException(413, "文章页面超过 12 MiB 导入上限")
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > READER_IMPORT_MAX_BYTES:
+                raise HTTPException(413, "文章页面超过 12 MiB 导入上限")
+        try:
+            payload = json.loads(bytes(raw))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise HTTPException(400, "无法解析浏览器页面内容") from None
+        if not isinstance(payload, dict):
+            raise HTTPException(400, "导入内容格式无效")
+        target = reader_mod.normalize_url(str(payload.get("url") or ""))
+        parts = urllib.parse.urlsplit(target)
+        if (parts.scheme != "https" or parts.hostname != "zhuanlan.zhihu.com"
+                or not re.fullmatch(r"/p/\d+/?", parts.path)):
+            raise HTTPException(422, "只允许导入知乎专栏文章页")
+        html = payload.get("html")
+        if not isinstance(html, str) or not html.strip():
+            raise HTTPException(422, "浏览器没有提供文章页面内容")
+        if len(html.encode("utf-8")) > READER_IMPORT_MAX_BYTES:
+            raise HTTPException(413, "文章页面超过 12 MiB 导入上限")
+        if re.search(r"(?is)<meta[^>]+id=[\"']zh-zse-ck[\"']", html):
+            raise HTTPException(422, "当前浏览器页面仍停在知乎安全校验页")
+        result = await run_in_threadpool(
+            reader_mod.read_article, target, fetch=lambda _url: (200, html, target),
+            render=lambda _url: ("", target), allow_render=False)
+        if result.status == "failed" or result.chars < reader_mod.FAIL_CONTENT_CHARS:
+            raise HTTPException(422, "导入页面未提取到可读正文；请确认知乎文章已完整显示")
+        result.engine = "browser-import"
+        result.warnings.append("正文由用户当前浏览器页面导入")
+        store = _intel()
+        store.save_read(result.to_dict())
+        return {**_reader_payload(result), "cached": False, "imported": True}
+
+    @app.post("/api/intel/read/refresh")
+    def intel_read_refresh(body: dict | None = None):
+        """强制重抓（失败后重试用）。与 GET+refresh 等价，单独给前端按钮用。"""
+        target = reader_mod.normalize_url(str((body or {}).get("url") or ""))
+        if not target:
+            raise HTTPException(422, "只支持 http/https 链接")
+        fetch, render = _intel_reader()
+        result = reader_mod.read_article(
+            target, fetch=fetch, render=render,
+            allow_render=getattr(app.state, "intel_reader_render_enabled", True))
+        _intel().save_read(result.to_dict())
+        return {**_reader_payload(result), "cached": False}
+
+    @app.get("/api/intel/read/image")
+    def intel_read_image(url: str):
+        """正文配图代理：带 UA/Referer 取回图片字节流。
+
+        只放行 http/https，**且目标必须是公网主机**（`is_public_host`：防这个
+        端点被当成内网探测器），限制体积与类型（只回 `image/*`）。
+        跟随重定向——媒体站基本都把图片 302 到对象存储。
+        """
+        target = reader_mod.normalize_url(url)
+        if not target:
+            raise HTTPException(422, "只支持 http/https 链接")
+        if not reader_mod.is_public_host(target):
+            raise HTTPException(403, "不允许访问内网/本机地址")
+        parts = urllib.parse.urlsplit(target)
+        try:
+            req = urllib.request.Request(target, headers={
+                "User-Agent": reader_mod.UA_DESKTOP,
+                "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                # 防盗链普遍校验 Referer：用它自己的站点根做来源最稳
+                "Referer": f"{parts.scheme}://{parts.netloc}/",
+            })
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                ctype = (resp.headers.get_content_type() or "").lower()
+                if not ctype.startswith("image/"):
+                    raise HTTPException(415, f"不是图片（{ctype or '未知类型'}）")
+                body = resp.read(READER_IMAGE_MAX_BYTES + 1)
+        except HTTPException:
+            raise
+        except Exception as e:                       # noqa: BLE001 —— 图片挂了不该 500
+            raise HTTPException(502, f"图片获取失败：{type(e).__name__}") from e
+        if len(body) > READER_IMAGE_MAX_BYTES:
+            raise HTTPException(413, "图片过大")
+        return Response(content=body, media_type=ctype, headers={
+            "Cache-Control": "public, max-age=86400",
+            # 图床内容不可信：禁掉嗅探与脚本，避免 SVG 之类在本站源下被执行
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+        })
+
+    def _intel_chat_llm():
+        """阅读器问答用的模型：优先 executor 角色（对话质量要够），
+        缺配置时退 classifier，最终 None → 端点回可读错误而不是 503。"""
+        if getattr(app.state, "intel_reader_llm", None) is not None:
+            return app.state.intel_reader_llm
+        try:
+            router = ModelRouter()
+            store: ProviderStore = app.state.llm_store
+            for role in ("executor", "classifier"):
+                try:
+                    target = router.target_for(role)
+                    return store.build(*target) if target else store.build()
+                except Exception:  # noqa: BLE001 —— 换下一个角色试
+                    continue
+            return store.build()
+        except Exception:  # noqa: BLE001 —— 无 key/无供应商
+            return None
+
+    @app.post("/api/intel/read/ask")
+    async def intel_read_ask(request: Request, body: dict):
+        """阅读器 AI 问答（SSE 流式）。
+
+        body: {url, question, selection?, selection_action?, history?, text?}
+        - `text` 由前端带上当前正文，避免后端为一次提问再抓一遍页面
+          （抓取要 20 秒以上，提问等不起）；后端仍会在缺失时按 url 取缓存。
+        """
+        data = body or {}
+        question = str(data.get("question") or "").strip()[:4000]
+        selection = str(data.get("selection") or "").strip()[:reader_ai_mod.MAX_SELECTION]
+        action = str(data.get("selection_action") or "").strip()
+        if action and not question:
+            question = reader_ai_mod.selection_action_prompt(action)
+        if not question and not selection:
+            raise HTTPException(422, "问题不能为空")
+
+        article_text = str(data.get("text") or "").strip()
+        title = str(data.get("title") or "").strip()
+        if not article_text:
+            # 前端没带正文 → 退回缓存（绝不在这个路径里现抓：用户已经点过阅读，
+            # 正文必然刚取过，缓存是热的；冷缓存说明客户端状态异常）
+            target = reader_mod.normalize_url(str(data.get("url") or ""))
+            hit = _intel().get_read(target) if target else None
+            if hit is not None:
+                article_text = str(hit.get("text") or "")
+                title = title or str(hit.get("title") or "")
+        article = reader_ai_mod.ArticleContext(
+            title=title, url=str(data.get("url") or ""),
+            site=str(data.get("site") or ""), published=str(data.get("published") or ""),
+            text=article_text)
+        history = data.get("history") if isinstance(data.get("history"), list) else []
+        messages = reader_ai_mod.build_messages(
+            article, question, selection=selection, history=history)
+
+        llm = _intel_chat_llm()
+
+        async def generate():
+            if llm is None:
+                yield _sse({"type": "error",
+                            "message": "未配置可用的模型供应商，无法使用 AI 提问"})
+                yield _sse({"type": "done"})
+                return
+            queue: asyncio.Queue = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+            cancelled = threading.Event()
+
+            def _emit(kind: str, payload: dict) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, (kind, payload))
+
+            def _worker() -> None:
+                try:
+                    resp = llm.chat(
+                        messages, system=reader_ai_mod.SYSTEM_PROMPT,
+                        max_tokens=4096, temperature=0.3,
+                        on_text=lambda chunk: _emit("delta", {"text": chunk}),
+                        should_cancel=lambda: cancelled.is_set() or loop.is_closed())
+                    full = getattr(resp, "text", "") or ""
+                    _emit("final", {"text": full,
+                                    "usage": _usage_dict(getattr(resp, "usage", None))})
+                except Exception as e:  # noqa: BLE001 —— 失败必须传回前端而不是静默断流
+                    _emit("error", {"message": f"{type(e).__name__}: {e}"})
+                finally:
+                    _emit("done", {})
+
+            threading.Thread(target=_worker, name="intel-read-ask", daemon=True).start()
+
+            # 流式增量与最终全文可能重复（有的供应商只回一次性全文、不回调
+            # on_text）；前端按 `type` 区分，此处原样转发两者。
+            streamed: list[str] = []
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        cancelled.set()
+                        break
+                    try:
+                        kind, payload = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": ping\n\n"      # 保活：长模型思考时防代理层掐连接
+                        continue
+                    if kind == "delta":
+                        streamed.append(str(payload.get("text") or ""))
+                        yield _sse({"type": "delta", "text": payload.get("text") or ""})
+                    elif kind == "final":
+                        text = str(payload.get("text") or "")
+                        if not streamed and text:
+                            # 供应商不支持逐字增量 → 一次性补发，前端体验一致
+                            yield _sse({"type": "delta", "text": text})
+                        yield _sse({"type": "final", "text": text,
+                                    "usage": payload.get("usage")})
+                    elif kind == "error":
+                        yield _sse({"type": "error", "message": payload.get("message")})
+                    elif kind == "done":
+                        yield _sse({"type": "done"})
+                        break
+            finally:
+                cancelled.set()
+
+        return StreamingResponse(generate(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "Connection": "keep-alive",
+                                          "X-Accel-Buffering": "no"})
+
+    @app.get("/api/intel/read/actions")
+    def intel_read_actions():
+        """划线浮动菜单的固定动作（前端按钮与 prompt 单一来源）。"""
+        return {"actions": [{"key": k, "label": v[0], "prompt": v[1]}
+                            for k, v in reader_ai_mod.SELECTION_ACTIONS.items()]}
+
+    @app.post("/api/intel/read/login")
+    def intel_read_login():
+        """「一键登录」：弹真实浏览器让用户扫码，登录态存盘后阅读器自动复用。
+
+        **Job 而非同步请求**：登录要等真人扫码（最多 5 分钟），HTTP 请求等不了
+        这么久——返回 job_id，前端轮询 `/api/jobs/{id}`。
+        `submit_unique` 保证连点/多窗口只起一个登录浏览器（Chromium profile
+        是进程级排他锁，两个实例会直接冲突）。
+
+        **必须 asyncio.run 包一层**：`run_login_flow` 是 async 函数，Job 的
+        runner 是普通线程——直接 lambda 调用只会得到一个从未 await 的协程，
+        Job 秒「完成」但什么都没做（实测：contract 测试的 coroutine 警告暴露）。
+        """
+        job_id, created = app.state.jobs.submit_unique(
+            "reader-login",
+            lambda: asyncio.run(reader_mod.run_login_flow(
+                headless=False, progress=lambda m: log.info("reader-login: %s", m))))
+        return {"job_id": job_id, "created": created}
+
+    @app.get("/api/intel/read/login/status")
+    def intel_read_login_status():
+        """登录态速查：前端用它决定失败卡片显示「一键登录」还是「重新登录」。"""
+        return {"ready": reader_mod.reader_profile_ready(),
+                "locked": reader_mod.profile_locked()}
+
+    # ---------- Job 轮询 ----------
+
+    @app.get("/api/jobs/{job_id}")
+    def get_job(job_id: str):
+        job = app.state.jobs.get(job_id)
+        if job is None:
+            raise HTTPException(404, f"任务不存在: {job_id}")
+        return job
+
+    # ---------- WebSocket 事件流 ----------
+
+    @app.websocket("/api/ws/projects/{pid}")
+    async def ws_events(ws: WebSocket, pid: str, since_id: int = 0,
+                        tick_s: int = 5):
+        await ws.accept()
+
+        async def _reject() -> None:
+            # 1008 = policy violation：项目删除中/已删除，前端据此停止重连
+            if ws.application_state != WebSocketState.DISCONNECTED:
+                await ws.close(code=1008)
+
+        if pid in app.state.projects_closing:
+            await _reject()
+            return
+        try:
+            proj = await run_in_threadpool(_project, pid)
+        except HTTPException:  # 项目已删除（404）或删除中（409）
+            await _reject()
+            return
+        cursor = since_id
+        # 应用层心跳（2026-09-29 消息刷新不及时复盘）：WS 名为推送实为 1s 查库，
+        # 空转期零帧——半开连接（服务端→客户端方向静默死）时浏览器收不到 close
+        # 帧、自身不发探测，连接永远 OPEN 但不打货，前端无限期卡住（切页面
+        # 重挂载新建 WS 才恢复）。空闲满 tick_s 拍发一条不落库的 ws.tick 帧：
+        # 前端看门狗据此区分「管道死」（20s 无任何帧→判死重连）与「健康静默」
+        # （长命令执行期 tick 照常到达，不误判）。
+        tick_s = max(1, min(tick_s, 60))
+        # 轮询间隔（2026-10-04 流式顺滑化）：此前无事件时固定 sleep(1.0)——delta 每
+        # ~0.25s 落一条，查库命中后立即再查必空 → 睡满 1s，前端于是**每秒才收到一批**
+        # delta，文本 1Hz 跳变（观感「一顿顿的」；后端再降 delta 节流阈值也治不了，
+        # 瓶颈在这个投递节奏）。改为 50ms 短轮询：有事件即时连查（延迟≈0），无事件
+        # 最多 50ms 后再查，流式投递延迟 ≤~50ms。空闲心跳按时间折算（≈tick_s 秒），
+        # 语义不变（前端看门狗只看「20s 零帧」）。
+        poll_s = 0.05
+        tick_loops = max(1, round(tick_s / poll_s))
+        idle_loops = 0
+        # 思考快照的增量游标（浮点秒，v51）。与 events 的 cursor **完全独立**：
+        # 快照不是事件、没有 id，混进同一条游标会让重连回放跳号。0.0 起步 =
+        # 连上就把当前正在流的那一步推一遍（收尾会 prune，正常只剩在跑的一步）。
+        state_ts = 0.0
+        try:
+            while True:
+                if pid in app.state.projects_closing:
+                    await _reject()
+                    return
+                try:
+                    events = await run_in_threadpool(
+                        proj.bb.recent_events, pid, cursor, 100)
+                except BlackboardClosedError:
+                    # 删除路由 close_all 了旧实例：退出，不要重连复活连接
+                    await _reject()
+                    return
+                except Exception:
+                    # tick 正执行时连接被 close_all 关掉（sqlite 操作已关闭连接）
+                    # 只在删除窗口内吞掉并优雅 1008；其他场景照常冒泡，不遮 bug
+                    if pid in app.state.projects_closing:
+                        await _reject()
+                        return
+                    raise
+                if events:
+                    idle_loops = 0
+                for e in events:
+                    await ws.send_json(e)
+                    cursor = e["id"]
+                # 思考增量快照（v51，thinking-delta-snapshot）：状态快照不是事件，
+                # 无 id、不推游标，前端在 `ws.tick` 那行旁边拦截（必须拦在
+                # `e.id <= cursor` 之前，否则 undefined 污染游标）。
+                # 独立 try：快照读失败只丢思考面板的帧，不能连带掐断消息推送。
+                try:
+                    states = await run_in_threadpool(
+                        proj.bb.recent_delta_states, pid, state_ts, 20)
+                except Exception:  # noqa: BLE001
+                    states = []
+                for st in states:
+                    state_ts = max(state_ts, float(st["updated_at"]))
+                    await ws.send_json({
+                        "kind": "ws.thinking",
+                        "thread_id": st["thread_id"],
+                        "step": st["step"],
+                        "seq": st["seq"],
+                        "text": st["text"],
+                        "ts": time.time(),
+                    })
+                if not events:
+                    idle_loops += 1
+                    if idle_loops >= tick_loops:
+                        await ws.send_json(
+                            {"kind": "ws.tick", "ts": time.time()})
+                        idle_loops = 0
+                    await asyncio.sleep(poll_s)
+        except WebSocketDisconnect:
+            return
+
+    # ---- F6-v2 浏览器实时画面流（CDP screencast → WS → 前端回传接管输入） ----
+
+    @app.websocket("/api/projects/{pid}/browser/ws")
+    async def ws_browser(ws: WebSocket, pid: str, sid: str | None = None):
+        """指定真实浏览器 Page 的画面流；缺省使用人类主页面。"""
+        await ws.accept()
+
+        async def _close(code: int) -> None:
+            # 1008=项目删除中/已删（前端停重连）；1011=浏览器侧不可用（依赖缺失）
+            if ws.application_state != WebSocketState.DISCONNECTED:
+                await ws.close(code=code)
+
+        if pid in app.state.projects_closing:
+            await _close(1008)
+            return
+        try:
+            await run_in_threadpool(_project, pid)
+        except HTTPException:  # 项目已删除（404）或删除中（409）
+            await _close(1008)
+            return
+        if not browser_available():
+            await ws.send_json({"type": "error",
+                                "message": "playwright 未安装：pip install -e \".[browser]\" "
+                                           "&& playwright install chromium"})
+            await _close(1011)
+            return
+        inst = app.state.browser_pool.get_instance(pid)
+        try:
+            if not sid:
+                sid = (await run_in_threadpool(inst.ensure_human_session))["sid"]
+            else:
+                exists = await run_in_threadpool(lambda: inst.session_exists(sid))
+                if not exists:
+                    raise BrowserError(f"浏览器会话不存在: {sid}")
+        except BrowserError:
+            await ws.send_json({"type": "error", "message": "浏览器会话创建失败"})
+            await _close(1011)
+            return
+
+        frames: asyncio.Queue = asyncio.Queue(maxsize=30)
+
+        def _put(q: asyncio.Queue, item: dict) -> None:
+            try:
+                q.put_nowait(item)
+            except asyncio.QueueFull:  # 丢帧保最后，不背压浏览
+                try:
+                    q.get_nowait()
+                    q.put_nowait(item)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        def _sink(frame: dict) -> None:
+            # 在实例 loop 线程被调 → 桥回本（uvicorn）事件循环
+            inst._loop.call_soon_threadsafe(_put, frames, frame)
+
+        await run_in_threadpool(inst.attach_screencast, sid, _sink)
+
+        async def _sender() -> None:
+            while True:
+                frame = await frames.get()
+                await ws.send_json({"type": "frame", **frame})
+
+        send_task = asyncio.create_task(_sender())
+        try:
+            while True:
+                msg = await ws.receive_json()
+                if msg.get("type") == "input":
+                    kind = str(msg.get("kind", ""))
+                    kw = {k: v for k, v in msg.items()
+                          if k not in ("type", "kind")}
+                    # 接管输入异步注入（不阻塞帧推送）；红线校验在 human_input 内
+                    async def _inject(kind=kind, kw=kw):
+                        try:
+                            await run_in_threadpool(inst.human_input, sid, kind, **kw)
+                        except Exception:  # noqa: BLE001 —— 注入失败静默（画面即真相）
+                            pass
+                    asyncio.create_task(_inject())
+        except WebSocketDisconnect:
+            pass
+        finally:
+            send_task.cancel()
+            try:
+                await run_in_threadpool(inst.detach_screencast, sid, _sink)
+            except Exception:  # noqa: BLE001 —— 实例已停等：清理降级
+                pass
+
+    # SPA 同源静态托管（desktop-app-shell M2，DESIGN §1）：前端本就走相对路径
+    # （/api/* 与 location.host 拼 WS），同源后零改动；Vite dev 代理仅开发期保留。
+    # 挂载点在 return 前=路由注册序最后，全部 API/WS/docs 路由先匹配，兜底不遮蔽。
+    if static_dir is not None:
+        dist = Path(static_dir)
+        index_html = dist / "index.html"
+        if not index_html.is_file():
+            raise ValueError(f"static_dir 缺 index.html：{dist}")
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        def _spa_fallback(full_path: str) -> FileResponse:
+            top = full_path.split("/", 1)[0]
+            # API/Swagger 例外不兜底（未知 API GET 回 404 而非 index.html，别坑调试）
+            if top in ("api", "docs", "redoc") or full_path == "openapi.json":
+                raise HTTPException(status_code=404, detail="Not Found")
+            candidate = (dist / full_path).resolve()
+            # 防穿越（路径参数解码后可能含 ..\ 等分隔符）：resolve 后必须仍在产物目录内
+            if (full_path
+                    and str(candidate).startswith(str(dist.resolve()) + os.sep)
+                    and candidate.is_file()):
+                return FileResponse(candidate)
+            return FileResponse(index_html)
+
+    return app

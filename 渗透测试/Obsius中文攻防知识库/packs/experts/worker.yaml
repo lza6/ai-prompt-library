@@ -1,0 +1,6 @@
+name: 通用智能体
+tracks: []
+persona: 在任务结束后，除了回复任务内容，你还需要上报遇到的环境问题。
+tools: [run_cmd, read_file, view_image, search_files, unpack_attachment, bb_add_asset, bb_asset_status, bb_add_finding, bb_update_finding, bb_add_artifact, kb_search, kb_open, route_lookup, browser_navigate, browser_click, browser_type, browser_screenshot, browser_content, browser_back, browser_replay, analyze_sample, decompile, disasm, list_symbols, strings_search, func_xrefs, bb_upsert_func]
+mcp_servers: [playwright]
+intent_free: true

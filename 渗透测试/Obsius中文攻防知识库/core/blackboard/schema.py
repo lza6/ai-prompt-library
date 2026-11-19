@@ -1,0 +1,1409 @@
+"""黑板 SQLite schema（DESIGN.md §5.2 数据模型 v6 的 DDL 实现）。
+
+设计要点：
+- WAL 模式：多会话并发读、单写入口（core API）。
+- findings / func_kb 用 UNIQUE 指纹去重，重复写入合并而非新增（§5.3）。
+- chains 的节点必须引用既有 finding/func_kb/artifact，黑板层校验防幻觉（§5.2）。
+- 所有实体带 author，形成审计链（§5.2 末）。
+"""
+
+import sqlite3
+
+SCHEMA_VERSION = 55
+
+# v54→v55（线程级工作区，thread-workspace，2026-11-02 Nan 要求）：chat_threads
+# 增 `workspace` 列。工作区此前是**项目级**（projects.meta.workspace），同一项目
+# 里两个主控线程互改，切换主控后 UI 显示的是另一个主控的目录（用户实测）。
+# 现在：线程显式设置优先；未设置（''）沿 parent_thread_id 继承父主控的工作区，
+# 父链也没有 → 回项目级（meta.workspace → 关联目录包 → 项目目录）。子专家线程
+# 不复制路径，保持 '' 以便父主控改目录后动态跟随。
+
+# v52→v53（功能图工作台，dev 轨，2026-10-30）：功能树升级为**功能图**——
+# 一张图 = 一个功能（feature_trees 一行），图内节点 = 实现该功能的文件夹/文件/
+# 子功能（feature_tree_nodes）。二进制语义下 binary_sha256 存功能 key
+# （''=项目级图）；图级验收状态 status（pending/passed，人类 UI 改，Agent 不可
+# 自标）。node_type（feature/folder/file）+ path（工作区相对路径，folder 优先
+# 展示，file 可直接定位到实现代码）。历史数据回填：既有树 status=pending（新列
+# DEFAULT），节点 node_type 保持默认 feature、path 空——旧节点语义是「程序功能点」，
+# 不猜测成文件路径。
+
+# v51→v52（线程事件索引，child-events，2026-10-26）：events 增
+# `(project_id, author, id)` 复合索引，供 `bb_query(what="child_events")` 按
+# `author == thread_id` 取「某线程自己产生的事件」。
+#
+# **为什么非加不可**：没有这个索引时，`WHERE project_id=? AND author=? ORDER BY
+# id DESC` 只能用 `(project_id, id)` 反向扫；目标线程的最新事件距项目末端 9,482
+# 条时，「先取尾部 N 条再在 Python 侧筛」的做法返回 **0 条**——看起来像「这个
+# 子 agent 什么都没干」，实际是扫的窗口根本没到它。这是本次要修的核心 bug。
+#
+# **为什么用 author 不用 session_id**：`core/chat/runtime.py` 的 `_emit()` 对
+# 全部 chat.* 事件硬编码 `session_id=None`（实测 chat.tool 2,386 条、chat.usage
+# 1,045 条、chat.thinking 614 条、chat.message 116 条**无一例外**），按
+# session_id 查线程会漏掉这些；author 写的是 `chat-{thread_id[-12:]}`，而线程 id
+# 本身就是 `chat-<12 hex>`，两者逐字相等。
+#
+# 纯 `CREATE INDEX IF NOT EXISTS`，DDL 幂等，旧库打开即建，无需 ALTER。
+#
+# v50→v51（思考增量降级为状态快照，thinking-delta-snapshot，2026-10-26）：新增
+# chat_delta_state 表，`chat.thinking.delta` 从**事件流**改为**状态快照**。
+#
+# **为什么改**：原实现每条 delta 都 `INSERT INTO events` 并携带**累计全文**，
+# 形成平方级放大——实测一条 9,147 字的思考块被写成 6,547 行、57 MB（6,400×），
+# 全量 8.19 GB / 306 万行。而 delta 的信息量**恒为零**：它是 `chat.thinking`
+# 终稿的前缀（抽 30/30 命中，最长那条与终稿完全相等），删掉不损失任何审计现场。
+#
+# **为什么不能「不落库只推流」**：`/api/ws/projects/{pid}` 不是推送，是 50ms
+# 轮询 `recent_events`（app.py `poll_s=0.05`）——不落库就没有可轮询的载体；
+# 合成 id 也不行（前端 `e.id > cursorRef` 过滤 + 重连回放会跳游标）。
+#
+# **快照语义**：每 (线程, 步) 恒一行，`ON CONFLICT DO UPDATE` 覆盖。写入量从
+# 「每帧一行」降到「每步一行」，体积与思考长度的平方无关、只与步数线性相关。
+# 投递侧在 `ws_events` 循环里按 `updated_at` 增量读出，推 `ws.thinking` 瞬时帧
+# （无 id，前端在 `ws.tick` 那行旁边拦截，不推进游标）。`updated_at` 用 REAL
+# 秒级浮点（不是 ISO 文本）——轮询每 50ms 比一次，文本比较要走两次解析。
+#
+# **清理**：线程收尾时随 `prune_chat_thread_deltas` 一起删（见
+# `Blackboard.prune_delta_states`）。历史行不回溯删除——由 scripts/db_compact.py
+# 统一处理（它删的是 events 里的旧 delta，与本表无关）。
+
+# v49→v50（CTF 方向组账本，ctf-direction-ledger，2026-10-25）：新增
+# ctf_session_state / ctf_direction_groups / ctf_direction_runs /
+# ctf_summary_batches / ctf_summary_items 五张表。表注释在 DDL 里（建表处
+# 就近说明职责与幂等键）。纯建表、无 ALTER，旧库打开即建；**存量方向不回溯
+# 补建**——内存账本从未落库，凭消息文本反推会把「讨论过」当成「派过」。
+
+# v48→v49（主控改名，pentest-controller，2026-10-25）：chat_threads.agent_id 的
+# 存量值 `chat-orchestrator` 归一为 `pentest-controller`。该列的取值直接决定
+# `ChatTurn.__init__` 认不认它是控制器（`CONTROLLER_IDS`）——不改的话，老项目
+# 里所有历史主控线程都会掉回「普通专家」工具面（没有 call_expert、没有
+# todo_write），历史会话看上去还在、实际已经不能续跑。
+# 无 ALTER（纯数据迁移），幂等靠 meta 键 `agent_id_rename_migration` 去重。
+
+# v47→v48（线程级思考强度，thinking-effort，2026-10-21）：chat_threads 幂等补
+# thinking_effort（七档：minimal/low/medium/high/xhigh/max/ultra，''=跟随该供应商
+# 的配置）。工作台 composer 的模型浮层里，模型与强度是**两个独立的线程级覆写**：
+# 同一个模型在不同任务上要的深度不同（扫描要快、逆向要深），把它绑在供应商配置上
+# 就没法按会话调。七档→线上值的归并见 core/llm/effort.py（唯一真源）。
+
+# v46→v47（CTF 题目 flag 台账，challenge-flag-ledger，2026-10-19）：新增
+# challenge_flags 表——flag 从 findings 迁出独立建模。findings 的「正式漏洞
+# 五项必填契约」是为渗透结论设计的，CTF flag 不是漏洞，此前只能硬写套话过闸。
+# 题目状态（untouched/running/partial/solved/abandoned）由本表**派生**，不独立
+# 维护；``verdict='rejected'`` 是人工否决清单（同串再提交必须拦）。表由 DDL 的
+# IF NOT EXISTS 直接建（无 ALTER），旧库打开即建；存量 flag（findings 里
+# vuln_class='flag-capture' 且 evidence.flag 非空）由惰性迁移补登，见
+# core/blackboard/challenge_flags.py::backfill_from_findings。
+
+# v45→v46（Worker 间过程级信息交换，artex-traces，2026-10-19）：chat_threads
+# 幂等补 artex_intent_id / artex_task_id，使 Worker 执行线程与 ARTEX Intent/任务
+# 可关联——支撑 list/get/search_worker_traces 从 chat_messages 反推执行过程。
+# 历史行保持空值不回填。
+
+# v44→v45（Intent 依赖序，artex-deps，2026-10-19）：artex_intents 幂等补
+# depends_on（JSON id 数组，''/'[]' = 无依赖）。真实攻击链常是**有前后依赖的
+# 串行序列**（注入点→凭据→横向→提权），后一步要用前一步的实际产出；此前一次性
+# 并行下发会让下游 worker 拿不到还不存在的前置，只能空转或重复探测。存 id 数组
+# 而**不**用外键：Intent 删除后残留 id 视为已满足（不阻断），避免悬空依赖死锁。
+# Frontier（claim_next_intent）据此加依赖闸：依赖未全 completed 不得领取；依赖
+# 中出现 failed/cancelled 时本 Intent 置 blocked 并说明原因（上游 planner.go:333
+# 「串行利用链：分步派，别拆成并行」的调度侧落地）。
+
+# v43→v44（任务资产锚点与覆盖度，artex-coverage，2026-10-19）：新增
+# artex_task_assets —— 任务的「范围资产」（复刻上游 task_scope 语义）：一行
+# = 一个被本任务纳入测试范围的资产。它是覆盖度的**分母**，与 assets 表的父子
+# 包含关系正交（后者是资产树的物理结构，前者是任务的授权/测试范围）。行由
+# Planner 落树时的初始 asset_ids（source='planner'）与主控显式锚定
+# （source='manual'）写入，幂等去重 (project_id, task_id, asset_id)。
+# 覆盖度**分子**不落表：由探索图 fact 节点的 asset_ids 限定（上游同口径——
+# 「被事实锚定过」即视为已测），见 core/blackboard/artex_coverage.py。
+
+# v42→v43（联网搜索开关，web-search-toggle，2026-10-19）：chat_threads 幂等补
+# web_search（0/1，线程级）。工作台 composer「联网」开关打开 = 该对话线程的主控
+# 与**其 spawn 的全部子代理**默认启用 web_search 工具（SearXNG/ddgs 双后端，
+# 见 core/websearch.py）——不是专家 yaml 的工具勾选（用户明确：不进专家工具清单），
+# 关了子代理也不拿该工具。call_expert spawn 与 ARTEX Worker 建线程时从父线程
+# 继承该位。历史行默认 0（关闭），不回溯。
+
+# v37→v38（CTF 题目即资产，challenge-asset，2026-10-14）：chat_threads 幂等补
+# challenge_asset_id（本线程归属的题目资产 id，''=未绑定）。CTF 轨「一个主控线程
+# 只发一道题」——线程 ↔ 题目天然 1:1，故把归属落在**线程级**（与 v37 的
+# provider/model 同款线程级覆写惯例），bb_declare_challenge 声明时写入，
+# bb_add_finding/declare_intent 未显式给锚点时按它兜底。题目本身是 assets 表里
+# type='challenge' 的根行（见 core/blackboard/assets.py::register_challenge），
+# 不新建表——findings/intents 的 target_asset_id 本就指向 assets(id)，绑定零成本。
+# 历史行保持空值不回填（惰性补建见 API 层 GET /projects/{pid}/challenges）。
+
+# v36→v37（工作台线程级模型，2026-10-13）：chat_threads 幂等补 provider/model
+# （''=跟随全局 executor 默认）。每个对话线程可自选模型——发送轮次时按线程值
+# 经 llm_store.build 换装 LLM（坏值静默回退全局）。历史行保持空值不回填。
+
+# v35→v36（功能树独立成表，2026-10-13）：功能树从 blueprints.tree 拆出为
+# feature_trees + feature_tree_nodes（分析阶段产物，与蓝图解耦）；blueprints
+# 加 feature_tree_id（引用施工图纸），logic_blocks 加 feature_node_id（下钻某
+# 功能的函数协作）。历史 blueprints.tree 数据因功能未发布无实际内容，直接 DROP。
+
+# v34→v35（蓝图功能树，2026-10-13）：blueprints 幂等补 tree（JSON 扁平节点数组
+# [{id,name,parent_id,status(pending/passed),desc,func_addresses[]}]）。功能树是
+# 蓝图的「施工图纸」——单向树状展示程序功能流向，人类验收后节点置 passed（绿），
+# 后续重建可按树推进。唯一写入口 Blackboard.*_blueprint_node。
+
+# v33→v34（测试维度面，agent-path-intent-loop M1，2026-10-09）：intents 幂等补
+# dimension（所属测试面 id，见 core/dimensions.py；''=未标面）。面覆盖判定的
+# 数据源——"该资产测完了吗"由「适用面是否都有收尾意图」回答，替代只看覆盖度。
+# 历史行保持默认空值（不猜测回填：面归属是声明时的语义，事后推断会误判）。
+
+# v32→v33（任务机制退役，2026-10-06）：DROP TABLE tasks / resource_leases。
+# 执行单元由 Team direct execution 承接（teams/team_members/team_runs/
+# team_run_members/execution_audits 独立表）。历史任务数据一并删除。
+
+# v31→v32（Team direct execution）：Team/Member/Run 与旧 tasks/coordination DAG
+# 完全分离。新 Team 只写以下独立表；旧项目数据不迁移、不回填。
+
+# v30→v31（会话流 cc-haha 对齐，2026-10-04）：chat_messages 幂等补 thinking
+# （assistant 行=该步推理正文，''=无）。此前思考只经 chat.thinking 事件实时
+# 上屏、轮结束即消失；落库后前端可持久渲染「已思考 <预览>」折叠行，展开看全文。
+# 不参与 LLM 重放（_load_history 只读 role/content/tool_calls），纯展示列。
+
+# v29→v30（结构化漏洞报告）：findings 新增报告正文与内嵌 POC 字段；历史行
+# 保持默认空值，由前端兼容展示旧 evidence，不做自动猜测迁移。
+
+# v28→v29（意图必须有资产锚点 + 子目标链路图，2026-10-01）：
+# 存量**无锚点且仍 open** 的意图标记为「需补锚点」——批次留档（不回退 closed
+# 历史：closed 意图与既有 tested_clean 背书保持不动）。declare_intent 工具层已
+# 硬门禁（须 target_asset_id 或 basis_refs 含 asset:<id>）；本迁移把历史遗漏的
+# open 游离意图落一个 audit 事件，便于人工/Agent 按新口径重新立意。
+# 无 ALTER（纯数据事件，幂等靠 meta 键 intents_anchor_migration 去重）。
+
+# v27→v28（健壮性：轮次失败结构化错误，2026-10-01）：chat_threads 幂等补 error
+# （JSON：最近一轮失败 {category,message,hint,detail}；''=无错误）。前端据此在
+# 时间线末尾渲染错误卡片，替代原先只亮一个「出错」徽标的粗糙反馈。
+
+# v23→v24（会话中心化 M4，docs/plans/session-centric-orchestration.md，2026-09-25）：
+# **纯语义迁移、零物理改动与数据搬迁**——tasks 表即「委托」；会话窗经
+# tasks.target_session 串当前/排队委托；meta.bound_task_id 旧双向绑定退役
+# （新窗不再写，存量残留只作「上一件」历史字段忽略）；租约过期回收仍指同窗。
+
+# v22→v23（TRAE 新壳 M3 chip 全通，docs/plans/webui-trae-shell.md，2026-09-25）：
+# tasks 幂等补 preferred_runtime（''=未设；host/wsl/docker/sandbox）——runtime chip
+# 写入的任务级默认运行时：run_cmd 省略 runtime 时由工具调度层按此回填，单条命令
+# 显式传 runtime 仍可临时覆盖。
+
+# v21→v22（渗透链路图 v3，docs/plans/website-attack-path-graph.md，2026-09-24）：
+# 新表 intents 由 DDL 的 IF NOT EXISTS 直接建表（无 ALTER，幂等）——意图（规划
+# 产物·可证伪假设）的持久记录：每个意图必须收尾（outcome_type=vuln/finding/
+# dead_end），漏洞/发现收尾引用 findings 行、死路收尾必带死因+证据引用；
+# basis_refs 记录推导依据（边=逻辑推导）。写入口 core/blackboard/intents.py。
+
+# v20→v21（渗透分阶段工作流 M2，docs/plans/pentest-phased-workflow.md，2026-09-22）：
+# orchestrator_state 幂等补 derive_idle_rounds（auto_derive 连续 N 轮零发布的
+# 调度轮次计数——recon 门指标 idle_rounds 的现值源；任意有发布轮复位为 0）。
+
+# v19→v20（漏洞收录格式三件套，docs/plans/finding-report-format.md M1，2026-09-22）：
+# findings 幂等补 impact（危害描述：影响事实）/ remediation（修复建议：可落地）
+# 两列——报告「逐发现详情」三节模板的数据承载（复现步骤走 evidence.repro_steps
+# 约定键，不占列）。两列不进 verified 门禁（写入放行），报告侧才校验齐备。
+
+# v18→v19（执行轨迹链路 M2，docs/plans/execution-trace-chain.md §3.1 R3/R6，2026-09-22）：
+# chains 幂等补 origin（manual=人工策划链 / trace=任务收尾·verified 自动物化的轨迹链，
+# board_graph 链边查询显式只取 manual）+ chain_links 幂等补 trace_ref（物化幂等键
+# ='task-<task_id>'，人工链空串——重物化单事务按它 DELETE+重插，人工行零感知）。
+# node_type 扩 task/step（TEXT 列无 CHECK 约束，写新值零迁移）。
+
+# v17→v18（向指定会话直接发任务，DESIGN §6.4 定稿块 2026-09-20）：tasks 幂等补
+# target_session（''=公共池；非空=仅该窗可认领——claim 硬门控、claim_next WHERE
+# 过滤；发布即武装目标窗并单窗 kick，关窗退回公共池，reopen 清指派）。
+
+# v16→v17（R4 逆向开发管线，DESIGN §9 R4 定稿块）：新表 blueprints 由 DDL 的
+# IF NOT EXISTS 直接建表（无 ALTER，幂等）——逆向重建的开发蓝图：
+# modules 为 JSON 数组 [{name, desc, func_addresses[], spec, notes,
+# status(pending/analyzed/specd/tested)}]，status 流转 draft→reviewed→ready→
+# building→built（ready 仅人类/审批可置，Agent 工具不暴露 status 入口）。
+# 唯一写入口 Blackboard.create_blueprint 等方法。
+
+# v14→v15（F6 浏览器能力，DESIGN §7）：新表 http_history 由 DDL 的 IF NOT EXISTS
+# 直接建表（无 ALTER，幂等）——浏览器抓包/重发/爆破的请求响应历史，唯一写入口
+# Blackboard.add_http_history；source 区分来源（browser/replay/intruder），
+# batch_id 分组（爆破批次/重发单发），body 超 64KB 截断（body_truncated）、
+# 二进制 base64（is_binary）。
+
+# v13→v14（任务绑定角色：认领即换装，DESIGN §6.4 定稿块）：tasks 幂等补 role
+# （建议认领角色 id；''=不限。会话窗保留底色角色，认领带 role 任务时按任务角色
+# 换装执行——prompt/工具边界/噪声/运行时上限，跑完恢复底色）。
+
+# v11→v12（发现分两类）：findings 幂等补 category（vuln=漏洞 / intel=有效发现·关键发现；
+# 缺省 'vuln'，存量行不动——历史数据以 vuln_class/severity 语义自辨）。
+
+# v10→v11（F11 评级落地）：findings 幂等补 rating_basis（判级依据，如
+# 「rating:edu-rating 高危#2 任意文件覆盖写」；合并就高时随 severity 覆盖）。
+
+# v9→v10（工作区隔离 W3）：artifacts 幂等补 meta（JSON 归属元数据
+# {task_id?, session_id?}，bb_add_artifact 自动挂认领任务/会话；清单按 meta 过滤）。
+
+# v8→v9（C10 任务上下文归任务所有）：tasks 幂等补 context（JSON：任务执行履历
+# {transcript, attempts[]}，唯一写点 TaskQueue._finish；完整对话现场在
+# <workspace>/<pid>/snapshots/task-<tid>.json，agent 层每步落盘）。
+
+# v7→v8（C1 任务暂停语义统一，§6.1）：tasks 幂等补 blocked_reason（error|awaiting_human，缺省 error 向后兼容）。
+
+# v6→v7（机制 1.1/1.4 协调底座，DESIGN §6.7 机制 1.1/1.4）：
+# tasks 幂等补 workset/dedup_fp/wait_for/lease_cooldown_until 4 列；
+# 新表 resource_leases（资源租约，键方案白名单见 core/blackboard/leases.py）。
+# 运行期动态锁申请后置（发布期/认领期门控为主）。
+
+# v4→v5 给 orchestrator_state 补的编排状态列（批 3，DESIGN §6.8/机制 1.9）：
+# (列名, ALTER 声明)；DDL 新库直接全列，旧库 _migrate 幂等 ALTER。
+V5_ORCH_STATE_COLUMNS: list[tuple[str, str]] = [
+    ("event_cursor", "INTEGER NOT NULL DEFAULT 0"),       # 已消费事件游标
+    ("cycles", "INTEGER NOT NULL DEFAULT 0"),             # 累计 tick 轮数
+    ("last_digest_cycle", "INTEGER NOT NULL DEFAULT -999"),
+    ("chain_active", "INTEGER NOT NULL DEFAULT 0"),       # 以下 4 列批 5 自动链消费，先存
+    ("chain_ticks", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_auto_tick_at", "TEXT NOT NULL DEFAULT ''"),
+    ("auto_ticks_total", "INTEGER NOT NULL DEFAULT 0"),
+    ("tick_owner", "TEXT NOT NULL DEFAULT ''"),           # tick 租约（900s TTL + 心跳）
+    ("tick_lease_until", "TEXT NOT NULL DEFAULT ''"),
+]
+
+DDL = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    domain       TEXT NOT NULL,           -- 旧列（v1 平铺领域包）；新行写 track 值兜底
+    track        TEXT NOT NULL DEFAULT '',-- v2 场景轨：ctf / assessment / research / malware
+    capabilities TEXT NOT NULL DEFAULT '[]', -- v2 能力包多选 JSON：["web","binary",...]
+    config       TEXT NOT NULL DEFAULT '{}',-- JSON：授权边界、cross_target、噪声预算等
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id         TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    name       TEXT NOT NULL,
+    role       TEXT NOT NULL DEFAULT '_generalist',
+    status     TEXT NOT NULL DEFAULT 'idle',  -- idle / running / blocked / stopped
+    meta       TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+-- 多态资产树：domain → host → service → url，或 binary 等
+CREATE TABLE IF NOT EXISTS assets (
+    id         TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    type       TEXT NOT NULL,           -- domain / host / service / url / binary / ...
+    value      TEXT NOT NULL,
+    parent_id  TEXT REFERENCES assets(id),
+    status     TEXT NOT NULL DEFAULT 'open',
+    meta       TEXT NOT NULL DEFAULT '{}',
+    author     TEXT NOT NULL DEFAULT 'system',
+    created_at TEXT NOT NULL,
+    revision   INTEGER NOT NULL DEFAULT 1,  -- H2 乐观锁：每次写 +1，写前可比对 expected_revision
+    UNIQUE(project_id, type, value, parent_id)
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    id          TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    path        TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'file',  -- file / poc / capture / decompile / ...
+    description TEXT NOT NULL DEFAULT '',
+    sha256      TEXT NOT NULL DEFAULT '',
+    author      TEXT NOT NULL DEFAULT 'system',
+    meta        TEXT NOT NULL DEFAULT '{}',   -- 归属元数据（W3）：{task_id?, session_id?}
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS findings (
+    id              TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL REFERENCES projects(id),
+    target_asset_id TEXT REFERENCES assets(id),
+    vuln_class      TEXT NOT NULL DEFAULT '',  -- 渗透类；逆向发现留 ''（类别在 evidence.category 五类）
+    title           TEXT NOT NULL,
+    severity        TEXT NOT NULL DEFAULT 'info',  -- info / low / medium / high / critical
+    rating_basis    TEXT NOT NULL DEFAULT '',  -- 判级依据（F11）：规则名+条款+一句话依据
+    status          TEXT NOT NULL DEFAULT 'unverified',  -- unverified / verified / false-positive
+    category        TEXT NOT NULL DEFAULT 'vuln',  -- C6 分两类：vuln=漏洞 / intel=有效发现·关键发现
+    impact          TEXT NOT NULL DEFAULT '',  -- v20 危害描述：影响事实（拿到什么/影响面，报告三件套）
+    remediation     TEXT NOT NULL DEFAULT '',  -- v20 修复建议：可落地（报告三件套）
+    summary         TEXT NOT NULL DEFAULT '',  -- 漏洞摘要
+    affected_assets TEXT NOT NULL DEFAULT '',  -- URL/API、版本、业务模块补充说明
+    test_environment TEXT NOT NULL DEFAULT '', -- 测试环境
+    reproduction_steps TEXT NOT NULL DEFAULT '', -- 人工可执行的复现步骤
+    verification_result TEXT NOT NULL DEFAULT '', -- 预期与实际验证结果
+    risk_assessment TEXT NOT NULL DEFAULT '', -- CIA 风险影响评估
+    pocs            TEXT NOT NULL DEFAULT '[]', -- 内嵌 POC：[{type:http|python,code}]
+    evidence        TEXT NOT NULL DEFAULT '{}',  -- JSON：引用 event、请求响应、截图、repro_steps 复现步骤
+    poc_artifact_id TEXT REFERENCES artifacts(id),
+    confidence      REAL NOT NULL DEFAULT 0.5,
+    dedup_key       TEXT NOT NULL,        -- 指纹：vuln_class/dedup_key；无键时=自身 id（永不合并）
+    author          TEXT NOT NULL DEFAULT 'system',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    revision        INTEGER NOT NULL DEFAULT 1,  -- H2 乐观锁：每次写 +1，写前可比对 expected_revision
+    UNIQUE(project_id, target_asset_id, dedup_key)
+);
+
+CREATE TABLE IF NOT EXISTS func_kb (
+    id            TEXT PRIMARY KEY,
+    project_id    TEXT NOT NULL REFERENCES projects(id),
+    binary_sha256 TEXT NOT NULL,
+    address       INTEGER NOT NULL,
+    name          TEXT NOT NULL,
+    name_history  TEXT NOT NULL DEFAULT '[]',  -- JSON：重命名演变史（也是分析笔记）
+    analysis      TEXT NOT NULL DEFAULT '',
+    risk_tags     TEXT NOT NULL DEFAULT '[]',  -- JSON：stack-overflow / no-length-check ...
+    confidence    REAL NOT NULL DEFAULT 0.5,
+    analyzed_by   TEXT NOT NULL DEFAULT 'system',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    UNIQUE(project_id, binary_sha256, address)
+);
+
+CREATE TABLE IF NOT EXISTS chains (
+    id         TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    name       TEXT NOT NULL,
+    goal       TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'hypothesis',  -- hypothesis / validated / exploited
+    origin     TEXT NOT NULL DEFAULT 'manual',  -- v19：manual=人工策划 / trace=任务轨迹自动物化（board_graph 只画 manual）
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chain_links (
+    id         TEXT PRIMARY KEY,
+    chain_id   TEXT NOT NULL REFERENCES chains(id),
+    seq        INTEGER NOT NULL,
+    node_type  TEXT NOT NULL,            -- finding / func_kb / artifact / task / step（v19 扩后两类，无 CHECK 零迁移）
+    node_id    TEXT NOT NULL,
+    edge_note  TEXT NOT NULL DEFAULT '', -- 这条边为什么成立（如"溢出可覆盖返回地址"）
+    trace_ref  TEXT NOT NULL DEFAULT '', -- v19：物化幂等键（='task-<task_id>'；人工链空串——重物化按它整删重插）
+    created_at TEXT NOT NULL
+);
+
+-- v3 会话收件箱（DESIGN.md §6.7 的 1.5/1.6）：知会类私信，与审批收件箱严格分设。
+-- 只有系统写，没有 Agent 自由消息工具；kind：basis_stale（撤回强制自评）/
+-- finding_update（v6 A4：实质增补，信息式）。
+CREATE TABLE IF NOT EXISTS session_inbox (
+    id          TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    to_session  TEXT NOT NULL,               -- 不设外键：会话关窗后私信仍留审计
+    kind        TEXT NOT NULL,               -- basis_stale / finding_update
+    ref_id      TEXT NOT NULL,               -- 被推翻的 finding id
+    payload     TEXT NOT NULL DEFAULT '{}',  -- JSON：标题/推翻人/备注
+    created_at  TEXT NOT NULL,
+    read_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_session_inbox_unread
+    ON session_inbox(to_session, read_at);
+-- 未读去重：同一收件人对同一 ref 的未读私信只此一条；读后再次撤回可重新投递
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_inbox_open_uniq
+    ON session_inbox(to_session, ref_id, kind) WHERE read_at IS NULL;
+
+-- 编排器状态/用量计数（v4 批 2：token/任务计数；v5 批 3 补游标/轮数/tick 租约等，
+-- 见 DESIGN §6.8 与机制 1.9）。每项目一行，首次记账或拿租约时惰性创建。
+CREATE TABLE IF NOT EXISTS orchestrator_state (
+    project_id            TEXT PRIMARY KEY REFERENCES projects(id),
+    tokens_in             INTEGER NOT NULL DEFAULT 0,
+    tokens_out            INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_read     INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_creation INTEGER NOT NULL DEFAULT 0,
+    llm_calls             INTEGER NOT NULL DEFAULT 0,
+    tasks_published       INTEGER NOT NULL DEFAULT 0,  -- 只计 orchestrator 自主发布
+    budget_warned         INTEGER NOT NULL DEFAULT 0,  -- token 80% 软警告去重（回落复位）
+    event_cursor          INTEGER NOT NULL DEFAULT 0,  -- v5：已消费事件 id
+    cycles                INTEGER NOT NULL DEFAULT 0,  -- v5：累计 tick 轮数
+    last_digest_cycle     INTEGER NOT NULL DEFAULT -999,
+    chain_active          INTEGER NOT NULL DEFAULT 0,  -- v5：批 5 自动链状态先存后用
+    chain_ticks           INTEGER NOT NULL DEFAULT 0,
+    last_auto_tick_at     TEXT NOT NULL DEFAULT '',
+    auto_ticks_total      INTEGER NOT NULL DEFAULT 0,
+    tick_owner            TEXT NOT NULL DEFAULT '',    -- v5：tick 租约所有者（''=空闲）
+    tick_lease_until      TEXT NOT NULL DEFAULT '',
+    last_replan_at        TEXT NOT NULL DEFAULT '',    -- v6：L2 自动重排节流时间戳（A5）
+    last_derive_at        TEXT NOT NULL DEFAULT '',    -- v13：mission 自动派生上次判定时间（2026-09-18）
+    last_derive_result    TEXT NOT NULL DEFAULT '',    -- v13：上次判定结果 published:n / empty / error:…
+    derive_idle_rounds    INTEGER NOT NULL DEFAULT 0,  -- v21：连续零发布调度轮次（阶段门 idle_rounds 现值源）
+    updated_at            TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    session_id TEXT,
+    kind       TEXT NOT NULL,            -- command / decision / finding.new / task.claimed / audit.deny ...
+    payload    TEXT NOT NULL DEFAULT '{}',
+    author     TEXT NOT NULL DEFAULT 'system',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id);
+-- kind 过滤索引（2026-10-26 事故）：`bb_query(what="events", kinds=[...])` 走
+-- `recent_events` 的 `kind IN (…)` + `ORDER BY id`，而 events 上原先只有
+-- `(project_id, id)` —— kind 不在索引里，**0 匹配也必须扫完该项目全部事件**才能
+-- 确认「没有」。实测 82 万条事件的项目上，查两个不存在的 kind 各花 2.1~2.4 秒，
+-- 运行期并发写争锁后涨到 27 秒，把同批后续工具全堵在「排队中」。
+-- 带 kind 的复合索引让 `kind IN (…)` 变成索引 seek，未知 kind 毫秒级返回空。
+-- 写放大：events 是高频写表（thinking.delta 峰值 ~76 条/秒），多维护一个索引约
+-- +10~15% 写入，换来「按类型查事件」从秒级到毫秒级，值得。
+CREATE INDEX IF NOT EXISTS idx_events_project_kind ON events(project_id, kind, id);
+-- 线程过滤索引（v52，2026-10-26）：`bb_query(what="child_events", thread_id=...)`
+-- 按 `author == thread_id` 取「某线程自己产生的事件」。**author 必须进索引**：
+-- 没有它时 `WHERE project_id=? AND author=? ORDER BY id DESC` 只能靠
+-- `(project_id, id)` 反向扫，撞不到目标 author 就要一直扫下去——实测 ctf-3 上
+-- 目标线程的最新事件距末端 9,482 条，用「先取尾部 N 条再在 Python 里筛」的做法
+-- 直接返回 0 条（这正是本次要修的 bug）。
+--
+-- 为什么是 author 而不是 session_id：`core/chat/runtime.py` 的 `_emit()` 给
+-- 全部 chat.* 事件**硬编码 session_id=None**（实测 chat.tool 2,386 / chat.usage
+-- 1,045 / chat.thinking 614 条无一例外），所以按 session_id 查线程会漏掉这些；
+-- 而 author 写的是 `chat-{thread_id[-12:]}`，线程 id 本身就是 `chat-<12 hex>`，
+-- 两者**逐字相等**（全库 31/31 验证）。
+CREATE INDEX IF NOT EXISTS idx_events_project_author ON events(project_id, author, id);
+
+CREATE TABLE IF NOT EXISTS approvals (
+    id          TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    session_id  TEXT,
+    action      TEXT NOT NULL,           -- JSON：请求的具体动作
+    risk        TEXT NOT NULL DEFAULT 'medium',
+    status      TEXT NOT NULL DEFAULT 'pending',  -- pending / approved / rejected
+    requested_by TEXT NOT NULL,
+    decided_by  TEXT,                    -- human / orchestrator
+    created_at  TEXT NOT NULL,
+    decided_at  TEXT
+);
+
+-- v15 浏览器抓包/重发/爆破历史（F6，DESIGN §7）：所有明文 HTTP 交互统一入此表；
+-- 写入口只有 Blackboard.add_http_history（黑板唯一写入口红线）。
+CREATE TABLE IF NOT EXISTS http_history (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id     TEXT NOT NULL,
+    session_id     TEXT,                       -- 来源会话（AI 会话 id / human-<uuid>）
+    task_id        TEXT,                       -- AI 动作挂认领任务；人类=NULL
+    source         TEXT NOT NULL DEFAULT 'browser',  -- browser / replay / intruder
+    batch_id       TEXT NOT NULL DEFAULT '',   -- 爆破批次分组；重发填自身批 id
+    meta           TEXT NOT NULL DEFAULT '{}', -- JSON：payload/改写说明等附加信息
+    method         TEXT NOT NULL,
+    url            TEXT NOT NULL,
+    status         INTEGER,
+    req_headers    TEXT NOT NULL DEFAULT '{}', -- JSON
+    req_body       TEXT,
+    resp_headers   TEXT NOT NULL DEFAULT '{}', -- JSON
+    resp_body      TEXT,                       -- 文本原样 / 二进制 base64(is_binary) / 超 64KB 截断
+    resp_mime      TEXT NOT NULL DEFAULT '',
+    body_truncated INTEGER NOT NULL DEFAULT 0,
+    is_binary      INTEGER NOT NULL DEFAULT 0,
+    duration_ms    INTEGER,
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_http_history_project ON http_history(project_id, id);
+CREATE INDEX IF NOT EXISTS idx_http_history_batch ON http_history(project_id, batch_id);
+
+-- v17 逆向开发蓝图（R4，DESIGN §9 R4 定稿块）：从分析产物重建程序的中枢——
+-- 模块划分任务产骨架、模块深析写回 spec/notes、蓝图汇总产 content_md，
+-- ready 后派生 reconstruct 重建子任务。一个样本一个项目可有多份蓝图（重划分）。
+-- v36：功能树独立成表（feature_trees），蓝图只引用 feature_tree_id 作为施工图纸，
+-- 不再内嵌 tree（功能树是分析阶段产物，与蓝图解耦，可被多蓝图复用）。
+CREATE TABLE IF NOT EXISTS blueprints (
+    id             TEXT PRIMARY KEY,
+    project_id     TEXT NOT NULL REFERENCES projects(id),
+    binary_sha256  TEXT NOT NULL DEFAULT '',   -- 目标样本 sha256（''=非单样本蓝图）
+    name           TEXT NOT NULL,
+    goal           TEXT NOT NULL DEFAULT '',   -- 重建目标（要造一个什么样的程序）
+    status         TEXT NOT NULL DEFAULT 'draft',  -- draft/reviewed/ready/building/built
+    content_md     TEXT NOT NULL DEFAULT '',   -- 蓝图正文：数据流/接口表/算法/协议/状态机
+    modules        TEXT NOT NULL DEFAULT '[]', -- JSON 数组：[{name,desc,func_addresses[],spec,notes,status}]
+    feature_tree_id TEXT NOT NULL DEFAULT '',  -- v36 引用功能树（施工图纸），''=未关联
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    UNIQUE(project_id, binary_sha256, name)
+);
+CREATE INDEX IF NOT EXISTS idx_blueprints_project ON blueprints(project_id, id);
+
+-- v36 功能树（逆向分析阶段产物，与蓝图解耦）；v53 升级为功能图（dev 轨）：
+-- 一张图=一个功能，节点=实现该功能的文件夹/文件/子功能。人类验收（图级/节点级）
+-- 置 passed（绿）。唯一写入口 Blackboard.*_feature_node。
+CREATE TABLE IF NOT EXISTS feature_trees (
+    id             TEXT PRIMARY KEY,
+    project_id     TEXT NOT NULL REFERENCES projects(id),
+    binary_sha256  TEXT NOT NULL DEFAULT '',   -- 目标样本 sha256 / 功能 key（''=项目级图）
+    name           TEXT NOT NULL DEFAULT '',   -- 图名（一个功能一张图）
+    status         TEXT NOT NULL DEFAULT 'pending',  -- v53 图级验收：pending/passed
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    UNIQUE(project_id, binary_sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_feature_trees_project ON feature_trees(project_id, binary_sha256);
+
+CREATE TABLE IF NOT EXISTS feature_tree_nodes (
+    id             TEXT PRIMARY KEY,
+    tree_id        TEXT NOT NULL REFERENCES feature_trees(id),
+    name           TEXT NOT NULL,
+    parent_id      TEXT,                       -- null=根节点；同树可多根（森林）
+    status         TEXT NOT NULL DEFAULT 'pending',  -- pending/passed（人类验收）
+    node_type      TEXT NOT NULL DEFAULT 'feature',  -- v53：feature/folder/file
+    path           TEXT NOT NULL DEFAULT '',   -- v53：工作区相对路径（folder/file 用）
+    desc           TEXT NOT NULL DEFAULT '',
+    func_addresses TEXT NOT NULL DEFAULT '[]', -- JSON hex 地址数组
+    seq            INTEGER NOT NULL DEFAULT 0, -- 同层排序
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ftn_tree ON feature_tree_nodes(tree_id, parent_id, seq);
+
+-- v22 意图表（渗透链路图 v3，2026-09-24）：思考/规划产物=可证伪假设。
+-- 意图必收尾：status open→closed 时 outcome_type 三选一——
+-- vuln/finding（漏洞/有效发现，outcome_refs 指向 findings 行）/
+-- dead_end（死路，dead_reason 死因 + evidence_refs 证据引用）。
+-- basis_refs=推导依据（逻辑推导边的数据源：finding:/asset:/…）。
+-- 唯一写入口 core/blackboard/intents.py（仿 assets.py 模块函数经 bb 写）。
+CREATE TABLE IF NOT EXISTS intents (
+    id              TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL REFERENCES projects(id),
+    statement       TEXT NOT NULL,            -- 假设一句话（可证伪）
+    target_asset_id TEXT REFERENCES assets(id),  -- 意图针对的根目标（host/domain，可空）
+    dimension       TEXT NOT NULL DEFAULT '',  -- v34：所属测试面 id（core/dimensions.py 口径，可空）
+    basis_refs      TEXT NOT NULL DEFAULT '[]',  -- JSON：推导依据 ["finding:<id>",...]
+    status          TEXT NOT NULL DEFAULT 'open',  -- open / closed
+    outcome_type    TEXT NOT NULL DEFAULT '',  -- vuln / finding / dead_end（closed 时非空）
+    outcome_refs    TEXT NOT NULL DEFAULT '[]',  -- JSON：收尾 finding ids
+    dead_reason     TEXT NOT NULL DEFAULT '',  -- 死路死因（什么证据排除了假设）
+    evidence_refs   TEXT NOT NULL DEFAULT '[]',  -- JSON：证据引用 ["http:<id>","event:<id>"]
+    author          TEXT NOT NULL DEFAULT 'system',
+    created_at      TEXT NOT NULL,
+    closed_at       TEXT,
+    updated_at      TEXT NOT NULL,
+    revision        INTEGER NOT NULL DEFAULT 1  -- H2 乐观锁同口径
+);
+CREATE INDEX IF NOT EXISTS idx_intents_project ON intents(project_id, id);
+CREATE INDEX IF NOT EXISTS idx_intents_open ON intents(project_id, status);
+
+-- v40 ARTEX 调度 Intent：与证据链 intents 分离，承载 frontier/worker 生命周期。
+CREATE TABLE IF NOT EXISTS artex_intents (
+    id              TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL REFERENCES projects(id),
+    parent_id       TEXT REFERENCES artex_intents(id),
+    source_intent_id TEXT REFERENCES intents(id),
+    task_id         TEXT NOT NULL DEFAULT '',
+    objective       TEXT NOT NULL,
+    constraints     TEXT NOT NULL DEFAULT '{}',
+    asset_ids       TEXT NOT NULL DEFAULT '[]',
+    depends_on      TEXT NOT NULL DEFAULT '[]',  -- v45：前置 Intent id 数组
+    expert          TEXT NOT NULL DEFAULT '',
+    priority        INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    attempt         INTEGER NOT NULL DEFAULT 0,
+    claimed_by      TEXT NOT NULL DEFAULT '',
+    claimed_at      TEXT,
+    started_at      TEXT,
+    finished_at     TEXT,
+    result          TEXT NOT NULL DEFAULT '',
+    error           TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_artex_intents_frontier ON artex_intents(project_id, status, priority);
+CREATE INDEX IF NOT EXISTS idx_artex_intents_task ON artex_intents(project_id, task_id);
+
+-- v41 ARTEX 探索图：Goal/Fact/Finding/Hint 节点及血缘边。
+CREATE TABLE IF NOT EXISTS artex_exploration_nodes (
+    id              TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL REFERENCES projects(id),
+    task_id         TEXT NOT NULL DEFAULT '',
+    intent_id       TEXT,
+    kind            TEXT NOT NULL,
+    title           TEXT NOT NULL DEFAULT '',
+    content         TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'open',
+    confidence      REAL NOT NULL DEFAULT 0.0,
+    asset_ids       TEXT NOT NULL DEFAULT '[]',
+    metadata        TEXT NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_artex_explore_project ON artex_exploration_nodes(project_id, task_id, kind);
+CREATE INDEX IF NOT EXISTS idx_artex_explore_intent ON artex_exploration_nodes(project_id, intent_id);
+
+CREATE TABLE IF NOT EXISTS artex_exploration_edges (
+    id              TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL REFERENCES projects(id),
+    from_node_id    TEXT NOT NULL REFERENCES artex_exploration_nodes(id),
+    to_node_id      TEXT NOT NULL REFERENCES artex_exploration_nodes(id),
+    relation        TEXT NOT NULL,
+    metadata        TEXT NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL,
+    UNIQUE(project_id, from_node_id, to_node_id, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_artex_explore_edges_from ON artex_exploration_edges(project_id, from_node_id);
+CREATE INDEX IF NOT EXISTS idx_artex_explore_edges_to ON artex_exploration_edges(project_id, to_node_id);
+
+-- v44 ARTEX 任务范围资产（task_scope 语义）：覆盖度分母。
+CREATE TABLE IF NOT EXISTS artex_task_assets (
+    project_id      TEXT NOT NULL REFERENCES projects(id),
+    task_id         TEXT NOT NULL,
+    asset_id        TEXT NOT NULL REFERENCES assets(id),
+    source          TEXT NOT NULL DEFAULT 'planner',  -- planner / manual / api
+    note            TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY(project_id, task_id, asset_id)
+);
+CREATE INDEX IF NOT EXISTS idx_artex_task_assets_task
+    ON artex_task_assets(project_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_artex_task_assets_asset
+    ON artex_task_assets(project_id, asset_id);
+
+-- v47 CTF 题目 flag 台账（challenge-flag-ledger，2026-10-19）：flag **不再**只
+-- 落在 findings 里。findings 的「正式漏洞五项必填契约」（名称/等级/类型/受影响
+-- 资产/摘要/测试环境/步骤/验证结果/风险影响/POC）是为渗透结论设计的，CTF 的 flag
+-- 不是漏洞——此前为了让 flag 过闸只能硬写套话（tools.py 里 risk_assessment
+-- 「CTF 题目环境内的解题结论…」就是被契约逼出来的）。
+--
+-- 本表是 flag 的**唯一真值**，题目状态（未跑/进行中/部分/已解/放弃）全部由它
+-- **派生**（core/blackboard/challenge_flags.py::challenge_state），不独立维护——
+-- 否则会出现「状态说已解但 flag 表是空的」。
+--
+-- verdict 语义：
+--   * ``pending``  —— 已登记待人工复核（AI 判定通过但人还没确认）；
+--   * ``accepted`` —— 有效（AI 判定通过且无人否决，或人工确认）；
+--   * ``rejected`` —— **人工标记为错误**。被拒的 flag 一律**不进** solved 派生，
+--     且同串再提交必须拦下（rejected 清单），否则模型会反复提交同一串白烧轮次。
+CREATE TABLE IF NOT EXISTS challenge_flags (
+    id              TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL REFERENCES projects(id),
+    challenge_id    TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    flag            TEXT NOT NULL,
+    flag_format     TEXT NOT NULL DEFAULT '',  -- 声明格式（flag{}/ctf{}），''=题目未声明
+    confidence      REAL NOT NULL DEFAULT 0.0, -- flagishness 分（0=人工录入）
+    source          TEXT NOT NULL DEFAULT '',  -- 解题路径/来源（可读文本）
+    transform       TEXT NOT NULL DEFAULT '',  -- 声称的变换链（base64/rot13…）
+    judged_by       TEXT NOT NULL DEFAULT 'ai',-- ai / human
+    verdict         TEXT NOT NULL DEFAULT 'pending',
+    verdict_reason  TEXT NOT NULL DEFAULT '',  -- 人工否决/确认的理由
+    author          TEXT NOT NULL DEFAULT '',
+    session_id      TEXT NOT NULL DEFAULT '',
+    finding_id      TEXT NOT NULL DEFAULT '',  -- 关联的过程性 finding（可空，仅留痕）
+    -- v48（flag-hint，2026-10-21）：本行对应题面「第几条 flag」的提示（0 基）。
+    -- -1 = 未指定，确认时按 accepted 顺序推断（人工逐条确认时通常就对）。
+    -- 有它才能把「这条 flag 的题面提示」一并告诉子 agent——它据此判断这条是不是
+    -- 自己正在分析的方向，从而决定收尾还是继续。只给 flag 原文（flag{1a2b}）时
+    -- 它对方向的指示性几乎为零，模型只能猜。
+    hint_index      INTEGER NOT NULL DEFAULT -1,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    UNIQUE(project_id, challenge_id, flag)
+);
+CREATE INDEX IF NOT EXISTS idx_challenge_flags_challenge
+    ON challenge_flags(project_id, challenge_id, verdict);
+CREATE INDEX IF NOT EXISTS idx_challenge_flags_flag
+    ON challenge_flags(project_id, flag);
+
+-- v25 智能体工作台对话线程（K9，2026-09-29）：新独立轻量对话运行时的持久化层，
+-- 不进 sessions/tasks 体系。每 agent（主控 chat-orchestrator + 专家池专家）
+-- 独立线程（蛙池式：切 agent=切线程）；主控 call_expert spawn 的子专家线程经
+-- parent_thread_id 留档关联（持久线程留档，摘要+引用回传主控）。
+CREATE TABLE IF NOT EXISTS chat_threads (
+    id               TEXT PRIMARY KEY,
+    project_id       TEXT NOT NULL REFERENCES projects(id),
+    agent_id         TEXT NOT NULL,                 -- 'chat-orchestrator' / 专家池 id
+    title            TEXT NOT NULL DEFAULT '',      -- 首条消息截断自动起题 / 人工改名
+    status           TEXT NOT NULL DEFAULT 'idle',  -- idle / running / error
+    parent_thread_id TEXT REFERENCES chat_threads(id) ON DELETE CASCADE,  -- call_expert spawn 来源（主控线程删则子线程级联删）
+    spawned_task     TEXT NOT NULL DEFAULT '',      -- spawn 时的委派任务简述
+    todo             TEXT NOT NULL DEFAULT '[]',    -- JSON：主控待办 [{id,title,status}]
+    usage            TEXT NOT NULL DEFAULT '',      -- JSON：最近上下文用量 {input,output,steps,cache_read,cache_creation}（v26）
+    error            TEXT NOT NULL DEFAULT '',      -- JSON：最近一轮失败 {category,message,hint,detail}（v28；''=无）
+    provider         TEXT NOT NULL DEFAULT '',      -- 线程级模型供应商覆写（v37；''=跟随全局默认）
+    model            TEXT NOT NULL DEFAULT '',      -- 线程级模型 id 覆写（v37；''=该供应商默认模型）
+    thinking_effort  TEXT NOT NULL DEFAULT '',      -- 线程级思考强度（v48；七档，''=跟随供应商配置，见 core/llm/effort.py）
+    challenge_asset_id TEXT NOT NULL DEFAULT '',    -- 本线程归属的题目资产 id（v38；''=未绑定，CTF 轨用）
+    web_search      INTEGER NOT NULL DEFAULT 0,     -- 联网搜索开关（v43；0=关。主控开=子代理默认继承，见 core/websearch.py）
+    pool_pulse_on   INTEGER NOT NULL DEFAULT 1,     -- CTF 池脉冲周期检查开关（v54；0=关，该主控不再被 5 分钟池子检查唤醒/提示，见 app.py ctf-pool-pulse-wake）
+    workspace       TEXT NOT NULL DEFAULT '',       -- 线程级执行工作区（v55；''=继承父线程 → 项目级，见 app.py _exec_workspace）
+    artex_intent_id  TEXT NOT NULL DEFAULT '',      -- v46：关联 ARTEX Intent（支撑 Worker trace 检索）
+    artex_task_id    TEXT NOT NULL DEFAULT '',      -- v46：关联 ARTEX 任务（支撑 Worker trace 检索）
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chat_threads_agent
+    ON chat_threads(project_id, agent_id, updated_at);
+
+-- v49→v50（CTF 方向组账本，ctf-direction-ledger，2026-10-25）：把 CTF 主控的
+-- 「派过哪些方向、每条跑了几次、有没有拿到东西」从 `ChatTurn` 内存搬到库里。
+--
+-- **为什么必须落库**：`CtfSession.dirs`/`rounds` 是实例内存。新一轮聊天新建
+-- `ChatTurn` → 新建 `CtfSession` → `ctf_review` 报「尚无方向记账」，上一轮
+-- 明明派过；`rounds` 归零还会让「无条件首轮分诊」闸**再拦一次**（复盘里 WP
+-- 深挖被分诊闸拒绝就是这个）。
+--
+-- 三层结构，职责不重叠：
+--   ctf_session_state   —— 线程级轮次（只为恢复分诊闸，不含方向）
+--   ctf_direction_groups—— **逻辑解题方向**（同方向重试/续跑不重复计组）
+--   ctf_direction_runs  —— 每次真实 spawn 一条执行尝试
+--   ctf_summary_batches/items —— 每新增 5 个**终态**方向组切一批压缩摘要
+--
+-- **不复用 intents/artex_intents**：前者是「可证伪假设及其收尾」，要求证据链；
+-- 后者是 ARTEX Planner 的任务生命周期。把普通 CTF 派发塞进去会让「发现」这个
+-- 词贬值，还会在任务树里造出没有 Planner/目标的假任务。
+CREATE TABLE IF NOT EXISTS ctf_session_state (
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    thread_id   TEXT NOT NULL,                  -- 主控线程（CTF 会话即一个线程）
+    rounds      INTEGER NOT NULL DEFAULT 0,     -- 派发轮数（含被拦的），跨轮恢复
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY(project_id, thread_id)
+);
+
+CREATE TABLE IF NOT EXISTS ctf_direction_groups (
+    id           TEXT PRIMARY KEY,
+    project_id   TEXT NOT NULL REFERENCES projects(id),
+    thread_id    TEXT NOT NULL,
+    challenge_id TEXT NOT NULL DEFAULT '',      -- 题目归属（''=未绑定；跨题不混）
+    key          TEXT NOT NULL,                 -- 归一键（core/ctf/lease.py::direction_key）
+    subgoal      TEXT NOT NULL DEFAULT '',      -- 方向原文（展示用，键是 2-gram 碎片）
+    expert       TEXT NOT NULL DEFAULT '',
+    need         INTEGER,                       -- 该方向须拿几条 flag（NULL=未声明）
+    status       TEXT NOT NULL DEFAULT 'open',  -- open/requeued/solved/dropped/retired
+    -- terminal 是**派生位**（status ∈ 终态即 1），单独存是为了让「每新增 5 组」
+    -- 的查询走索引而不必在 SQL 里枚举状态；写入点只有一个（ledger.update_group）。
+    terminal     INTEGER NOT NULL DEFAULT 0,
+    passes       INTEGER NOT NULL DEFAULT 0,    -- 累计执行次数
+    correct      INTEGER NOT NULL DEFAULT 0,
+    flags_got    INTEGER NOT NULL DEFAULT 0,    -- 由 flag 台账差值写入，不信自述
+    last_summary TEXT NOT NULL DEFAULT '',      -- 最近一次回执（截断）
+    first_epoch  REAL NOT NULL DEFAULT 0.0,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    UNIQUE(project_id, thread_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_ctf_groups_thread
+    ON ctf_direction_groups(project_id, thread_id, status);
+CREATE INDEX IF NOT EXISTS idx_ctf_groups_terminal
+    ON ctf_direction_groups(project_id, thread_id, terminal);
+
+CREATE TABLE IF NOT EXISTS ctf_direction_runs (
+    id            TEXT PRIMARY KEY,
+    project_id    TEXT NOT NULL REFERENCES projects(id),
+    thread_id     TEXT NOT NULL,
+    group_id      TEXT NOT NULL REFERENCES ctf_direction_groups(id) ON DELETE CASCADE,
+    sub_thread_id TEXT NOT NULL DEFAULT '',     -- spawn 出的子线程（ask_expert 据此挂回原组）
+    expert        TEXT NOT NULL DEFAULT '',
+    task          TEXT NOT NULL DEFAULT '',
+    -- queued → running → completed/failed/cancelled。失败路径必须落终态，否则
+    -- 账本里会留一条永远 running 的记录，与「线程被删」无法区分。
+    status        TEXT NOT NULL DEFAULT 'queued',
+    result        TEXT NOT NULL DEFAULT '',
+    error         TEXT NOT NULL DEFAULT '',
+    started_at    TEXT,
+    finished_at   TEXT,
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ctf_runs_group
+    ON ctf_direction_runs(project_id, group_id);
+CREATE INDEX IF NOT EXISTS idx_ctf_runs_subthread
+    ON ctf_direction_runs(project_id, sub_thread_id);
+
+CREATE TABLE IF NOT EXISTS ctf_summary_batches (
+    id           TEXT PRIMARY KEY,
+    project_id   TEXT NOT NULL REFERENCES projects(id),
+    thread_id    TEXT NOT NULL,
+    challenge_id TEXT NOT NULL DEFAULT '',
+    seq          INTEGER NOT NULL,              -- 线程内递增批次号（从 1 起）
+    status       TEXT NOT NULL DEFAULT 'pending',  -- pending/running/completed/failed
+    group_ids    TEXT NOT NULL DEFAULT '[]',    -- 冗余快照（items 是权威关联）
+    summary      TEXT NOT NULL DEFAULT '',
+    error        TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    UNIQUE(project_id, thread_id, seq)
+);
+
+-- **幂等键就在这张表上**：group_id 全局唯一 → 同一方向组永远只能进一个批次。
+-- 并发下两个线程同时判定「够 5 个」时，后插入的一方整批回滚，不会重复摘要。
+CREATE TABLE IF NOT EXISTS ctf_summary_items (
+    batch_id   TEXT NOT NULL REFERENCES ctf_summary_batches(id) ON DELETE CASCADE,
+    group_id   TEXT NOT NULL REFERENCES ctf_direction_groups(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    PRIMARY KEY(batch_id, group_id),
+    UNIQUE(group_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ctf_summary_items_batch
+    ON ctf_summary_items(project_id, batch_id);
+
+-- v25 对话消息（K9）：API 消息数组按序落库——user / assistant（content=文本段，
+-- tool_calls=JSON [{id,name,args}]）/ tool（content=结果文本，tool_use_id 对应）。
+-- 重放即 LLM messages 数组（assistant 行重建 tool_use 块）；工具结果全文存此，
+-- 事件流只发 delta/终稿供前端流式。
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id   TEXT NOT NULL REFERENCES chat_threads(id),
+    role        TEXT NOT NULL,               -- user / assistant / tool
+    content     TEXT NOT NULL DEFAULT '',    -- 文本（tool 行=工具结果全文）
+    thinking    TEXT NOT NULL DEFAULT '',    -- assistant 行：该步推理正文（v31；''=无）
+    tool_calls  TEXT NOT NULL DEFAULT '[]',  -- assistant 行 JSON：[{id,name,args}]
+    tool_use_id TEXT NOT NULL DEFAULT '',    -- tool 行：对应的 tool_call id
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id, id);
+
+-- v39 会话系统提示词快照（诊断用，2026-10-16）：诊断页「查看系统提示词」的数据源。
+-- 每会话（chat-<tid> / sess-<id>）一行，UPSERT 只保留**最近一次实际下发给 LLM 的
+-- 完整 system 正文**（chat 轮=ChatTurn._system_prompt()；任务轮=build_system_blocks
+-- 拼合）——快照性质而非审计流水，故不随事件表线性增长（events 已 25 万行量级，
+-- 按 kind 检索要 2s+，不适合放系统提示）。sha256 供前端比对内容是否变化。
+CREATE TABLE IF NOT EXISTS session_system_prompts (
+    session_id TEXT PRIMARY KEY,              -- chat-<tid> / sess-<id>
+    project_id TEXT NOT NULL DEFAULT '',
+    kind       TEXT NOT NULL DEFAULT '',      -- chat / agent
+    agent_id   TEXT NOT NULL DEFAULT '',      -- 归属智能体（角色口径）
+    text       TEXT NOT NULL DEFAULT '',      -- 完整 system 正文
+    chars      INTEGER NOT NULL DEFAULT 0,    -- 字符数
+    tokens     INTEGER NOT NULL DEFAULT 0,    -- 折算 token 数（tokenizer，供参考）
+    sha256     TEXT NOT NULL DEFAULT '',      -- 正文指纹（判断内容是否变化）
+    updated_at TEXT NOT NULL
+);
+
+-- v27 业务逻辑块（逆向工作台第四页签，2026-09-29）：分块记载函数协作与业务
+-- 语义——PWN/漏洞利用走攻击链（因果路径），重建走蓝图（R4 管线），业务理解
+-- （函数逻辑/业务逻辑/逆向破解/游戏业务）落这里。人机共写：人工建块挂函数，
+-- Agent 经 bb_logic_block_* 工具产块/挂函数/补描述。函数挂接定位键=
+-- (binary_sha256, address) 同 func_kb；UNIQUE 防重复挂；级联删除在 store 手动做
+-- （连接未开 foreign_keys pragma，不依赖 ON DELETE CASCADE）。
+CREATE TABLE IF NOT EXISTS logic_blocks (
+    id             TEXT PRIMARY KEY,
+    project_id     TEXT NOT NULL REFERENCES projects(id),
+    binary_sha256  TEXT NOT NULL DEFAULT '',   -- 目标样本 sha256（''=项目级块）
+    name           TEXT NOT NULL,
+    description    TEXT NOT NULL DEFAULT '',   -- 业务逻辑描述（markdown：块干什么/函数间协作/业务语义）
+    feature_node_id TEXT NOT NULL DEFAULT '',  -- v36 挂到功能树某节点（下钻该功能的函数协作），''=未挂
+    seq            INTEGER NOT NULL DEFAULT 0, -- 排序
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    UNIQUE(project_id, binary_sha256, name)
+);
+CREATE INDEX IF NOT EXISTS idx_logic_blocks_project ON logic_blocks(project_id, binary_sha256, seq);
+
+CREATE TABLE IF NOT EXISTS logic_block_funcs (
+    id          TEXT PRIMARY KEY,
+    block_id    TEXT NOT NULL REFERENCES logic_blocks(id),
+    address     INTEGER NOT NULL,            -- 函数地址（func_kb 定位键，sha 继承自块）
+    role        TEXT NOT NULL DEFAULT '',    -- 角色注：该函数在本块中的职责一句话
+    seq         INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    UNIQUE(block_id, address)
+);
+CREATE INDEX IF NOT EXISTS idx_logic_block_funcs_block ON logic_block_funcs(block_id, seq);
+
+-- Team direct execution（v32）：与旧 tasks/coordination DAG 完全独立。
+CREATE TABLE IF NOT EXISTS teams (
+    id          TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    name        TEXT NOT NULL,
+    goal_text   TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'draft',
+    created_by  TEXT NOT NULL DEFAULT 'human',
+    revision    INTEGER NOT NULL DEFAULT 1,
+    config      TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_teams_project ON teams(project_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS team_members (
+    id              TEXT PRIMARY KEY,
+    team_id         TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    member_key      TEXT NOT NULL,
+    label           TEXT NOT NULL DEFAULT '',
+    responsibility  TEXT NOT NULL DEFAULT '',
+    role            TEXT NOT NULL DEFAULT '',
+    provider        TEXT NOT NULL DEFAULT '',
+    model           TEXT NOT NULL DEFAULT '',
+    runtime         TEXT NOT NULL DEFAULT '',
+    threat_class    TEXT NOT NULL DEFAULT '',
+    max_steps      INTEGER,
+    status          TEXT NOT NULL DEFAULT 'active',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    UNIQUE(team_id, member_key)
+);
+CREATE INDEX IF NOT EXISTS idx_team_members_team ON team_members(team_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS team_runs (
+    id                      TEXT PRIMARY KEY,
+    project_id              TEXT NOT NULL REFERENCES projects(id),
+    team_id                 TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    status                  TEXT NOT NULL DEFAULT 'starting',
+    confirmation_revision   TEXT NOT NULL,
+    cancel_reason           TEXT NOT NULL DEFAULT '',
+    created_at              TEXT NOT NULL,
+    updated_at              TEXT NOT NULL,
+    started_at              TEXT,
+    finished_at             TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_team_runs_team ON team_runs(team_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_team_runs_project ON team_runs(project_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS team_run_members (
+    id              TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL REFERENCES team_runs(id) ON DELETE CASCADE,
+    member_id       TEXT NOT NULL REFERENCES team_members(id),
+    member_key      TEXT NOT NULL,
+    objective       TEXT NOT NULL DEFAULT '',
+    role            TEXT NOT NULL DEFAULT '',
+    provider        TEXT NOT NULL DEFAULT '',
+    model           TEXT NOT NULL DEFAULT '',
+    runtime         TEXT NOT NULL DEFAULT '',
+    threat_class    TEXT NOT NULL DEFAULT '',
+    max_steps      INTEGER,
+    session_id      TEXT,
+    execution_id    TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    error           TEXT NOT NULL DEFAULT '',
+    started_at      TEXT,
+    finished_at     TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    UNIQUE(run_id, member_id),
+    UNIQUE(run_id, member_key)
+);
+CREATE INDEX IF NOT EXISTS idx_team_run_members_run ON team_run_members(run_id, status);
+CREATE INDEX IF NOT EXISTS idx_team_run_members_session ON team_run_members(session_id);
+
+CREATE TABLE IF NOT EXISTS execution_audits (
+    execution_id    TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL REFERENCES projects(id),
+    source          TEXT NOT NULL,
+    team_id         TEXT NOT NULL REFERENCES teams(id),
+    run_id          TEXT NOT NULL REFERENCES team_runs(id),
+    member_id       TEXT NOT NULL REFERENCES team_members(id),
+    session_id      TEXT,
+    objective       TEXT NOT NULL DEFAULT '',
+    role            TEXT NOT NULL DEFAULT '',
+    runtime         TEXT NOT NULL DEFAULT '',
+    threat_class    TEXT NOT NULL DEFAULT '',
+    roe_snapshot    TEXT NOT NULL DEFAULT '{}',
+    status          TEXT NOT NULL DEFAULT 'pending',
+    outcome         TEXT NOT NULL DEFAULT '',
+    transcript_ref  TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_execution_audits_project ON execution_audits(project_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_execution_audits_run ON execution_audits(run_id, status);
+
+-- v50→v51（thinking-delta-snapshot，2026-10-26）：思考增量的**状态快照**。
+-- 不是事件流——每 (线程, 步) 恒一行，写就覆盖。原 events 里的
+-- `chat.thinking.delta` 每条带累计全文，平方级放大到 8.19 GB；快照把写入量
+-- 压到「每步一行」，体积只与步数线性相关。读侧由 ws_events 按 updated_at
+-- 增量轮询，推无 id 的 ws.thinking 瞬时帧。
+--
+-- **不要给这张表加 append 语义**：一旦每帧一行，就退化成原来的事件表。
+-- **不要用 created_at/ISO 文本**：轮询 20 次/秒，浮点比较比字符串解析便宜。
+CREATE TABLE IF NOT EXISTS chat_delta_state (
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    thread_id   TEXT NOT NULL,
+    step        INTEGER NOT NULL,               -- 本轮第几步（每步一个快照）
+    seq         INTEGER NOT NULL DEFAULT 0,     -- 该步内的发布序号（前端判新旧）
+    text        TEXT NOT NULL DEFAULT '',       -- 累计全文（覆盖，不追加）
+    updated_at  REAL NOT NULL,                  -- time.time()，读侧增量游标
+    PRIMARY KEY(project_id, thread_id, step)
+);
+-- 读侧唯一查询形态：WHERE project_id=? AND updated_at>? ORDER BY updated_at
+CREATE INDEX IF NOT EXISTS idx_chat_delta_state_ts
+    ON chat_delta_state(project_id, updated_at);
+"""
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """幂等迁移（旧 demo 库仍可打开）：
+    - v1→v2：projects 补 track/capabilities 列；
+    - v2→v3：tasks 补 context_refs/stale_refs 列（session_inbox 由 DDL 的
+      IF NOT EXISTS 直接建表）；
+    - v3→v4：orchestrator_state 由 DDL 的 IF NOT EXISTS 直接建表（批 2 用量计数）；
+    - v4→v5：旧库的 orchestrator_state 幂等 ALTER 补编排状态/租约 9 列（批 3）；
+    - v5→v6：tasks 幂等补 plan 列（A2），orchestrator_state 补 last_replan_at（A5）。
+    - v6→v7：tasks 幂等补 workset/dedup_fp/wait_for/lease_cooldown_until（机制 1.1/机制 1.4），
+      resource_leases 由 DDL 的 IF NOT EXISTS 直接建表。
+    - v7→v8：tasks 幂等补 blocked_reason（C1）。
+    - v8→v9：tasks 幂等补 context（C10 任务执行履历）。
+    - v9→v10：artifacts 幂等补 meta（W3 产物归属 {task_id?, session_id?}）。
+    - v10→v11：findings 幂等补 rating_basis（F11 判级依据，空串=未标注）。
+    - v14→v15：http_history 由 DDL 的 IF NOT EXISTS 直接建表（F6 浏览器抓包/重发/爆破），
+      无 ALTER，旧库打开即建。
+    - v15→v16：assets/findings 幂等补 revision（H2 乐观锁：多窗并发改同一行时
+      写前比对 expected_revision，防丢失更新；每次写 +1）。
+    - v18→v19：chains 幂等补 origin、chain_links 幂等补 trace_ref（执行轨迹链路，
+      见文件头版本注释）。
+    - v19→v20：findings 幂等补 impact/remediation（收录格式三件套的危害描述与
+      修复建议，写入放行不进门禁，见文件头版本注释）。
+    - v21→v22：intents 由 DDL 的 IF NOT EXISTS 直接建表（无 ALTER，旧库打开即建）。
+    - v22→v23：tasks 幂等补 preferred_runtime（任务默认运行时，见文件头版本注释）。
+    - v24→v25：chat_threads/chat_messages 由 DDL 的 IF NOT EXISTS 直接建表
+      （K9 智能体工作台，无 ALTER，旧库打开即建）。
+    - v26→v27：logic_blocks/logic_block_funcs 由 DDL 的 IF NOT EXISTS 直接建表
+      （业务逻辑块，无 ALTER，旧库打开即建）。
+    - v27→v28：chat_threads 幂等补 error（轮次失败结构化错误，见文件头版本注释）。
+    - v28→v29：无锚点且 open 的存量意图落 intent.anchor_required 审计事件
+      （closed 不动；幂等靠 meta 键去重，见文件头版本注释）。
+    - v30→v31：chat_messages 幂等补 thinking（assistant 行推理正文，见文件头
+      版本注释）。
+    - v31→v32：teams/team_members/team_runs/team_run_members/execution_audits
+      由 DDL 的 IF NOT EXISTS 直接建表；新 Team 直执行不转换旧任务。
+    - v32→v33：任务机制退役——DROP TABLE tasks / resource_leases（幂等
+      IF EXISTS），历史任务数据一并删除。
+    - v33→v34：intents 幂等补 dimension（所属测试面 id，''=未标面，见
+      core/dimensions.py）。历史行保持默认空值不回填。
+    - v34→v35：blueprints 幂等补 tree（功能树扁平节点 JSON 数组，见文件头
+      版本注释）。
+    - v35→v36：功能树独立成表——blueprints DROP tree、ADD feature_tree_id；
+      logic_blocks ADD feature_node_id；feature_trees/feature_tree_nodes 由
+      DDL IF NOT EXISTS 建表。
+    - v36→v37：chat_threads 幂等补 provider/model（线程级模型覆写，''=跟随
+      全局默认，见文件头版本注释）。历史行保持默认空值不回填。
+    - v37→v38：chat_threads 幂等补 challenge_asset_id（线程归属的题目资产，
+      ''=未绑定，见文件头版本注释）。历史行保持默认空值不回填。
+    - v38→v39：session_system_prompts 由 DDL 的 IF NOT EXISTS 直接建表（诊断页
+      「查看系统提示词」快照，无 ALTER，旧库打开即建）。
+    - v42→v43：chat_threads 幂等补 web_search（联网搜索开关，0/1，主控开=
+      子代理继承，见文件头版本注释）。历史行默认 0 不回填。
+    - v47→v48：chat_threads 幂等补 thinking_effort（线程级思考强度，''=跟随
+      供应商配置，见文件头版本注释）。历史行保持空值——空 ≠ high，语义是
+      「没覆写」，回填 high 会把「跟随供应商」变成「钉死 high」。
+    - v49→v50：ctf_session_state / ctf_direction_groups / ctf_direction_runs /
+      ctf_summary_batches / ctf_summary_items 由 DDL 的 IF NOT EXISTS 直接建表
+      （CTF 方向组账本，无 ALTER，旧库打开即建）。**历史方向不回溯补建**：内存
+      账本从未落库，凭消息文本反推方向会把「讨论过」当成「派过」；需要历史
+      归档时另做显式导入。
+    - v50→v51：chat_delta_state 由 DDL 的 IF NOT EXISTS 直接建表（思考增量从
+      事件流降级为状态快照，无 ALTER，旧库打开即建）。**存量 events 里的
+      `chat.thinking.delta` 不在此清理**——那是 8.19 GB 的历史数据，须停平台后
+      用 scripts/db_compact.py 批删 + VACUUM，放在迁移里会卡死启动。
+    - v51→v52：events 增 idx_events_project_author（child-events 面按
+      `author == thread_id` 取「某线程自己产生的事件」），由 DDL 的
+      IF NOT EXISTS 直接建，无 ALTER。
+    - v52→v53：feature_trees 幂等补 status（图级验收，pending/passed）；feature_tree_nodes
+      幂等补 node_type（feature/folder/file）+ path（工作区相对路径）。历史行保持默认
+      值不回填（旧树节点语义是「程序功能点」，不猜测成文件路径）。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(projects)")}
+    if "track" not in cols:
+        conn.execute("ALTER TABLE projects ADD COLUMN track TEXT NOT NULL DEFAULT ''")
+    if "capabilities" not in cols:
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'")
+    chat_cols = {r[1] for r in conn.execute("PRAGMA table_info(chat_threads)")}
+    if chat_cols and "usage" not in chat_cols:  # v26（K9 /context 与用量圆环）
+        conn.execute(
+            "ALTER TABLE chat_threads ADD COLUMN usage TEXT NOT NULL DEFAULT ''")
+    if chat_cols and "error" not in chat_cols:  # v28（轮次失败结构化错误）
+        conn.execute(
+            "ALTER TABLE chat_threads ADD COLUMN error TEXT NOT NULL DEFAULT ''")
+    if chat_cols and "provider" not in chat_cols:  # v37（线程级模型覆写）
+        conn.execute(
+            "ALTER TABLE chat_threads ADD COLUMN provider TEXT NOT NULL DEFAULT ''")
+    if chat_cols and "model" not in chat_cols:  # v37（线程级模型覆写）
+        conn.execute(
+            "ALTER TABLE chat_threads ADD COLUMN model TEXT NOT NULL DEFAULT ''")
+    if chat_cols and "thinking_effort" not in chat_cols:  # v48（线程级思考强度）
+        conn.execute(
+            "ALTER TABLE chat_threads ADD COLUMN thinking_effort TEXT NOT NULL DEFAULT ''")
+    if chat_cols and "challenge_asset_id" not in chat_cols:  # v38（线程归属题目）
+        conn.execute(
+            "ALTER TABLE chat_threads ADD COLUMN challenge_asset_id TEXT NOT NULL DEFAULT ''")
+    if chat_cols and "web_search" not in chat_cols:  # v43（联网搜索开关，主控开=子代理继承）
+        conn.execute(
+            "ALTER TABLE chat_threads ADD COLUMN web_search INTEGER NOT NULL DEFAULT 0")
+    if chat_cols and "pool_pulse_on" not in chat_cols:  # v54（CTF 池脉冲周期检查开关，默认开）
+        conn.execute(
+            "ALTER TABLE chat_threads ADD COLUMN pool_pulse_on INTEGER NOT NULL DEFAULT 1")
+    if chat_cols and "artex_intent_id" not in chat_cols:  # v46（Worker trace 关联）
+        conn.execute(
+            "ALTER TABLE chat_threads ADD COLUMN artex_intent_id TEXT NOT NULL DEFAULT ''")
+    if chat_cols and "artex_task_id" not in chat_cols:  # v46（Worker trace 关联）
+        conn.execute(
+            "ALTER TABLE chat_threads ADD COLUMN artex_task_id TEXT NOT NULL DEFAULT ''")
+    msg_cols = {r[1] for r in conn.execute("PRAGMA table_info(chat_messages)")}
+    if msg_cols and "thinking" not in msg_cols:  # v31（思考正文持久化）
+        conn.execute(
+            "ALTER TABLE chat_messages ADD COLUMN thinking TEXT NOT NULL DEFAULT ''")
+    # v32→v33（任务机制退役，2026-10-06）：DROP TABLE tasks / resource_leases。
+    # 幂等（IF EXISTS）；旧库残留任务数据一并删除。
+    conn.execute("DROP TABLE IF EXISTS resource_leases")
+    conn.execute("DROP TABLE IF EXISTS tasks")
+    int_cols = {r[1] for r in conn.execute("PRAGMA table_info(intents)")}
+    if int_cols and "dimension" not in int_cols:  # v34（测试维度面）
+        conn.execute(
+            "ALTER TABLE intents ADD COLUMN dimension TEXT NOT NULL DEFAULT ''")
+    bp_cols = {r[1] for r in conn.execute("PRAGMA table_info(blueprints)")}
+    if bp_cols:
+        if "tree" in bp_cols:  # v36：功能树拆出，移除内嵌 tree 列
+            try:
+                conn.execute("ALTER TABLE blueprints DROP COLUMN tree")
+            except sqlite3.OperationalError:
+                pass  # 旧 SQLite 不支持 DROP COLUMN，留空列无害
+        if "feature_tree_id" not in bp_cols:  # v36（蓝图引用功能树）
+            conn.execute(
+                "ALTER TABLE blueprints ADD COLUMN feature_tree_id TEXT NOT NULL DEFAULT ''")
+    lb_cols = {r[1] for r in conn.execute("PRAGMA table_info(logic_blocks)")}
+    if lb_cols and "feature_node_id" not in lb_cols:  # v36（业务块挂功能节点）
+        conn.execute(
+            "ALTER TABLE logic_blocks ADD COLUMN feature_node_id TEXT NOT NULL DEFAULT ''")
+    ft_cols = {r[1] for r in conn.execute("PRAGMA table_info(feature_trees)")}
+    if ft_cols and "status" not in ft_cols:  # v53（功能图级验收状态）
+        conn.execute(
+            "ALTER TABLE feature_trees ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+    ftn_cols = {r[1] for r in conn.execute("PRAGMA table_info(feature_tree_nodes)")}
+    if ftn_cols:
+        if "node_type" not in ftn_cols:  # v53（节点类型：feature/folder/file）
+            conn.execute(
+                "ALTER TABLE feature_tree_nodes ADD COLUMN node_type TEXT NOT NULL DEFAULT 'feature'")
+        if "path" not in ftn_cols:  # v53（工作区相对路径，folder/file 节点用）
+            conn.execute(
+                "ALTER TABLE feature_tree_nodes ADD COLUMN path TEXT NOT NULL DEFAULT ''")
+    art_cols = {r[1] for r in conn.execute("PRAGMA table_info(artifacts)")}
+    if art_cols and "meta" not in art_cols:  # v10（W3 产物归属元数据）
+        conn.execute("ALTER TABLE artifacts ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'")
+    fin_cols = {r[1] for r in conn.execute("PRAGMA table_info(findings)")}
+    if fin_cols and "rating_basis" not in fin_cols:  # v11（F11 判级依据）
+        conn.execute(
+            "ALTER TABLE findings ADD COLUMN rating_basis TEXT NOT NULL DEFAULT ''")
+    if fin_cols and "category" not in fin_cols:  # v12（发现分两类：vuln/intel）
+        conn.execute(
+            "ALTER TABLE findings ADD COLUMN category TEXT NOT NULL DEFAULT 'vuln'")
+    for col in ("impact", "remediation"):  # v20（收录格式三件套：危害描述/修复建议）
+        if fin_cols and col not in fin_cols:
+            conn.execute(
+                f"ALTER TABLE findings ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    report_columns = {
+        "summary": "TEXT NOT NULL DEFAULT ''",
+        "affected_assets": "TEXT NOT NULL DEFAULT ''",
+        "test_environment": "TEXT NOT NULL DEFAULT ''",
+        "reproduction_steps": "TEXT NOT NULL DEFAULT ''",
+        "verification_result": "TEXT NOT NULL DEFAULT ''",
+        "risk_assessment": "TEXT NOT NULL DEFAULT ''",
+        "pocs": "TEXT NOT NULL DEFAULT '[]'",
+    }
+    for col, declaration in report_columns.items():
+        if fin_cols and col not in fin_cols:
+            conn.execute(f"ALTER TABLE findings ADD COLUMN {col} {declaration}")
+    for tbl in ("assets", "findings"):  # v16（H2 乐观锁 revision 列）
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({tbl})")}
+        if cols and "revision" not in cols:
+            conn.execute(
+                f"ALTER TABLE {tbl} ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+    chain_cols = {r[1] for r in conn.execute("PRAGMA table_info(chains)")}
+    if chain_cols and "origin" not in chain_cols:  # v19（自动轨迹链隔离标）
+        conn.execute(
+            "ALTER TABLE chains ADD COLUMN origin TEXT NOT NULL DEFAULT 'manual'")
+    clink_cols = {r[1] for r in conn.execute("PRAGMA table_info(chain_links)")}
+    if clink_cols and "trace_ref" not in clink_cols:  # v19（物化幂等键）
+        conn.execute(
+            "ALTER TABLE chain_links ADD COLUMN trace_ref TEXT NOT NULL DEFAULT ''")
+    # v48（flag-hint，2026-10-21）：台账行补 hint_index。旧库该列不存在，
+    # 新建库 DDL 已含——两条路都要幂等，故这里只判存在性再 ALTER。
+    cflag_cols = {r[1] for r in conn.execute("PRAGMA table_info(challenge_flags)")}
+    if cflag_cols and "hint_index" not in cflag_cols:
+        conn.execute(
+            "ALTER TABLE challenge_flags ADD COLUMN hint_index INTEGER NOT NULL DEFAULT -1")
+    # v55（thread-workspace，2026-11-02）：chat_threads 补线程级工作区列。
+    cthread_cols = {r[1] for r in conn.execute("PRAGMA table_info(chat_threads)")}
+    if cthread_cols and "workspace" not in cthread_cols:
+        conn.execute(
+            "ALTER TABLE chat_threads ADD COLUMN workspace TEXT NOT NULL DEFAULT ''")
+    os_tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='orchestrator_state'")}
+    if os_tables:
+        os_cols = {r[1] for r in conn.execute("PRAGMA table_info(orchestrator_state)")}
+        for name, decl in V5_ORCH_STATE_COLUMNS:
+            if name not in os_cols:
+                conn.execute(
+                    f"ALTER TABLE orchestrator_state ADD COLUMN {name} {decl}")
+        if "last_replan_at" not in os_cols:  # v6（A5 自动重排节流）
+            conn.execute(
+                "ALTER TABLE orchestrator_state ADD COLUMN"
+                " last_replan_at TEXT NOT NULL DEFAULT ''")
+        for col in ("last_derive_at", "last_derive_result"):  # v13（mission 派生结果）
+            if col not in os_cols:
+                conn.execute(
+                    f"ALTER TABLE orchestrator_state ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        if "derive_idle_rounds" not in os_cols:  # v21（阶段门空闲轮计数）
+            conn.execute(
+                "ALTER TABLE orchestrator_state ADD COLUMN"
+                " derive_idle_rounds INTEGER NOT NULL DEFAULT 0")
+    _migrate_intent_anchors(conn)
+    _migrate_agent_id_rename(conn)
+    _ensure_artex_intents(conn)
+    _ensure_artex_intents_deps(conn)
+    _ensure_artex_exploration(conn)
+    _ensure_artex_task_runtime(conn)
+    _ensure_artex_task_assets(conn)
+
+
+def _ensure_artex_intents_deps(conn: sqlite3.Connection) -> None:
+    """旧库给 artex_intents 补 depends_on（v45，Intent 依赖序）。
+
+    已有表用 ALTER 幂等补列；列不存在才加。历史行默认 '[]'（无依赖），不回溯
+    ——旧任务的并行下发行为不受影响。
+    """
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(artex_intents)")}
+    if cols and "depends_on" not in cols:
+        conn.execute("ALTER TABLE artex_intents ADD COLUMN depends_on TEXT"
+                     " NOT NULL DEFAULT '[]'")
+
+
+def _ensure_artex_intents(conn: sqlite3.Connection) -> None:
+    """旧库补建 ARTEX 调度表；DDL 已含 IF NOT EXISTS，单独建索引保证旧库。"""
+    conn.execute("""CREATE TABLE IF NOT EXISTS artex_intents (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+        parent_id TEXT REFERENCES artex_intents(id), source_intent_id TEXT REFERENCES intents(id),
+        task_id TEXT NOT NULL DEFAULT '', objective TEXT NOT NULL,
+        constraints TEXT NOT NULL DEFAULT '{}', asset_ids TEXT NOT NULL DEFAULT '[]',
+        depends_on TEXT NOT NULL DEFAULT '[]',
+        expert TEXT NOT NULL DEFAULT '', priority INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending', attempt INTEGER NOT NULL DEFAULT 0,
+        claimed_by TEXT NOT NULL DEFAULT '', claimed_at TEXT, started_at TEXT,
+        finished_at TEXT, result TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_artex_intents_frontier "
+                 "ON artex_intents(project_id, status, priority)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_artex_intents_task "
+                 "ON artex_intents(project_id, task_id)")
+
+
+def _ensure_artex_task_runtime(conn: sqlite3.Connection) -> None:
+    conn.execute("""CREATE TABLE IF NOT EXISTS artex_task_runtime (
+        project_id TEXT NOT NULL REFERENCES projects(id), task_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'exploring', goal TEXT NOT NULL DEFAULT '',
+        metadata TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        PRIMARY KEY(project_id, task_id))""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_artex_runtime_project "
+                 "ON artex_task_runtime(project_id, status, updated_at DESC)")
+
+
+def _ensure_artex_task_assets(conn: sqlite3.Connection) -> None:
+    """旧库补建 v44 任务范围资产表（覆盖度分母）。DDL 已含 IF NOT EXISTS。"""
+    conn.execute("""CREATE TABLE IF NOT EXISTS artex_task_assets (
+        project_id TEXT NOT NULL REFERENCES projects(id), task_id TEXT NOT NULL,
+        asset_id TEXT NOT NULL REFERENCES assets(id),
+        source TEXT NOT NULL DEFAULT 'planner', note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL, PRIMARY KEY(project_id, task_id, asset_id))""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_artex_task_assets_task "
+                 "ON artex_task_assets(project_id, task_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_artex_task_assets_asset "
+                 "ON artex_task_assets(project_id, asset_id)")
+
+
+def _ensure_artex_exploration(conn: sqlite3.Connection) -> None:
+    conn.execute("""CREATE TABLE IF NOT EXISTS artex_exploration_nodes (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+        task_id TEXT NOT NULL DEFAULT '', intent_id TEXT, kind TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '', content TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'open', confidence REAL NOT NULL DEFAULT 0.0,
+        asset_ids TEXT NOT NULL DEFAULT '[]', metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_artex_explore_project "
+                 "ON artex_exploration_nodes(project_id, task_id, kind)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_artex_explore_intent "
+                 "ON artex_exploration_nodes(project_id, intent_id)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS artex_exploration_edges (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+        from_node_id TEXT NOT NULL REFERENCES artex_exploration_nodes(id),
+        to_node_id TEXT NOT NULL REFERENCES artex_exploration_nodes(id),
+        relation TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        UNIQUE(project_id, from_node_id, to_node_id, relation))""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_artex_explore_edges_from "
+                 "ON artex_exploration_edges(project_id, from_node_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_artex_explore_edges_to "
+                 "ON artex_exploration_edges(project_id, to_node_id)")
+
+
+def _migrate_intent_anchors(conn: sqlite3.Connection) -> None:
+    """v28→v29：存量无锚点且 open 的意图落 intent.anchor_required 审计事件。
+
+    意图必须有资产锚点（2026-10-01 新规）——否则落不到链路图子目标下，其
+    dead_end 收尾也无法为资产背书 tested_clean。只标注**仍 open** 的游离意图
+    （closed 历史一律不动：保住已上链路图与既有 tested_clean 背书）。幂等：
+    meta.intents_anchor_migration 置位后不再重复扫描；但新库/无 intents 表时跳过。
+    """
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='intents'")}
+    if not tables:
+        return
+    done = conn.execute(
+        "SELECT value FROM meta WHERE key='intents_anchor_migration'").fetchone()
+    if done is not None:
+        return
+    rows = conn.execute(
+        "SELECT id, project_id, target_asset_id, basis_refs FROM intents"
+        " WHERE status='open'").fetchall()
+    import json as _json
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for r in rows:
+        has_anchor = bool(r[2] and str(r[2]).strip())
+        if not has_anchor:
+            try:
+                refs = _json.loads(r[3] or "[]")
+            except ValueError:
+                refs = []
+            has_anchor = any(isinstance(x, str) and x.startswith("asset:")
+                             for x in refs)
+        if has_anchor:
+            continue
+        conn.execute(
+            "INSERT INTO events(project_id, session_id, kind, payload, author,"
+            " created_at) VALUES(?,?,?,?,?,?)",
+            (r[1], None, "intent.anchor_required",
+             _json.dumps({"intent_id": r[0],
+                          "reason": "存量 open 意图无资产锚点——请补 "
+                                    "target_asset_id 或 basis_refs 的 "
+                                    "asset:<id> 后重新立意收尾"},
+                         ensure_ascii=False),
+             "system-migration", ts))
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('intents_anchor_migration', ?)"
+        " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (ts,))
+
+
+def _migrate_agent_id_rename(conn: sqlite3.Connection) -> None:
+    """v48→v49：主控 agent_id 从 `chat-orchestrator` 归一为 `pentest-controller`。
+
+    为什么必须迁移而不是「新旧都认」：`ChatTurn.__init__` 用
+    `agent_id in CONTROLLER_IDS` 判定「这是不是控制器」，而 CONTROLLER_IDS 只能
+    有一个真值。同时认两个 id 会让「谁是主控」出现两个真相源（前端常量、通知
+    投递、wrapup 选词各写一份），迟早分叉。数据归一后代码只需认新 id。
+
+    迁移范围：`chat_threads.agent_id` 一列，其它表没有该语义（artex_* 表的
+    agent/worker 列存的是专家名与 intent id）。幂等：meta 键置位后不再扫描，
+    且 UPDATE 自带 WHERE 天然幂等（重跑命中 0 行）。
+    """
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='chat_threads'")}
+    if not tables:
+        return
+    done = conn.execute(
+        "SELECT value FROM meta WHERE key='agent_id_rename_migration'").fetchone()
+    if done is not None:
+        return
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        "UPDATE chat_threads SET agent_id='pentest-controller'"
+        " WHERE agent_id='chat-orchestrator'")
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('agent_id_rename_migration', ?)"
+        " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (ts,))
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(DDL)
+    _migrate(conn)
+    # 版本号随迁移 upsert（旧库 meta 里可能留着 1/2/3/4）
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('schema_version', ?)"
+        " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(SCHEMA_VERSION),),
+    )
+    conn.commit()

@@ -1,0 +1,1432 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn, spawnSync } = require('child_process');
+const paths = require('./lib/paths');
+const { assertTraceSignals, traceSignalNeedleGroups } = require('./lib/trace-signal-policy');
+
+const KNOWN_FLAGS = [
+  '--url', '--input', '--case-dir', '--dir', '--out-dir', '--profile-dir', '--ruyitrace-home',
+  '--ruyitrace-exe', '--project-dir', '--cookie', '--cookie-domain', '--duration', '--limit',
+  '--ptype', '--trace-env', '--target-signal', '--trace-signal', '--evidence-signal',
+  '--end-signal', '--signal-policy', '--flush-timeout', '--flush-quiet',
+  '--dry-run', '--import-after', '--json', '--markdown',
+  '--self-test', '--help',
+];
+
+// 参数拼错时给出最接近的合法参数名（编辑距离 ≤3），避免用户对着全量 usage 逐行找。
+function suggestFlag(input) {
+  const a = String(input || '');
+  let best = '';
+  let bestScore = Infinity;
+  for (const flag of KNOWN_FLAGS) {
+    const score = editDistance(a, flag);
+    if (score < bestScore) { bestScore = score; best = flag; }
+  }
+  return bestScore <= 3 ? `，是否想用 ${best}？` : '';
+}
+
+function editDistance(a, b) {
+  const prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i += 1) {
+    let diag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const tmp = prev[j];
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diag = tmp;
+    }
+  }
+  return prev[b.length];
+}
+
+function parseArgs(argv) {
+  const args = {
+    url: '',
+    input: '',
+    caseDir: '.',
+    outDir: '',
+    profileDir: '',
+    ruyitraceHome: '',
+    ruyitraceExe: '',
+    projectDir: '',
+    cookies: [],
+    cookieDomain: '',
+    duration: 120,
+    limit: 200000,
+    ptype: '',
+    traceEnv: [],
+    targetSignals: [],
+    traceSignals: [],
+    evidenceSignals: [],
+    endSignals: [],
+    signalPolicy: 'strict',
+    flushTimeout: 45000,
+    flushQuiet: 8000,
+    userJs: '',
+    prefs: [],
+    gate: null,
+    gateAfter: 0,
+    gateDuration: 0,
+    maxLogBytes: 0,
+    dryRun: false,
+    importAfter: false,
+    json: false,
+    markdown: false,
+    help: false,
+    selfTest: false,
+  };
+  for (let i = 2; i < argv.length; i += 1) {
+    const a = argv[i];
+    const nextVal = (fb) => (i + 1 < argv.length && typeof argv[i + 1] === 'string' && !argv[i + 1].startsWith('-')) ? argv[++i] : fb;
+    const needVal = (hint) => {
+      const v = nextVal('');
+      if (!v) throw new Error(`${a} 缺少取值${hint ? `：${hint}` : ''}`);
+      return v;
+    };
+    if (a === '--url') args.url = nextVal('');
+    else if (a === '--input') args.input = nextVal('');
+    else if (a === '--case-dir' || a === '--dir') args.caseDir = nextVal('');
+    else if (a === '--out-dir') args.outDir = nextVal('');
+    else if (a === '--profile-dir') args.profileDir = nextVal('');
+    else if (a === '--ruyitrace-home') args.ruyitraceHome = nextVal('');
+    else if (a === '--ruyitrace-exe') args.ruyitraceExe = nextVal('');
+    else if (a === '--project-dir') args.projectDir = nextVal('');
+    else if (a === '--cookie') args.cookies.push(nextVal(''));
+    else if (a === '--cookie-domain') args.cookieDomain = nextVal('');
+    else if (a === '--duration') args.duration = Number(nextVal('120'));
+    else if (a === '--limit') args.limit = Number(nextVal('200000'));
+    else if (a === '--ptype') args.ptype = nextVal('');
+    else if (a === '--trace-env') args.traceEnv.push(nextVal(''));
+    else if (a === '--target-signal') {
+      const signal = needVal('信号字符串，如 Headers.set 或目标参数名');
+      args.targetSignals.push(signal);
+      args.evidenceSignals.push(signal);
+      args.endSignals.push(signal);
+    }
+    else if (a === '--trace-signal') {
+      const signal = needVal('信号字符串，如 XMLHttpRequest 或目标参数名');
+      args.traceSignals.push(signal);
+      args.evidenceSignals.push(signal);
+    }
+    else if (a === '--evidence-signal') args.evidenceSignals.push(needVal('信号字符串，用于证据门禁'));
+    else if (a === '--end-signal') args.endSignals.push(needVal('信号字符串，用于提前结束采集'));
+    else if (a === '--signal-policy') {
+      const v = needVal('strict 或 advisory');
+      if (!['strict', 'advisory'].includes(v)) throw new Error(`--signal-policy 只接受 strict 或 advisory，收到：${v}`);
+      args.signalPolicy = v;
+    }
+    else if (a === '--flush-timeout') {
+      const v = Number(needVal('毫秒，如 45000'));
+      if (!Number.isFinite(v) || v < 0) throw new Error('--flush-timeout 需为非负毫秒数');
+      args.flushTimeout = v;
+    }
+    else if (a === '--flush-quiet') {
+      const v = Number(needVal('毫秒，如 8000'));
+      if (!Number.isFinite(v) || v < 0) throw new Error('--flush-quiet 需为非负毫秒数');
+      args.flushQuiet = v;
+    }
+    else if (a === '--user-js') args.userJs = needVal('user.js 文件路径（整份写入 trace profile）');
+    else if (a === '--pref') {
+      const v = needVal('KEY=VALUE，如 javascript.options.blinterp=false');
+      if (!v.includes('=')) throw new Error(`--pref 需要 KEY=VALUE 形式，收到：${v}`);
+      args.prefs.push(v);
+    }
+    else if (a === '--gate') {
+      // 省略取值时用默认控制文件（输出目录下 trace-gate.on），传值则用指定路径
+      args.gate = nextVal('') || 'default';
+    }
+    else if (a === '--gate-after') {
+      const v = Number(needVal('毫秒，如 8000'));
+      if (!Number.isFinite(v) || v < 0) throw new Error('--gate-after 需为非负毫秒数');
+      args.gateAfter = v;
+    }
+    else if (a === '--gate-duration') {
+      const v = Number(needVal('毫秒，如 15000'));
+      if (!Number.isFinite(v) || v < 0) throw new Error('--gate-duration 需为非负毫秒数');
+      args.gateDuration = v;
+    }
+    else if (a === '--max-log-bytes') {
+      const v = Number(needVal('字节数，如 2147483648（2GB）'));
+      if (!Number.isFinite(v) || v < 0) throw new Error('--max-log-bytes 需为非负字节数');
+      args.maxLogBytes = v;
+    }
+    else if (a === '--dry-run') args.dryRun = true;
+    else if (a === '--import-after') args.importAfter = true;
+    else if (a === '--json') args.json = true;
+    else if (a === '--markdown') args.markdown = true;
+    else if (a === '--self-test') args.selfTest = true;
+    else if (a === '--help' || a === '-h') args.help = true;
+    else throw new Error(`未知参数：${a}${suggestFlag(a)}（完整参数说明用 --help 查看）`);
+  }
+  if (!args.json && !args.markdown) args.markdown = true;
+  if (!Number.isFinite(args.duration) || args.duration <= 0) args.duration = 120;
+  if (!Number.isFinite(args.limit) || args.limit <= 0) args.limit = 200000;
+  if (!['strict', 'advisory'].includes(args.signalPolicy)) args.signalPolicy = 'strict';
+  args.traceSignals = args.traceSignals.filter((s) => s && s.trim());
+  args.evidenceSignals = args.evidenceSignals.filter((s) => s && s.trim());
+  args.endSignals = args.endSignals.filter((s) => s && s.trim());
+  assertTraceSignals(args.evidenceSignals, 'evidence-signal');
+  assertTraceSignals(args.endSignals, 'end-signal');
+  if (args.evidenceSignals.length) args.targetSignals = args.evidenceSignals.slice();
+  args.traceEnvPairs = parseTraceEnv(args.traceEnv);
+  if ((args.gateAfter || args.gateDuration) && !args.gate) {
+    throw new Error('--gate-after / --gate-duration 需配合 --gate 使用（未启用闸门时无意义）');
+  }
+  args.prefPairs = parsePrefs(args.prefs);
+  return args;
+}
+
+// user.js pref 透传：Firefox 层配置（JIT/tier-pin、代理 prefs 等）没有对应的 MOZ_DOM_ 环境变量，
+// 只能写进 profile 的 user.js。--pref 与 --user-js 可并用，--pref 覆盖同名 key 后追加。
+function parsePrefs(pairs) {
+  const out = [];
+  for (const item of (pairs || [])) {
+    const eq = String(item).indexOf('=');
+    const key = String(item).slice(0, eq).trim();
+    const value = String(item).slice(eq + 1).trim();
+    if (!key || eq <= 0) throw new Error(`--pref 需要 KEY=VALUE 形式，收到：${item}`);
+    out.push({ key, value });
+  }
+  return out;
+}
+
+// 把 user.js 内容合并进 trace profile：同 key 覆盖、其余保留，避免复用 profile 时丢掉既有 prefs。
+// 返回实际写入的 pref 行数（含 --pref 追加项），供计划与报告展示。
+function writeUserPrefs(profileDir, args) {
+  let base = '';
+  if (args.userJs) {
+    const src = path.resolve(args.userJs);
+    if (!exists(src)) throw new Error(`--user-js 文件不存在：${src}`);
+    base = fs.readFileSync(src, 'utf8');
+  }
+  const lines = base.split(/\r?\n/);
+  const prefRe = /^user_pref\(\s*"([^"]+)"\s*,\s*(.*?)\s*\)\s*;?\s*$/;
+  for (const { key, value } of args.prefPairs || []) {
+    const literal = /^-?\d+(\.\d+)?$/.test(value) || value === 'true' || value === 'false' ? value : `"${value.replace(/"/g, '\\"')}"`;
+    const line = `user_pref("${key}", ${literal});`;
+    const idx = lines.findIndex((l) => { const m = l.match(prefRe); return m && m[1] === key; });
+    if (idx >= 0) lines[idx] = line; else lines.push(line);
+  }
+  const content = lines.filter((l) => l.trim()).join('\n') + '\n';
+  ensureDir(profileDir);
+  fs.writeFileSync(path.join(profileDir, 'user.js'), content, 'utf8');
+  return (content.match(/user_pref\(/g) || []).length;
+}
+
+// 递归统计目录体积（用于采集期日志熔断）。读不到就当 0，不因统计失败中断采集。
+function dirSizeBytes(dir) {
+  let total = 0;
+  const walk = (d) => {
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const ent of entries) {
+      const p = path.join(d, ent.name);
+      try {
+        if (ent.isDirectory()) walk(p);
+        else total += fs.statSync(p).size;
+      } catch { /* 文件被并发写入/删除时跳过 */ }
+    }
+  };
+  walk(dir);
+  return total;
+}
+
+function formatBytes(n) {
+  if (n >= 1073741824) return `${(n / 1073741824).toFixed(2)} GB`;
+  if (n >= 1048576) return `${(n / 1048576).toFixed(1)} MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${n} B`;
+}
+
+// 定向 trace 开关透传：允许 MOZ_DOM_（RuyiTrace 内核 trace 配置命名空间）与
+// JIT_OPTION_（Firefox JIT 调优/tier-pin，如 baselineInterpreterWarmUpThreshold）两类前缀，
+// 不允许覆盖脚本自身管理的 5 个 key（对应专用参数 --limit / --ptype / 输出路径），
+// 避免采集计划与实际环境变量漂移。输出文件按锚点自动派生：设 MOZ_DOM_TRACE_FILE 后，
+// jscall/cookie/eval 等模块日志落在同目录子文件夹，无需单独传 *_TRACE_FILE。
+const SCRIPT_MANAGED_TRACE_ENV = new Set([
+  'MOZ_DOM_TRACE', 'MOZ_DOM_TRACE_FILE', 'MOZ_DOM_TRACE_LIMIT',
+  'MOZ_DOM_TRACE_PTYPE', 'MOZ_DISABLE_LAUNCHER_PROCESS',
+  // 闸门由 --gate 自管：脚本要在运行中按 --gate-after / --gate-duration 创建/删除控制文件，
+  // 再用 --trace-env 传一个静态路径会让脚本与实际环境漂移（浏览器只读 env，不管文件是谁建的）。
+  'MOZ_DOM_TRACE_GATE',
+]);
+
+function parseTraceEnv(pairs) {
+  const out = {};
+  for (const item of (pairs || [])) {
+    if (typeof item !== 'string' || !item.trim()) continue;
+    const eq = item.indexOf('=');
+    if (eq <= 0) throw new Error(`--trace-env 需要 KEY=VALUE 形式，收到：${item}`);
+    const key = item.slice(0, eq).trim();
+    const value = item.slice(eq + 1).trim();
+    // MOZ_DOM_ 一律全大写；JIT_OPTION_ 沿用 Firefox 的驼峰名（baselineInterpreterWarmUpThreshold）
+    const keyOk = /^MOZ_DOM_[A-Z0-9_]+$/.test(key) || /^JIT_OPTION_[A-Za-z0-9_]+$/.test(key);
+    if (!keyOk) throw new Error(`--trace-env 只接受 MOZ_DOM_（RuyiTrace trace 开关，全大写）或 JIT_OPTION_（Firefox JIT 调优/tier-pin，驼峰）前缀的环境变量：${key}（完整开关清单见 references/tooling/ruyitrace-cheatsheet.md）`);
+    if (SCRIPT_MANAGED_TRACE_ENV.has(key)) throw new Error(`--trace-env 不允许覆盖脚本管理的 ${key}：行数上限用 --limit、进程类型用 --ptype、输出路径由 --case-dir 决定、运行时闸门用 --gate`);
+    out[key] = value;
+  }
+  return out;
+}
+
+function usage() {
+  return `用法（自动 trace / 手动 trace 二选一）：
+  # 自动 trace：自动启动随 RuyiTrace 提供的 trace Firefox 捕获 NDJSON
+  node scripts/capture_ruyitrace_log.js --url <target-page-url> --case-dir . --ruyitrace-home <RuyiTrace-dir> --duration 120 --import-after --markdown
+  # 手动 trace：用户已用 RuyiTrace 手动 trace 完成，指定 NDJSON 日志直接导入生成摘要
+  node scripts/capture_ruyitrace_log.js --input <用户trace生成的.ndjson> --case-dir . --markdown
+  # 仅检测环境并打印计划（不启动浏览器）
+  node scripts/capture_ruyitrace_log.js --url <target-page-url> --case-dir . --dry-run --json
+  # 本地自测（不启动浏览器）
+  node scripts/capture_ruyitrace_log.js --self-test
+
+说明：--case-dir 指项目根目录（其下应有 case/ 和 result/ 两个平级子目录），默认当前目录。
+--project-dir <dir>：用户工程目录（tools/ 所在），未传时从 --case-dir 推断；安装模式下需靠此定位 RuyiTrace。
+--url 与 --input 互斥：--url 为自动捕获（需 RuyiTrace 完整安装）；--input 为手动 trace 后直接导入用户指定的 NDJSON，无需 RuyiTrace 安装检测。
+--trace-signal / --evidence-signal <信号>（可多次）：只用于导入和证据门禁，扫描环境 API / writer / 参数写入点。
+--end-signal <信号>（可多次）：仅用于自动采集提前结束；不传时只在用户关闭或 duration 到期时结束。
+--target-signal <信号>（兼容旧参数）：同时作为 evidence-signal 和 end-signal；新流程不要使用。
+--signal-policy strict|advisory：strict 未命中退出非 0；advisory 只记录覆盖不足，适合用户手动结束或信号尚未确定的采集。
+--flush-timeout <ms>（默认 45000）：结束后等待日志刷盘的上限。content 进程日志常在浏览器 kill 后数十秒才写出（match17 实测 33s），过短会只收进空壳小文件。
+--flush-quiet <ms>（默认 8000）：连续静默多久才判定刷盘完成；只按「一轮稳定」返回会漏掉后刷盘的大进程日志。
+--ptype <list>：启用 trace 的进程类型（逗号分隔，透传 MOZ_DOM_TRACE_PTYPE），不传则全部进程类型；大页面可只留主/content 进程减少无关日志。
+--trace-env KEY=VALUE（可多次）：透传 RuyiTrace 定向 trace 开关（仅 MOZ_DOM_ 前缀；KEY=VALUE 里的值含空格时整体加引号）。
+  定向组合示例（先判题型再选最小开关，避免日志过大，完整清单见 references/tooling/ruyitrace-cheatsheet.md）：
+    # 已知目标脚本，只缩小 jscall 记录范围并排除噪声（日志量最大的降幅来源）：
+    --trace-env MOZ_DOM_JSCALL_TRACE=1 --trace-env "MOZ_DOM_JSCALL_SCRIPT_URL=challenge.js;static/crypto" --trace-env "MOZ_DOM_JSCALL_SCRIPT_URL_EXCLUDE=analytics;telemetry" --trace-env MOZ_DOM_JSCALL_SHALLOW=1
+    # 已知函数名，只记目标函数及子调用并抓参数/返回值真值：
+    --trace-env MOZ_DOM_JSCALL_TRACE=1 --trace-env MOZ_DOM_JSCALL_TARGET_ONLY=1 --trace-env "MOZ_DOM_JSCALL_DETAIL_FUNCS=encrypt,sign" --trace-env MOZ_DOM_JSCALL_SHALLOW=1
+    # 不知函数名：按脚本来源整体抓真值（长密文补 DEEP_LONG_STR 防截断）：
+    --trace-env MOZ_DOM_JSCALL_TRACE=1 --trace-env MOZ_DOM_JSCALL_SCRIPT_URL=target.js --trace-env MOZ_DOM_JSCALL_DETAIL_SCRIPT_URL=target.js --trace-env MOZ_DOM_JSCALL_SHALLOW=1 --trace-env MOZ_DOM_JSCALL_DEEP_LONG_STR=512
+    # 还原 jsvmp 指令流（autodetect；重混淆站点加 MIN_BYTECODE=128 MIN_SPAN=200）：
+    --trace-env MOZ_DOM_JSVMP_TRACE=1 --trace-env "MOZ_DOM_JSVMP_SCRIPT_URL=challenges.example.com" --trace-env MOZ_DOM_JSVMP_AUTODETECT=1
+--user-js <file> / --pref KEY=VALUE（后者可多次）：把 user.js 合并写入 trace profile，用于没有对应环境变量的
+  Firefox 层配置。典型用途是 tier-pin（opcode/vm_step 要全程不断流必须关 JIT，否则热函数 tier-up 后进入
+  hook 盲区、轨迹断流）与代理 prefs：
+    --pref javascript.options.blinterp=false --pref javascript.options.baselinejit=false --pref javascript.options.ion=false
+  --user-js 为整份文件（同 key 被 --pref 覆盖后追加），--pref 适合只改个别项。注意 blinterp 才是
+  baseline interpreter 的正确 pref 名（写 baseline_interpreter 不生效，match24 实证）。
+--gate [控制文件]（省略取值时落到输出目录下 trace-gate.on）：运行时启停闸门，只录关心的窗口，避免把整个
+  页面加载期噪声一起录进来（带栈 opcode 全录是 GB 级）。配套：
+    --gate-after <ms>（默认 0）：启动后多久开闸，给页面加载/登录留静默期。
+    --gate-duration <ms>（默认 0=开到采集结束）：开窗多久后自动关闸。
+  例（加载完再等 8s 开窗录 15s）：--gate --gate-after 8000 --gate-duration 15000 --duration 60
+  开窗期间需要交互（翻页/触发验证码）时用 ruyipage 挂到本脚本启动的浏览器上驱动，
+  见 references/tooling/ruyi-tooling.md「闸门窗口 + 外部驱动采集」。
+--max-log-bytes <字节数>（默认 0=不限）：采集期每 1.5s 统计日志目录体积，达阈值立即关浏览器收尾。
+  带栈 opcode（OPCODE_STACK_FULL）务必设硬保险，实测可达 2~6.6GB（match24）；OPCODE_LIMIT 是条数上限，
+  与字节上限互补——单条深序列化时条数没到、盘先满。
+--cookie "name=value"（可多次，或 "a=1; b=2" 分号分隔）：启动前向 trace profile 的 cookies.sqlite 预写 Cookie，用于需预置登录态/会话的页面取 Business 完整链路。
+--cookie-domain <domain>：--cookie 写入的目标域名（如 .bilibili.com），缺省取 --url 主机（含点前缀）。
+`;
+}
+
+function exists(p) {
+  try { return !!p && fs.existsSync(p); } catch { return false; }
+}
+
+function isDir(p) {
+  try { return !!p && fs.statSync(p).isDirectory(); } catch { return false; }
+}
+
+function ensureDir(p) {
+  fs.mkdirSync(p, { recursive: true });
+}
+
+function run(cmd, args, timeout = 8000) {
+  const ret = spawnSync(cmd, args, { encoding: 'utf8', timeout, windowsHide: true });
+  return { ok: ret.status === 0, stdout: ret.stdout || '', stderr: ret.stderr || '' };
+}
+
+function detectRuyiTrace(args) {
+  const home = paths.normalizeTraceHome({ ruyitraceHome: args.ruyitraceHome, ruyitraceExe: args.ruyitraceExe, projectDir: args.projectDir || paths.resolveProjectDirFromCaseDir(args.caseDir) });
+  const exeName = process.platform === 'win32' ? 'RuyiTrace.exe' : 'RuyiTrace';
+  const exe = args.ruyitraceExe ? path.resolve(args.ruyitraceExe) : (home ? path.join(home, exeName) : '');
+  // 兼容两代 RuyiTrace 内核路径：
+  //   新版 2.5+（Electron 壳）：<home>/resources/kernel/firefox(.exe) + RUYI_DOMTRACE.txt
+  //   旧版 1.x（自带 firefox/）：<home>/firefox/firefox(.exe) + RUYI_DOMTRACE.txt
+  const firefoxName = process.platform === 'win32' ? 'firefox.exe' : 'firefox';
+  const candidates = [
+    { kind: 'new', firefoxExe: path.join(home || '', 'resources', 'kernel', firefoxName), marker: path.join(home || '', 'resources', 'kernel', 'RUYI_DOMTRACE.txt') },
+    { kind: 'legacy', firefoxExe: path.join(home || '', 'firefox', firefoxName), marker: path.join(home || '', 'firefox', 'RUYI_DOMTRACE.txt') },
+  ];
+  const kernel = candidates.find((c) => exists(c.firefoxExe) && exists(c.marker)) || candidates[0];
+  const firefoxExe = kernel.firefoxExe;
+  const marker = kernel.marker;
+  const installed = exists(exe) && exists(firefoxExe) && exists(marker);
+  return {
+    installed,
+    home,
+    exe,
+    exeExists: exists(exe),
+    firefoxExe,
+    firefoxExists: exists(firefoxExe),
+    marker,
+    markerExists: exists(marker),
+    reason: installed ? '' : `RuyiTrace 不完整：需要 RuyiTrace 可执行文件，以及 ${kernel.kind === 'new' ? 'resources/kernel' : 'firefox'}/firefox(.exe) 与同目录 RUYI_DOMTRACE.txt`,
+  };
+}
+
+function timestamp() {
+  return new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 14);
+}
+
+function buildPlan(args, trace) {
+  const caseDir = path.resolve(args.caseDir || '.');
+  const caseSubdir = path.join(caseDir, 'case');
+  const outDir = path.resolve(args.outDir || path.join(caseSubdir, 'ruyi-trace', 'logs'));
+  const profileDir = path.resolve(args.profileDir || path.join(caseSubdir, 'tmp', 'ruyitrace-profile'));
+  const traceFile = path.join(outDir, `trace-${timestamp()}.ndjson`);
+  // 闸门控制文件：--gate 未传值时落在输出目录下，避免与本次采集的日志混在一起难以分辨
+  const gateFile = args.gate ? path.resolve(args.gate === 'default' ? path.join(outDir, 'trace-gate.on') : args.gate) : '';
+  const firefoxArgs = ['-no-remote', '-new-instance', '-profile', profileDir];
+  if (args.url) firefoxArgs.push(args.url);
+  return {
+    caseDir,
+    outDir,
+    profileDir,
+    traceFile,
+    gateFile,
+    gateAfterMs: args.gateAfter || 0,
+    gateDurationMs: args.gateDuration || 0,
+    maxLogBytes: args.maxLogBytes || 0,
+    userPrefs: {
+      file: args.userJs ? path.resolve(args.userJs) : '',
+      overrides: (args.prefPairs || []).map((p) => `${p.key}=${p.value}`),
+    },
+    firefoxExe: trace.firefoxExe,
+    firefoxArgs,
+    presetCookies: {
+      count: parseCookieArgs(args.cookies).length,
+      domain: args.cookieDomain,
+    },
+    env: {
+      MOZ_DOM_TRACE: '1',
+      MOZ_DOM_TRACE_FILE: traceFile,
+      MOZ_DOM_TRACE_LIMIT: String(args.limit),
+      MOZ_DISABLE_LAUNCHER_PROCESS: '1',
+      ...(args.ptype ? { MOZ_DOM_TRACE_PTYPE: args.ptype } : {}),
+      ...(gateFile ? { MOZ_DOM_TRACE_GATE: gateFile } : {}),
+      ...(args.traceEnvPairs || {}),
+    },
+  };
+}
+
+// 递归扫描目录下 NDJSON/JSONL（兼容新版分目录结构：domtrace/ 主日志 + jscall/cookie/descriptor/event/storage
+// 分类——jscall 等派生模块日志后缀为 .jsonl；也兼容旧版顶层单文件）。优先返回 domtrace/ 下的主日志，
+// 其余按修改时间倒序。
+// sinceMs 容差 10s：新版内核启动较慢（Firefox 155 重 fork），日志文件可能晚于采集起点才创建/写入。
+function walkNdjson(dir) {
+  if (!isDir(dir)) return [];
+  const out = [];
+  const walk = (d) => {
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { entries = []; }
+    for (const ent of entries) {
+      const p = path.join(d, ent.name);
+      if (ent.isDirectory()) walk(p);
+      else if (/\.(?:ndjson|jsonl)$/i.test(ent.name)) out.push(p);
+    }
+  };
+  walk(dir);
+  return out;
+}
+
+function listNdjsonFiles(dir, sinceMs) {
+  const out = walkNdjson(dir);
+  if (!out.length) return [];
+  const fresh = out.filter((file) => {
+    try { return fs.statSync(file).mtimeMs >= sinceMs - 10000; } catch { return false; }
+  });
+  const rank = (p) => {
+    const inDom = /[\\/]domtrace[\\/]/.test(p) ? 0 : 1;
+    let m = 0;
+    try { m = fs.statSync(p).mtimeMs; } catch { m = 0; }
+    return [inDom, -m];
+  };
+  return fresh.sort((a, b) => {
+    const ra = rank(a);
+    const rb = rank(b);
+    return ra[0] - rb[0] || ra[1] - rb[1];
+  });
+}
+
+// 读 NDJSON 识别 process_type：parent=浏览器父进程/内核活动（不含页面 JS，参与 target-signal 必然误报），
+// tab/content=页面内容进程（真正的业务 JS 调用）。
+// 兜底策略（match14 教训：52615 行的 content 日志被整体排除，自动导入只剩 1 行 event 日志）：
+// 1) 单行可能超过 8KB（长 stack/args），只读 8KB 会截断导致 JSON.parse 失败 → 逐级放大到 1MB 重读；
+// 2) 首行可能是非 JSON 头部或写入中的残行 → 依次探测前若干完整行；
+// 3) 全部失败时正则兜底直接从文本里抓 "process_type":"xxx"。
+function readProcessType(file) {
+  for (const size of [8192, 262144, 1048576]) {
+    let text = '';
+    try {
+      const fd = fs.openSync(file, 'r');
+      try {
+        const buf = Buffer.alloc(size);
+        const n = fs.readSync(fd, buf, 0, size, 0);
+        text = buf.slice(0, n).toString('utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return '';
+    }
+    if (!text) return '';
+    const lines = text.split('\n');
+    const complete = text.endsWith('\n') ? lines : lines.slice(0, -1);
+    for (const line of complete.slice(0, 20)) {
+      if (!line.trim()) continue;
+      try {
+        const evt = JSON.parse(line);
+        if (evt && evt.process_type) return String(evt.process_type);
+      } catch { /* 继续探测下一行 */ }
+    }
+    const m = /"process_type"\s*:\s*"([^"]+)"/.exec(text);
+    if (m) return m[1];
+    // 已读到完整行仍未识别：放大窗口也只是读到更后面的同类记录，直接判定未识别
+    if (complete.length) return '';
+  }
+  return '';
+}
+
+// 统计 NDJSON 行数（用于导入不足时的候选文件诊断）。大文件按块读，不整体载入内存。
+function countNdjsonLines(file) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      const size = fs.fstatSync(fd).size;
+      const chunk = 1024 * 1024;
+      const buf = Buffer.alloc(chunk);
+      let cursor = 0;
+      let lines = 0;
+      let lastByte = 0;
+      while (cursor < size) {
+        const n = fs.readSync(fd, buf, 0, Math.min(chunk, size - cursor), cursor);
+        if (n <= 0) break;
+        for (let i = 0; i < n; i += 1) if (buf[i] === 10) lines += 1;
+        lastByte = buf[n - 1];
+        cursor += n;
+      }
+      if (size > 0 && lastByte !== 10) lines += 1;
+      return lines;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return -1;
+  }
+}
+
+// 自动导入未覆盖主 DOM trace 时，枚举输出目录下全部 NDJSON 候选（行数 / process_type / 被排除原因），
+// 并给出可直接执行的手动导入命令，避免“静默只导入分类日志”让人误判为无日志可用。
+function describeTraceCandidates(outDir, sinceMs, picked) {
+  const pickedSet = new Set((picked || []).map((f) => path.resolve(f)));
+  const all = walkNdjson(outDir);
+  return all.map((file) => {
+    let mtimeMs = 0;
+    try { mtimeMs = fs.statSync(file).mtimeMs; } catch { mtimeMs = 0; }
+    const isDom = /[\\/]domtrace[\\/]/.test(file);
+    const processType = isDom ? readProcessType(file) : '';
+    const stale = mtimeMs < sinceMs - 10000;
+    const reasons = [];
+    if (!isDom) reasons.push('非 domtrace 分类日志（cookie/storage/event/descriptor 等，不含业务接口调用）');
+    if (stale) reasons.push(`早于本次采集起点（mtime ${new Date(mtimeMs).toISOString()}，采集起点 ${new Date(sinceMs).toISOString()}）`);
+    if (isDom && processType === 'parent') reasons.push('process_type=parent（浏览器父进程/内核活动，不含页面 JS）');
+    if (isDom && !processType) reasons.push('process_type 无法识别（首行非法/写入中）');
+    return {
+      file,
+      lines: countNdjsonLines(file),
+      processType: processType || (isDom ? '<未识别>' : '<分类日志>'),
+      imported: pickedSet.has(path.resolve(file)),
+      excludedReasons: reasons,
+    };
+  }).sort((a, b) => b.lines - a.lines);
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 检测 kernel firefox 进程是否存活（Windows）。返回进程数；非 Windows 或查询失败返回 null（表示不检测）。
+// 用户手动关闭浏览器（或浏览器崩溃）后，ExecutablePath 匹配内核 firefox 的进程数归零。
+function kernelFirefoxAlive(firefoxExe) {
+  return new Promise((resolve) => {
+    if (process.platform !== 'win32' || !firefoxExe) { resolve(null); return; }
+    const esc = (s) => String(s).replace(/'/g, "''");
+    const ps = spawn('powershell', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      `@(Get-CimInstance Win32_Process -Filter "Name='firefox.exe'" | Where-Object { $_.ExecutablePath -eq '${esc(firefoxExe.replace(/\//g, '\\'))}' }).Count`,
+    ], { windowsHide: true });
+    let out = '';
+    ps.stdout.on('data', (d) => { out += d; });
+    ps.once('error', () => resolve(null));
+    ps.once('exit', () => {
+      const n = parseInt(out.trim(), 10);
+      resolve(Number.isFinite(n) ? n : null);
+    });
+  });
+}
+
+function waitForExit(child, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      resolve(value);
+    };
+    // child 已退出（exitCode !== null）时 once('exit') 不会触发，直接按已退出处理
+    if (child.exitCode !== null || child.signalCode !== null) {
+      finish({ exited: true, code: child.exitCode, signal: child.signalCode });
+      return;
+    }
+    child.once('exit', (code, signal) => finish({ exited: true, code, signal }));
+    // 不用 unref：若 child 已死且无其他引用，unref 定时器不阻止进程退出，
+    // 会导致 promise 链被截断（输出丢失 / kill 未完成 / 残留进程）。保留引用等待超时。
+    setTimeout(() => finish({ exited: false, code: null, signal: null }), timeoutMs);
+  });
+}
+
+// 增量扫描新写入的 NDJSON。旧实现只扫描文件尾部 1MB，早先命中的 signal
+// 在日志继续增长后会被漏掉；同时记录每个文件的 offset，避免反复读取大日志。
+// 每个信号展开为 needle 组（组内 AND、组间 OR）：Interface.member 形态的信号除原子串外，
+// 增加 interface/member 分存字段组——RuyiTrace 记录 {"interface":"X","member":"y"}，
+// 原子串永不命中（match12 实测 XMLHttpRequest.open ×0）。
+function scanSignalsIncremental(files, signals, state) {
+  if (!signals || !signals.length || !files.length) return false;
+  state.offsets = state.offsets || new Map();
+  state.carry = state.carry || new Map();
+  const sameSignals = state.signalSource && state.signalSource.length === signals.length
+    && state.signalSource.every((s, i) => String(s) === String(signals[i]));
+  if (!sameSignals) {
+    state.signalSource = signals.slice();
+    state.signalGroups = signals.map((s) => traceSignalNeedleGroups(s));
+    state.observed = new Set();
+  }
+  const observed = state.observed;
+  const allNeedles = state.signalGroups.flat(2);
+  const maxNeedleLen = allNeedles.reduce((m, n) => Math.max(m, n.length), 1);
+  for (const file of files) {
+    try {
+      const st = fs.statSync(file);
+      const previous = state.offsets.get(file) || 0;
+      const start = st.size < previous ? 0 : previous;
+      const length = st.size - start;
+      if (length <= 0) continue;
+      const fd = fs.openSync(file, 'r');
+      let carry = st.size < previous ? '' : (state.carry.get(file) || '');
+      let cursor = start;
+      const chunkSize = 1024 * 1024;
+      while (cursor < st.size) {
+        const size = Math.min(chunkSize, st.size - cursor);
+        const buf = Buffer.alloc(size);
+        fs.readSync(fd, buf, 0, size, cursor);
+        const text = `${carry}${buf.toString('utf8')}`.toLowerCase();
+        state.signalGroups.forEach((groups, index) => {
+          if (observed.has(index)) return;
+          if (groups.some((group) => group.every((needle) => text.includes(needle)))) observed.add(index);
+        });
+        carry = text.slice(-Math.max(0, maxNeedleLen - 1));
+        cursor += size;
+      }
+      fs.closeSync(fd);
+      state.offsets.set(file, st.size);
+      state.carry.set(file, carry);
+    } catch { /* file may still be rotating */ }
+  }
+  return observed.size === signals.length;
+}
+
+async function runSelfTest() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'capture-trace-signal-'));
+  const file = path.join(root, 'trace.ndjson');
+  const state = { offsets: new Map(), carry: new Map(), observed: new Set() };
+  try {
+    fs.writeFileSync(file, '{"api":"hand', 'utf8');
+    if (scanSignalsIncremental([file], ['handshake'], state)) throw new Error('拆分信号不应在首段提前命中');
+    fs.appendFileSync(file, 'shake"}\n', 'utf8');
+    if (!scanSignalsIncremental([file], ['handshake'], state)) throw new Error('跨写入边界的信号应被命中');
+    fs.appendFileSync(file, 'x'.repeat(1024 * 1024 + 128), 'utf8');
+    if (!scanSignalsIncremental([file], ['handshake'], state)) throw new Error('日志继续增长后应记住已命中的信号');
+    // Interface.member 分存字段匹配：记录无 "XMLHttpRequest.open" 连续子串，也应命中
+    const file2 = path.join(root, 'trace2.ndjson');
+    fs.writeFileSync(file2, '{"type":"call","interface":"XMLHttpRequest","member":"open","args":["GET","/api"]}\n', 'utf8');
+    const state2 = { offsets: new Map(), carry: new Map() };
+    if (!scanSignalsIncremental([file2], ['XMLHttpRequest.open'], state2)) throw new Error('Interface.member 信号应命中分存字段记录');
+    // process_type 识别兜底：首行超过 8KB（长 stack）时不得判定失败（match14：content 日志被整体排除）
+    const domDir = path.join(root, 'domtrace');
+    fs.mkdirSync(domDir, { recursive: true });
+    const bigFirst = path.join(domDir, 'trace_process_1.ndjson');
+    const longStack = 'x'.repeat(20000);
+    fs.writeFileSync(bigFirst, `${JSON.stringify({ process_type: 'tab', stack: longStack })}\n${JSON.stringify({ process_type: 'tab' })}\n`, 'utf8');
+    if (readProcessType(bigFirst) !== 'tab') throw new Error('首行超 8KB 时应仍能识别 process_type');
+    // 首行非法（写入中残行）时应探测后续行
+    const brokenFirst = path.join(domDir, 'trace_process_2.ndjson');
+    fs.writeFileSync(brokenFirst, `{"process_type":"pa\n${JSON.stringify({ process_type: 'content' })}\n`, 'utf8');
+    if (readProcessType(brokenFirst) !== 'content') throw new Error('首行残缺时应从后续行识别 process_type');
+    // 行数统计与候选诊断
+    if (countNdjsonLines(brokenFirst) !== 2) throw new Error('countNdjsonLines 应统计 2 行');
+    const cands = describeTraceCandidates(root, Date.now() - 60000, [bigFirst]);
+    const picked = cands.find((c) => path.resolve(c.file) === path.resolve(bigFirst));
+    const missed = cands.find((c) => path.resolve(c.file) === path.resolve(brokenFirst));
+    if (!picked || !picked.imported) throw new Error('已导入文件应标记 imported');
+    if (!missed || missed.imported) throw new Error('未导入文件应标记为未导入');
+    if (missed.processType !== 'content') throw new Error('候选诊断应带出 process_type');
+    if (cands.some((c) => c.lines < 0)) throw new Error('候选诊断行数不应为负');
+    // 定向 trace 开关透传：合法 MOZ_DOM_ 与 JIT_OPTION_ key、非法前缀、脚本托管 key 三种路径
+    const envParsed = parseTraceEnv(['MOZ_DOM_JSCALL_TRACE=1', 'MOZ_DOM_JSCALL_SCRIPT_URL=a.js;b.js', 'JIT_OPTION_baselineInterpreterWarmUpThreshold=0']);
+    if (envParsed.MOZ_DOM_JSCALL_TRACE !== '1' || envParsed.MOZ_DOM_JSCALL_SCRIPT_URL !== 'a.js;b.js' || envParsed.JIT_OPTION_baselineInterpreterWarmUpThreshold !== '0') throw new Error('--trace-env 应解析 KEY=VALUE');
+    let threw = false;
+    try { parseTraceEnv(['MOZ_DOM_JSVMP_TRACE=1', 'MOZ_OTHER=1']); } catch { threw = true; }
+    if (!threw) throw new Error('非 MOZ_DOM_/JIT_OPTION_ 前缀应被拒绝');
+    threw = false;
+    try { parseTraceEnv(['MOZ_DOM_TRACE=0']); } catch { threw = true; }
+    if (!threw) throw new Error('覆盖脚本管理的 key 应被拒绝');
+    threw = false;
+    try { parseTraceEnv(['MOZ_DOM_TRACE_GATE=C:\\out\\trace.on']); } catch { threw = true; }
+    if (!threw) throw new Error('MOZ_DOM_TRACE_GATE 由 --gate 自管，--trace-env 应拒绝');
+    threw = false;
+    try { parsePrefs(['no-equals-sign']); } catch { threw = true; }
+    if (!threw) throw new Error('--pref 缺等号应被拒绝');
+    // user.js 合并写入：同 key 覆盖、其余保留（复用 profile 时不丢既有 prefs）
+    const prefDir = path.join(root, 'profile');
+    fs.mkdirSync(prefDir, { recursive: true });
+    const userJsSrc = path.join(root, 'user-src.js');
+    fs.writeFileSync(userJsSrc, 'user_pref("a", 1);\nuser_pref("keep.me", true);\n', 'utf8');
+    const prefCount = writeUserPrefs(prefDir, {
+      userJs: userJsSrc,
+      prefPairs: parsePrefs(['javascript.options.blinterp=false', 'a=2', 'network.proxy.socks=127.0.0.1']),
+    });
+    const written = fs.readFileSync(path.join(prefDir, 'user.js'), 'utf8');
+    if (prefCount !== 4) throw new Error(`user.js 应写入 4 条 pref，实际 ${prefCount}`);
+    if (!/user_pref\("a", 2\);/.test(written)) throw new Error('--pref 应覆盖 --user-js 里的同名 key');
+    if (!/user_pref\("keep\.me", true\);/.test(written)) throw new Error('--user-js 里未被覆盖的 pref 应保留');
+    if (!/user_pref\("javascript\.options\.blinterp", false\);/.test(written)) throw new Error('布尔值应写成字面量而非字符串');
+    if (!/user_pref\("network\.proxy\.socks", "127\.0\.0\.1"\);/.test(written)) throw new Error('字符串值应加引号');
+    // 参数联动：未启用闸门却给闸门时间参数应报错
+    threw = false;
+    try { parseArgs(['node', 'x', '--gate-after', '5000']); } catch { threw = true; }
+    if (!threw) throw new Error('--gate-after 未配 --gate 应被拒绝');
+    const gateDefault = parseArgs(['node', 'x', '--gate']);
+    if (gateDefault.gate !== 'default') throw new Error('--gate 省略取值时应落到默认控制文件');
+    const gateCustom = parseArgs(['node', 'x', '--gate', 'C:\\out\\trace.on', '--gate-duration', '15000']);
+    if (gateCustom.gate !== 'C:\\out\\trace.on' || gateCustom.gateDuration !== 15000) throw new Error('--gate 应支持自定义控制文件路径与开窗时长');
+    // 体积统计：目录递归（含子目录），用于采集期日志熔断
+    const capDir = path.join(root, 'cap', 'jscall');
+    fs.mkdirSync(capDir, { recursive: true });
+    fs.writeFileSync(path.join(capDir, 'a.jsonl'), 'x'.repeat(2048), 'utf8');
+    fs.writeFileSync(path.join(root, 'cap', 'b.ndjson'), 'y'.repeat(1024), 'utf8');
+    if (dirSizeBytes(path.join(root, 'cap')) !== 3072) throw new Error('dirSizeBytes 应递归统计子目录体积');
+    if (formatBytes(2147483648) !== '2.00 GB') throw new Error('formatBytes 应按 GB 展示');
+    // 日志刷盘等待：静默期内新出现的日志不得被漏掉（match17 实测：3 个真正的 tab 进程日志
+    // 在浏览器 kill 后才刷盘，旧实现“一轮稳定即返回”只收进 823B 空壳）
+    const flushDir = path.join(root, 'flush', 'domtrace');
+    fs.mkdirSync(flushDir, { recursive: true });
+    const flushSince = Date.now() - 1000;
+    fs.writeFileSync(path.join(flushDir, 'trace_process_1.ndjson'), `${JSON.stringify({ process_type: 'tab' })}\n`, 'utf8');
+    const lateTimer = setTimeout(() => {
+      fs.writeFileSync(path.join(flushDir, 'trace_process_2.ndjson'), `${JSON.stringify({ process_type: 'tab' })}\n`, 'utf8');
+    }, 600);
+    let flushResult;
+    try {
+      flushResult = await waitForTraceFlush(flushDir, flushSince, { timeoutMs: 8000, quietMs: 1000 });
+    } finally {
+      clearTimeout(lateTimer);
+    }
+    if (flushResult.files.length < 2) throw new Error('静默期内新刷盘的日志应被 waitForTraceFlush 收集');
+    if (flushResult.timedOut) throw new Error('日志已稳定时不应耗尽 flush 超时');
+    // walkNdjson 应同时发现 .ndjson 与 .jsonl（jscall 派生日志）
+    const jscallDir = path.join(root, 'jscall');
+    fs.mkdirSync(jscallDir, { recursive: true });
+    fs.writeFileSync(path.join(jscallDir, 'trace_jscall_process_1.jsonl'), '{"kind":"jscall"}\n', 'utf8');
+    // cap/ 是体积统计用例造的临时目录，不是本断言的计数对象
+    const walkAll = walkNdjson(root).filter((f) => !/[\\/](flush|cap)[\\/]/.test(f));
+    if (walkAll.length !== 5) throw new Error('walkNdjson 应匹配 .ndjson 与 .jsonl');
+    // 参数报错精细化：缺值 / 非法枚举 / 拼错参数名各给出定向提示，不再回落全量 usage
+    threw = '';
+    try { parseArgs(['node', 'x', '--trace-signal']); } catch (e) { threw = e.message; }
+    if (!/--trace-signal 缺少取值/.test(threw)) throw new Error('信号参数缺值应报出参数名');
+    threw = '';
+    try { parseArgs(['node', 'x', '--signal-policy', 'loose']); } catch (e) { threw = e.message; }
+    if (!/只接受 strict 或 advisory/.test(threw)) throw new Error('--signal-policy 非法取值应列出合法值');
+    threw = '';
+    try { parseArgs(['node', 'x', '--trace-signals', 'abc']); } catch (e) { threw = e.message; }
+    if (!/是否想用 --trace-signal/.test(threw)) throw new Error('拼错参数名应给出最接近的合法参数');
+    threw = '';
+    try { parseArgs(['node', 'x', '--trace-signal', 'ab']); } catch (e) { threw = e.message; }
+    if (!/最少 3 字符/.test(threw)) throw new Error('信号过短应告知最短长度');
+    return { clean: true, tests: 20 };
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function mainTraceFiles(files) {
+  const dom = files.filter((f) => /[\\/]domtrace[\\/]/.test(f));
+  const content = dom.filter((f) => {
+    const pt = readProcessType(f);
+    return pt && pt !== 'parent';
+  });
+  return content.length ? content : dom;
+}
+
+// 等待日志刷盘完成。
+// 旧实现只要“某一轮与上轮签名一致且所有文件以 LF 结尾”就立刻返回（最快 250ms），导致
+// 后刷盘的大进程日志被整体漏掉——match17 实测：浏览器 kill 时只有 823B 的 tab 日志在盘上，
+// 另外三个真正的业务进程日志（1.8MB / 2.5MB / 1.2MB）分别在 10s / 32s / 33s 后才写出，
+// 自动 --import-after 只收进了那个 823B 文件，页面 JS 证据全部丢失，只能手动合并导入。
+// 两条硬约束：① 写日志的 trace 浏览器进程仍存活时不进入静默期判定（进程还在就还会有日志）；
+// ② 必须连续静默 quietMs 才返回，不是“一轮稳定”就返回。
+async function waitForTraceFlush(outDir, sinceMs, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs >= 0 ? options.timeoutMs : 45000;
+  const quietMs = Number.isFinite(options.quietMs) && options.quietMs >= 0 ? options.quietMs : 8000;
+  const firefoxExe = options.firefoxExe || '';
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  let previous = '';
+  let lastChangeAt = startedAt;
+  let lastProcCheckAt = 0;
+  let alive = null;
+  let files = [];
+  while (Date.now() < deadline) {
+    // 进程退出后某些 content 进程可能才创建/关闭自己的 NDJSON；每轮重新发现文件，
+    // 不把“第一次扫描时尚不存在的日志”漏掉。
+    files = listNdjsonFiles(outDir, sinceMs);
+    let signature = '';
+    let allStable = true;
+    for (const file of files) {
+      try {
+        const st = fs.statSync(file);
+        signature += `${file}:${st.size}:${st.mtimeMs};`;
+        if (st.size > 0) {
+          const fd = fs.openSync(file, 'r');
+          const buf = Buffer.alloc(1);
+          fs.readSync(fd, buf, 0, 1, st.size - 1);
+          fs.closeSync(fd);
+          // 只接受完整 NDJSON 行：日志尾部“某处出现过换行”不能证明最后一条已刷盘。
+          // 用户关闭浏览器时尤其容易留下半条 JSON；等到最后一个字节为 LF 再导入。
+          if (buf[0] !== 0x0a) allStable = false;
+        }
+      } catch { allStable = false; }
+    }
+    if (signature !== previous || !allStable) {
+      previous = signature;
+      lastChangeAt = Date.now();
+    }
+    // 进程存活探测较重（起 powershell），每 3s 一次即可；查询不可用（非 Windows）时跳过该判据。
+    if (firefoxExe && Date.now() - lastProcCheckAt >= 3000) {
+      lastProcCheckAt = Date.now();
+      const count = await kernelFirefoxAlive(firefoxExe);
+      if (count !== null) alive = count;
+    }
+    if (alive !== null && alive > 0) lastChangeAt = Date.now();
+    if (Date.now() - lastChangeAt >= quietMs) break;
+    await wait(500);
+  }
+  return {
+    waitedMs: Date.now() - startedAt,
+    timedOut: Date.now() >= deadline,
+    remainingFirefoxProcesses: alive,
+    files: listNdjsonFiles(outDir, sinceMs),
+  };
+}
+
+async function waitForKernelStopped(firefoxExe, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await kernelFirefoxAlive(firefoxExe);
+    if (last === null || last === 0) return last;
+    await wait(250);
+  }
+  return last;
+}
+
+// 结束 trace Firefox 进程（多进程树 + 内核迁移兜底）：
+// 1. 先按 spawn 主 PID 用 taskkill /T /F 杀进程树（旧版结构有效）；
+// 2. 新版（2.5+ / Firefox 155）主进程可能重 fork，CommandLine 不含 profile，
+//    因此再按 firefox 可执行文件路径精确匹配（ExecutablePath == kernel firefox）
+//    杀掉全部实例（主进程 + content/GPU 子进程），避免残留锁 profile；
+//    profile 匹配作为第三层兜底（旧版结构 CommandLine 含 profile）。
+function killProcessTree(pid, profileDir, firefoxExe) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      resolve(ok);
+    };
+
+    // 带超时包装的 spawn 调用，防止 taskkill/PowerShell 卡死导致进程清理 hang 住
+    function spawnWithTimeout(cmd, args, timeoutMs = 15000) {
+      return new Promise((res) => {
+        const child = spawn(cmd, args, { windowsHide: true });
+        const timer = setTimeout(() => {
+          try { child.kill(); } catch { /* ignore */ }
+          res(false);
+        }, timeoutMs);
+        child.once('error', () => { clearTimeout(timer); res(false); });
+        child.once('exit', (code) => { clearTimeout(timer); res(code === 0); });
+      });
+    }
+
+    const attempts = [];
+    if (pid) {
+      attempts.push(spawnWithTimeout(
+        process.platform === 'win32' ? 'taskkill' : 'kill',
+        process.platform === 'win32' ? ['/PID', String(pid), '/T', '/F'] : ['-TERM', `-${pid}`]
+      ));
+    }
+
+    if (process.platform === 'win32') {
+      const esc = (s) => String(s).replace(/'/g, "''");
+      const matchers = [];
+      // 第 2 层：按 kernel firefox 可执行文件路径精确匹配（主进程重 fork 后 CommandLine 可能无参数）
+      if (firefoxExe) {
+        matchers.push(`($_.ExecutablePath -eq '${esc(firefoxExe.replace(/\//g, '\\'))}')`);
+      }
+      // 第 3 层：按 profile 路径匹配 CommandLine（旧版结构）
+      if (profileDir) {
+        const back = esc(profileDir.replace(/\//g, '\\'));
+        const fwd = esc(profileDir.replace(/\\/g, '/'));
+        matchers.push(`($_.CommandLine -like '*${back}*')`);
+        matchers.push(`($_.CommandLine -like '*${fwd}*')`);
+      }
+      if (matchers.length) {
+        attempts.push(spawnWithTimeout('powershell', [
+          '-NoProfile', '-NonInteractive', '-Command',
+          `Get-CimInstance Win32_Process -Filter "Name='firefox.exe'" | Where-Object { ${matchers.join(' -or ')} } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+        ], 15000));
+      }
+    }
+
+    if (!attempts.length) { finish(false); return; }
+    Promise.all(attempts).then((results) => finish(results.some(Boolean)));
+  });
+}
+
+function importLog(caseDir, files, markdown, targetSignals, writeSummary, signalPolicy = 'strict') {
+  const script = path.join(__dirname, 'import_ruyitrace_log.js');
+  const list = Array.isArray(files) ? files : [files];
+  const args = [script, '--case-dir', caseDir, '--truncation-threshold', '3900', markdown ? '--markdown' : '--json'];
+  for (const f of list) args.push('--input', f);
+  if (writeSummary === false) args.push('--no-summary-write');
+  for (const s of targetSignals || []) args.push('--trace-signal', s);
+  args.push('--signal-policy', signalPolicy);
+  const ret = spawnSync(process.execPath, args, { encoding: 'utf8', windowsHide: true });
+  return { ok: ret.status === 0, status: ret.status, stdout: ret.stdout || '', stderr: ret.stderr || '' };
+}
+
+// 解析 cookies 输入：合并多次 --cookie，支持 "a=1; b=2" 分号分隔，以及单元素内含分号的字符串。
+// 与 ruyipage --cookie 语义一致：值是纯字符串集合（由 set/get 层透传给目标浏览器），
+// 这里解析为 [name, value] 列表以便写入 cookies.sqlite。
+function parseCookieArgs(rawList) {
+  const out = [];
+  for (const item of (rawList || [])) {
+    if (typeof item !== 'string' || !item.trim()) continue;
+    for (const seg of item.split(';')) {
+      const s = seg.trim();
+      if (!s) continue;
+      const eq = s.indexOf('=');
+      if (eq <= 0) continue;
+      out.push({ name: s.slice(0, eq).trim(), value: s.slice(eq + 1).trim() });
+    }
+  }
+  return out;
+}
+
+function defaultCookieHost(url) {
+  try {
+    const host = new URL(url).hostname; // 'match.x.com'；Firefox 要求 host 以点前缀 .x.com 才跨子域
+    return host.startsWith('.') ? host : `.${host}`;
+  } catch { return ''; }
+}
+
+// 启动前把预置 Cookie 写入 trace profile 的 cookies.sqlite（Firefox 116+ schema）。
+// 必须在 Firefox 未运行时调用（spawn 之前），否则文件被锁/WAL 冲突。
+// 返回写入条数；失败返回 0 并告警（不阻断后续启动，可继续手动登录兜底）。
+function writePresetCookies(args, profileDir, url) {
+  if (!(args.cookies && args.cookies.length)) return 0;
+  const pairs = parseCookieArgs(args.cookies);
+  if (!pairs.length) return 0;
+  const dbPath = path.join(profileDir, 'cookies.sqlite');
+  ensureDir(profileDir);
+  // 旧 cookie 文件残留（如上次 session 生成）会带已有记录与不同 schema；这里不删除，
+  // 仅做 INSERT OR REPLACE 按 (name, host, path, originAttributes) 唯一约束覆盖。
+  let db;
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    db = new DatabaseSync(dbPath);
+  } catch (e) {
+    console.error(`[警告] 预置 Cookie 写入跳过（无法打开 SQLite）：${e.message}`);
+    return 0;
+  }
+  try {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='moz_cookies'").get()) {
+      // 首次无 cookies.sqlite 时按 Firefox schema 建表（表版本与 Firefox 116+ 一致，
+      // zstd/JSON 等扩展列缺省；仅常规 host cookie，无 partitionKey 场景）
+      db.exec(`CREATE TABLE IF NOT EXISTS moz_cookies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        originAttributes TEXT NOT NULL DEFAULT '',
+        name TEXT, value TEXT, host TEXT, path TEXT,
+        expiry INTEGER, lastAccessed INTEGER, creationTime INTEGER,
+        isSecure INTEGER, isHttpOnly INTEGER, inBrowserElement INTEGER DEFAULT 0,
+        sameSite INTEGER DEFAULT 0, schemeMap INTEGER DEFAULT 0,
+        isPartitionedAttributeSet INTEGER DEFAULT 0, updateTime INTEGER,
+        CONSTRAINT moz_uniqueid UNIQUE (name, host, path, originAttributes))`);
+    }
+    db.prepare('CREATE INDEX IF NOT EXISTS moz_cookies_host_idx ON moz_cookies(host)');
+    const ins = db.prepare(`INSERT INTO moz_cookies
+      (originAttributes, name, value, host, path, expiry, lastAccessed, creationTime, isSecure, isHttpOnly, inBrowserElement, sameSite, schemeMap, isPartitionedAttributeSet, updateTime)
+      VALUES (@originAttributes, @name, @value, @host, @path, @expiry, @lastAccessed, @creationTime, @isSecure, @isHttpOnly, @inBrowserElement, @sameSite, @schemeMap, @isPartitionedAttributeSet, @updateTime)
+      ON CONFLICT(name, host, path, originAttributes) DO UPDATE SET value=@value, expiry=@expiry`);
+    const now = Date.now();
+    const host = args.cookieDomain || defaultCookieHost(url);
+    db.exec('BEGIN');
+    try {
+      for (const c of pairs) {
+        ins.run({
+          originAttributes: '',
+          name: c.name,
+          value: c.value,
+          host,
+          path: '/',
+          // Firefox expiry 用毫秒时间戳（PRTime/微秒的 ms 兼容），这里给未来一年
+          expiry: now + 365 * 24 * 3600 * 1000,
+          lastAccessed: now * 1000,
+          creationTime: now * 1000,
+          isSecure: 1, // 预置登录态 cookie 通常需 Secure；跨子域用 https
+          isHttpOnly: 0,
+          inBrowserElement: 0,
+          sameSite: 256, // LAX
+          schemeMap: 2,  // https
+          isPartitionedAttributeSet: 0,
+          updateTime: now * 1000,
+        });
+      }
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+    console.log(`已向 trace profile 预写 ${pairs.length} 条 Cookie（host=${host || '<缺省>'}）`);
+    return pairs.length;
+  } catch (e) {
+    console.error(`[警告] 预置 Cookie 写入失败（继续启动，可手动登录兜底）：${e.message}`);
+    try { db.close(); } catch {}
+    return 0;
+  } finally {
+    try { db.close(); } catch {}
+  }
+}
+
+async function capture(args, plan) {
+  ensureDir(plan.outDir);
+  ensureDir(plan.profileDir);
+  const prefCount = (args.userJs || (args.prefPairs || []).length) ? writeUserPrefs(plan.profileDir, args) : 0;
+  writePresetCookies(args, plan.profileDir, args.url);
+  const startedAt = Date.now();
+  // 闸门：启动前确保控制文件不存在 → 浏览器启动即处于暂停态（加载期噪声一条不写）
+  if (plan.gateFile) {
+    try { fs.unlinkSync(plan.gateFile); } catch { /* 文件不存在即已暂停态 */ }
+  }
+  const child = spawn(plan.firefoxExe, plan.firefoxArgs, {
+    env: { ...process.env, ...plan.env },
+    stdio: 'ignore',
+    windowsHide: false,
+  });
+  const result = {
+    launched: true,
+    pid: child.pid,
+    waitedSeconds: args.duration,
+    killAttempted: false,
+    killMethod: '',
+    killOk: false,
+    exitedEarly: false,
+    exit: null,
+    logs: [],
+    importResult: null,
+    endReason: 'duration',
+    startedAt: new Date(startedAt).toISOString(),
+    collectionDeadlineAt: new Date(startedAt + args.duration * 1000).toISOString(),
+    userPrefCount: prefCount,
+    gate: plan.gateFile
+      ? { file: plan.gateFile, afterMs: plan.gateAfterMs, durationMs: plan.gateDurationMs, opened: false, closedAt: null }
+      : null,
+  };
+  child.on('error', (err) => { result.launchError = err.message || String(err); });
+  try {
+    // 等待采集：duration 为总兜底；用户手动关闭浏览器（或浏览器崩溃）→
+    // kernel firefox 进程归零 → 立即提前结束，不必等满 duration。
+    // 进程检测只在 Windows 且"曾经见过内核进程"后生效（启动慢/从未出现进程时按 duration 兜底）。
+    const pollMs = 1500;
+    const deadline = Date.now() + args.duration * 1000;
+    let everSeen = false;
+    const signalState = { offsets: new Map(), carry: new Map(), observed: new Set() };
+    while (Date.now() < deadline) {
+      const elapsed = Date.now() - startedAt;
+      const currentLogs = mainTraceFiles(listNdjsonFiles(plan.outDir, startedAt));
+      if (args.endSignals.length && scanSignalsIncremental(currentLogs, args.endSignals, signalState)) {
+        result.endReason = 'end-signal-observed';
+        console.log('[capture] 已观察到全部 end-signal，开始收尾');
+        break;
+      }
+      // 闸门状态机：after 到点开闸（删除文件=关、创建文件=开），duration 到点关闸
+      if (result.gate && !result.gate.opened && elapsed >= plan.gateAfterMs) {
+        fs.writeFileSync(plan.gateFile, String(startedAt), 'utf8');
+        result.gate.opened = true;
+        result.gate.openedAtMs = elapsed;
+        console.log(`[capture] 闸门已开启（启动后 ${Math.round(elapsed / 1000)}s）：${plan.gateFile}`);
+      } else if (result.gate && result.gate.opened && !result.gate.closedAt
+        && plan.gateDurationMs > 0 && elapsed >= plan.gateAfterMs + plan.gateDurationMs) {
+        try { fs.unlinkSync(plan.gateFile); } catch { /* 已被外部删除则忽略 */ }
+        result.gate.closedAt = new Date().toISOString();
+        console.log(`[capture] 闸门已关闭（开窗 ${Math.round(plan.gateDurationMs / 1000)}s），后续不再落盘`);
+      }
+      // 体积熔断：STACK_FULL/大 opcode 窗口几秒就能写出 GB 级日志，靠事后发现已经晚了
+      if (plan.maxLogBytes > 0) {
+        const size = dirSizeBytes(plan.outDir);
+        result.logBytes = size;
+        if (size >= plan.maxLogBytes) {
+          result.endReason = 'log-size-cap';
+          result.logSizeCapped = `${formatBytes(size)} ≥ 阈值 ${formatBytes(plan.maxLogBytes)}`;
+          console.log(`[capture] 日志体积达 ${result.logSizeCapped}，立即结束采集并关闭浏览器`);
+          break;
+        }
+      }
+      const alive = await kernelFirefoxAlive(plan.firefoxExe);
+      if (alive !== null) {
+        if (alive > 0) {
+          everSeen = true;
+        } else if (everSeen) {
+          result.exitedEarly = true;
+          result.endReason = 'browser-closed-by-user-or-crash';
+          console.log(`[capture] 检测到浏览器已关闭，提前结束采集（已用时 ${Math.round((Date.now() - startedAt) / 1000)}s）`);
+          break;
+        }
+      }
+      await wait(pollMs);
+    }
+    if (Date.now() >= deadline && result.endReason === 'duration') result.endReason = 'duration-timeout';
+    if (!plan.maxLogBytes && !result.logBytes) result.logBytes = dirSizeBytes(plan.outDir);
+  } finally {
+    // 收尾一律删掉闸门控制文件：残留会让下一次共用同一控制文件的采集启动时直接开闸
+    if (plan.gateFile) {
+      try { fs.unlinkSync(plan.gateFile); } catch { /* 已删除则忽略 */ }
+    }
+    // 采集结束（成功或异常）一律主动关闭浏览器进程树，避免残留进程锁住 profile。
+    // 注意：spawn 的 launcher PID 可能在采集期间自己退出（Firefox 155 重 fork 主进程），
+    // 不能因 child 已退出就跳过 kill —— 真实浏览器主进程/子进程可能仍存活。
+    if (!result.launchError) {
+      result.killAttempted = true;
+      result.killMethod = process.platform === 'win32' ? 'taskkill-tree+exe/profile-match' : 'kill-group';
+      try {
+        result.killOk = await killProcessTree(child.pid, plan.profileDir, plan.firefoxExe);
+        if (!result.killOk) {
+          result.killError = '进程树/按 exe·profile 匹配结束失败，回退 child.kill()';
+          try {
+            child.kill();
+            result.killOk = await waitForExit(child, 3000).then((e) => e.exited);
+          } catch (err) {
+            result.killError = err.message || String(err);
+          }
+        }
+      } catch (err) {
+        result.killError = err.message || String(err);
+      }
+      result.exit = await waitForExit(child, 3000);
+      result.remainingFirefoxProcesses = await waitForKernelStopped(plan.firefoxExe, 5000);
+      if (result.remainingFirefoxProcesses > 0) {
+        result.killOk = false;
+        result.killError = `结束后仍有 ${result.remainingFirefoxProcesses} 个 trace Firefox 进程存活`;
+      }
+    }
+  }
+  const flush = await waitForTraceFlush(plan.outDir, startedAt, {
+    timeoutMs: args.flushTimeout,
+    quietMs: args.flushQuiet,
+    firefoxExe: plan.firefoxExe,
+  });
+  result.logs = flush.files;
+  result.flushWaitedMs = flush.waitedMs;
+  result.flushTimedOut = flush.timedOut;
+  // 刷盘等待结束时的存活数是更晚的观测值，用于报告；kill 判定维持 kill 阶段结论（不回溯改写）
+  if (flush.remainingFirefoxProcesses !== null) {
+    result.remainingFirefoxProcesses = flush.remainingFirefoxProcesses;
+  }
+  result.finishedAt = new Date().toISOString();
+  result.elapsedSeconds = Math.round((Date.now() - startedAt) / 100) / 10;
+  if (args.importAfter && result.logs.length) {
+    // 主 DOM trace = domtrace/ 下 process_type 非 parent 的内容进程文件，合并导入（RuyiTrace 多进程各写一个
+    // domtrace 文件：tab/content 进程才是业务 JS，parent 是浏览器父进程/内核活动）。按 mtime 取单个文件会漏掉
+    // 真正的业务 JS 调用、或误取 parent 内核空壳（resource://gre/modules 等，不含页面 JS，参与 target-signal
+    // 必然误报）。分类日志（cookie/storage/event/descriptor/eval/wasm）不含业务目标接口路径，逐文件硬门禁必然误报，
+    // 只导入做摘要（不带 --target-signal、不写 summary）。ruyitrace-summary.md 只反映主 DOM trace 合并结果。
+    const isDomtrace = (f) => /[\\/]domtrace[\\/]/.test(f);
+    let domFiles = result.logs.filter(isDomtrace);
+    const catFiles = result.logs.filter((f) => !isDomtrace(f));
+    // 抢救分支（match14 教训）：mtime 容差把真正的 content 进程日志过滤掉后，domFiles 为空，
+    // 原实现会静默只导入分类日志（event 1 行）而看不出问题。此处忽略 mtime，直接取输出目录下
+    // 全部 domtrace 文件重新参与选择，并记录抢救原因供摘要展示。
+    if (!domFiles.length) {
+      const rescued = walkNdjson(plan.outDir).filter(isDomtrace);
+      if (rescued.length) {
+        domFiles = rescued;
+        result.mainTraceRescued = `按采集起点（mtime 容差 10s）未发现 domtrace 主日志，已忽略时间过滤抢救 ${rescued.length} 个 domtrace 文件参与导入`;
+      }
+    } else {
+      // 抢救分支二（match17 教训）：静默期判定仍可能早于部分 content 进程刷盘，只剩小文件在盘上。
+      // 此处按体积补齐——未被 mtime 放行（或静默期后才写出）的 domtrace 文件里若存在明显更大的候选，
+      // 说明真正的业务日志被漏掉，忽略时间过滤一并合并导入，避免只导进 823B 空壳。
+      const sizeOf = (f) => { try { return fs.statSync(f).size; } catch { return 0; } };
+      const freshSet = new Set(domFiles.map((f) => path.resolve(f)));
+      const maxFresh = domFiles.reduce((m, f) => Math.max(m, sizeOf(f)), 0);
+      const staleBigger = walkNdjson(plan.outDir).filter(
+        (f) => isDomtrace(f) && !freshSet.has(path.resolve(f)) && sizeOf(f) > Math.max(32768, maxFresh * 2)
+      );
+      if (staleBigger.length) {
+        domFiles = domFiles.concat(staleBigger);
+        result.mainTraceRescued = `已导入 domtrace 最大仅 ${maxFresh} 字节，另发现 ${staleBigger.length} 个明显更大的 domtrace 文件（最大 ${Math.max(...staleBigger.map(sizeOf))} 字节），已忽略时间过滤一并合并导入`;
+      }
+    }
+    const mainFiles = domFiles.filter((f) => {
+      const pt = readProcessType(f);
+      return pt && pt !== 'parent';
+    });
+    // 识别不出非 parent 的 domtrace 文件（异常或全 parent）时退化为全部 domtrace 文件，
+    // 交由 import_ruyitrace_log 的质量判定（无页面 JS → 重度不足）兜底报错。
+    const effectiveMain = mainFiles.length ? mainFiles : domFiles;
+    result.importResults = [];
+    result.logLabels = [];
+    // 人工关闭通常意味着用户刚完成交互但尚未提前配置准确 writer 信号；
+    // 保留有效 NDJSON 并在摘要中报告覆盖不足，避免把“有日志但信号未命中”误报成导入失败。
+    // 后续 check_trace_gate 仍按 targetCoverage 严格阻断，因此 advisory 只改变分类，不放宽门禁。
+    const importSignalPolicy = result.endReason === 'browser-closed-by-user-or-crash'
+      ? 'advisory'
+      : args.signalPolicy;
+    result.importSignalPolicy = importSignalPolicy;
+    if (effectiveMain.length) {
+      result.importResults.push(importLog(plan.caseDir, effectiveMain, args.markdown, args.evidenceSignals, true, importSignalPolicy));
+      result.logLabels.push(`主 DOM trace（合并 ${effectiveMain.length} 个进程文件）`);
+    }
+    for (const file of catFiles) {
+      result.importResults.push(importLog(plan.caseDir, file, args.markdown, [], false));
+      result.logLabels.push(path.basename(file));
+    }
+    // 导入覆盖自查：主 trace 缺失、或输出目录里存在未导入且比已导入主 trace 更大的候选
+    //（说明真正的页面 JS 日志被漏掉），一律输出候选清单与手动导入命令，禁止静默降级为“只有分类日志”。
+    const candidates = describeTraceCandidates(plan.outDir, startedAt, effectiveMain.concat(catFiles));
+    const mainSet = new Set(effectiveMain.map((f) => path.resolve(f)));
+    const mainMaxLines = candidates
+      .filter((c) => mainSet.has(path.resolve(c.file)))
+      .reduce((m, c) => Math.max(m, c.lines), 0);
+    // 「更大候选」只在 domtrace 主日志里找：分类日志（storage/cookie/event/descriptor/eval/wasm）
+    // 行数再大也不是页面 JS trace（match20 实测 7241 行 storage 日志触发假告警，误导手动导入顺序）。
+    const missedBigger = candidates.filter((c) => !c.imported && c.lines > mainMaxLines && /[\\/]domtrace[\\/]/.test(c.file));
+    if (!effectiveMain.length || result.mainTraceRescued || missedBigger.length) {
+      result.traceCandidates = candidates;
+      result.manualImportCommands = candidates
+        .filter((c) => !c.imported && c.lines > 1)
+        .map((c) => `node scripts/import_ruyitrace_log.js --case-dir ${path.resolve(plan.caseDir)} --input ${c.file} --markdown`);
+      result.importCoverageWarning = !effectiveMain.length
+        ? '未导入任何主 DOM trace（domtrace/ 下无可用文件），当前摘要只反映分类日志，不能作为 trace 证据；请按下方候选清单手动导入或重新采集。'
+        : (missedBigger.length
+          ? `存在未导入的更大候选日志（最大 ${missedBigger[0].lines} 行 > 已导入主 trace 最大 ${mainMaxLines} 行），可能漏掉真正的页面 JS trace；请核对候选清单并按需手动导入。`
+          : result.mainTraceRescued);
+    }
+  }
+  return result;
+}
+
+function renderMarkdown(obj) {
+  const { args, trace, plan, result } = obj;
+  const lines = ['# RuyiTrace 自动捕获日志', ''];
+  lines.push(`- RuyiTrace 检测结果：${trace.installed ? '通过' : '不通过'}`);
+  if (trace.home) lines.push(`- RuyiTrace 目录：${trace.home}`);
+  if (trace.exe) lines.push(`- RuyiTrace 可执行文件：${trace.exeExists ? '存在' : '不存在'} - ${trace.exe}`);
+  if (trace.firefoxExe) lines.push(`- trace Firefox：${trace.firefoxExists ? '存在' : '不存在'} - ${trace.firefoxExe}`);
+  if (trace.marker) lines.push(`- trace 标志文件：${trace.markerExists ? '存在' : '不存在'} - ${trace.marker}`);
+  if (trace.reason) lines.push(`- 原因：${trace.reason}`);
+  lines.push('', '## 自动捕获计划');
+  lines.push(`- 目标页面：${args.url || '未提供'}`);
+  lines.push(`- 输出目录：${plan.outDir}`);
+  lines.push(`- Profile 目录：${plan.profileDir}`);
+  lines.push(`- 计划 trace 文件：${plan.traceFile}`);
+  lines.push(`- 采集窗口：${args.duration} 秒（窗口结束后仍会执行关闭进程、等待日志刷盘和可选导入，因此命令总耗时可能略长）`);
+  lines.push(`- 结束原因：${result.endReason || 'unknown'}`);
+  lines.push(`- 信号策略：${args.signalPolicy}`);
+  if (result.importSignalPolicy && result.importSignalPolicy !== args.signalPolicy) {
+    lines.push(`- 实际导入策略：${result.importSignalPolicy}（人工关闭/浏览器退出时保留有效 NDJSON，覆盖门禁仍由 check_trace_gate.js 执行）`);
+  }
+  if (args.evidenceSignals.length) lines.push(`- evidence-signal：${args.evidenceSignals.join('、')}（策略 ${args.signalPolicy}）`);
+  if (args.endSignals.length) lines.push(`- end-signal：${args.endSignals.join('、')}`);
+  if (plan.gateFile) {
+    const gate = result.gate || {};
+    lines.push(`- 运行时闸门：${plan.gateFile}（启动后 ${Math.round((plan.gateAfterMs || 0) / 1000)}s 开闸${plan.gateDurationMs ? `，开窗 ${Math.round(plan.gateDurationMs / 1000)}s 后自动关闸` : '，开到采集结束'}）`);
+    if (result.launched && (result.endReason !== 'duration' || gate.opened)) {
+      lines.push(`  - 闸门实际状态：${gate.opened ? `已于启动后 ${Math.round((gate.openedAtMs || 0) / 1000)}s 开闸` : '未开闸'}${gate.closedAt ? `，${gate.closedAt} 关闸` : ''}`);
+    }
+  }
+  if (typeof plan.maxLogBytes === 'number' && plan.maxLogBytes > 0) {
+    lines.push(`- 日志体积熔断：${formatBytes(plan.maxLogBytes)}${result.logSizeCapped ? `（已触发：${result.logSizeCapped}）` : ''}`);
+  }
+  if (plan.userPrefs && (plan.userPrefs.file || plan.userPrefs.overrides.length)) {
+    lines.push(`- profile user.js：${plan.userPrefs.file ? `基准 ${plan.userPrefs.file}` : '（无基准文件）'}${plan.userPrefs.overrides.length ? ` + 覆盖 ${plan.userPrefs.overrides.join('，')}` : ''}${typeof result.userPrefCount === 'number' ? `，共写入 ${result.userPrefCount} 条 pref` : ''}`);
+  }
+  lines.push(`- DOM trace 行数上限：${args.limit}`);
+  if (plan.presetCookies && plan.presetCookies.count) {
+    lines.push(`- 预置 Cookie：${plan.presetCookies.count} 条（domain=${plan.presetCookies.domain || '<缺省取url主机>'}）`);
+  }
+  lines.push(`- 启动参数：${[plan.firefoxExe].concat(plan.firefoxArgs).join(' ')}`);
+  lines.push(`- 环境变量：MOZ_DOM_TRACE=1，MOZ_DOM_TRACE_FILE=<case trace file>，MOZ_DOM_TRACE_LIMIT=${args.limit}${args.ptype ? `，MOZ_DOM_TRACE_PTYPE=${args.ptype}` : ''}，MOZ_DISABLE_LAUNCHER_PROCESS=1`);
+  const extraEnv = Object.entries(args.traceEnvPairs || {});
+  if (extraEnv.length) {
+    lines.push(`- 定向 trace 开关（--trace-env）：${extraEnv.map(([k, v]) => `${k}=${v}`).join('，')}`);
+    lines.push('  - jscall/eval/cookie 等派生模块日志按锚点派生到输出目录子文件夹（如 jscall/trace_jscall_process_<pid>.jsonl），导入时按分类日志生成摘要，检索用 search_trace.js。');
+  }
+  if (args.dryRun) {
+    lines.push('', '## Dry-run 结果');
+    lines.push('- 未启动浏览器，未创建日志文件。');
+    if (trace.installed) {
+      lines.push('- RuyiTrace 检测通过：自动 trace 可用；用户已提供日志时可改用手动 trace（--input 指定日志），不询问用户选择采集方式。');
+    } else {
+      lines.push('- RuyiTrace 检测未通过，不能进入自动 trace：按 GATE-1 自动安装（install_all.js --yes，执行前先宣布缺失组件、安装目标 <project-root>/tools/ 与预计规模）；自动安装失败后才可让用户安装 / 提供 RuyiTrace 路径，或改用手动 trace（用户 trace 后 --input 指定日志），或明确确认降级为仅 ruyiPage。');
+    }
+    return lines.join('\n') + '\n';
+  }
+  lines.push('', '## 捕获结果');
+  if (result.launchError) lines.push(`- 启动错误：${result.launchError}`);
+  if (typeof result.logBytes === 'number') lines.push(`- 日志总体积：${formatBytes(result.logBytes)}`);
+  lines.push(`- 是否已启动：${result.launched ? '是' : '否'}`);
+  if (result.exitedEarly) lines.push('- 浏览器在 duration 前已被关闭/退出，采集提前结束（NDJSON 日志保留，需结合结束原因判断是否为用户正常结束）');
+  if (result.pid) lines.push(`- 进程 PID：${result.pid}`);
+  if (typeof result.elapsedSeconds === 'number') lines.push(`- 命令实际耗时：${result.elapsedSeconds} 秒`);
+  if (typeof result.flushWaitedMs === 'number') {
+    lines.push(`- 日志刷盘等待：${(result.flushWaitedMs / 1000).toFixed(1)} 秒${result.flushTimedOut ? '（已到 --flush-timeout 上限，可能仍有日志未刷盘）' : ''}`);
+  }
+  lines.push(`- 是否尝试结束进程：${result.killAttempted ? '是' : '否'}`);
+  if (result.killAttempted) lines.push(`- 结束方式：${result.killMethod}，是否成功：${result.killOk ? '是' : '否'}${result.killError ? `（${result.killError}）` : ''}`);
+  if (result.killAttempted && !result.killOk) lines.push('- [警告] **浏览器未能自动关闭，请手动关闭残留的 trace Firefox（profile: ' + plan.profileDir + '）**');
+  lines.push(`- 发现 NDJSON 数量：${result.logs.length}`);
+  for (const file of result.logs) lines.push(`  - ${file}`);
+  if (!result.logs.length) {
+    lines.push('- 未发现 NDJSON：应检查 RuyiTrace trace Firefox 是否能写入日志、目标页面是否触发了环境访问、是否需要登录/验证码/权限交互；自动 trace 失败后可改用手动 trace（--input 指定用户采集的日志）。');
+  }
+  if (result.importResults && result.importResults.length) {
+    lines.push('', '## 导入结果');
+    result.importResults.forEach((imp, idx) => {
+      const label = result.logLabels && result.logLabels[idx] ? result.logLabels[idx] : (result.logs && result.logs[idx] ? path.basename(result.logs[idx]) : `#${idx + 1}`);
+      lines.push(`- ${label} 导入是否成功：${imp.ok ? '是' : '否'}`);
+      if (imp.stdout.trim()) lines.push('', '```text', imp.stdout.trim(), '```');
+      if (imp.stderr.trim()) lines.push('', '```text', imp.stderr.trim(), '```');
+    });
+  }
+  if (result.importCoverageWarning) {
+    lines.push('', '## [警告] 导入覆盖不足');
+    lines.push(`- ${result.importCoverageWarning}`);
+    if (result.mainTraceRescued) lines.push(`- 抢救记录：${result.mainTraceRescued}`);
+    if (result.traceCandidates && result.traceCandidates.length) {
+      lines.push('', '### 输出目录下全部 NDJSON 候选');
+      lines.push('', '| 行数 | process_type | 是否已导入 | 文件 | 未导入原因 |');
+      lines.push('| --- | --- | --- | --- | --- |');
+      for (const c of result.traceCandidates) {
+        const reason = c.imported ? '-' : (c.excludedReasons.length ? c.excludedReasons.join('；') : '未被选为主 trace');
+        lines.push(`| ${c.lines} | ${c.processType} | ${c.imported ? '是' : '否'} | ${c.file} | ${reason} |`);
+      }
+    }
+    if (result.manualImportCommands && result.manualImportCommands.length) {
+      lines.push('', '### 手动导入命令（PowerShell，按需逐条执行）', '', '```powershell');
+      for (const cmd of result.manualImportCommands) lines.push(cmd);
+      lines.push('```');
+    }
+    lines.push('', '> 行数最大的 domtrace 文件通常才是页面内容进程（业务 JS）日志；若它未被导入，必须手动导入后再判定 trace 质量，不得直接进入分析。');
+  }
+  return lines.join('\n') + '\n';
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+  if (args.help) {
+    console.log(usage());
+    return;
+  }
+  if (args.selfTest) {
+    const result = await runSelfTest();
+    console.log(`capture_ruyitrace_log.js 自测通过：${result.tests} 项断言`);
+    return;
+  }
+  // 手动 trace 模式：用户已用 RuyiTrace 手动采集完成，直接导入指定 NDJSON
+  if (args.input) {
+    const inputPath = path.resolve(args.input);
+    if (!exists(inputPath)) throw new Error(`日志文件不存在：${inputPath}`);
+    const ret = importLog(args.caseDir || '.', inputPath, args.markdown, args.evidenceSignals, true, args.signalPolicy);
+    if (args.markdown) {
+      const lines = ['# RuyiTrace 手动日志导入', ''];
+      lines.push(`- 手动 trace 日志：${inputPath}`);
+      lines.push(`- case 目录：${path.resolve(args.caseDir || '.')}`);
+      lines.push(`- 导入是否成功：${ret.ok ? '是' : '否'}`);
+      lines.push('', '> 以下为 import_ruyitrace_log.js 生成的摘要：', '');
+      if (ret.stdout.trim()) lines.push('```text', ret.stdout.trim(), '```');
+      if (ret.stderr.trim()) lines.push('', '```text', ret.stderr.trim(), '```');
+      process.stdout.write(lines.join('\n') + '\n');
+    } else {
+      process.stdout.write(JSON.stringify({
+        ok: ret.ok,
+        mode: 'manual',
+        input: inputPath,
+        caseDir: path.resolve(args.caseDir || '.'),
+        importStatus: ret.status,
+        importStdout: ret.stdout,
+        importStderr: ret.stderr,
+      }, null, 2) + '\n');
+    }
+    process.exitCode = ret.ok ? 0 : 1;
+    return;
+  }
+  if (!args.url) throw new Error('缺少 --url（自动 trace）或 --input（手动 trace 指定日志）之一。');
+  const trace = detectRuyiTrace(args);
+  const plan = buildPlan(args, trace);
+  if (!trace.installed) {
+    const obj = { args, trace, plan, result: { launched: false, logs: [] } };
+    if (args.json) process.stdout.write(JSON.stringify(obj, null, 2) + '\n');
+    if (args.markdown) process.stdout.write(renderMarkdown(obj));
+    process.exitCode = 2;
+    return;
+  }
+  if (args.dryRun) {
+    const obj = { args, trace, plan, result: { launched: false, logs: [] } };
+    if (args.json) process.stdout.write(JSON.stringify(obj, null, 2) + '\n');
+    if (args.markdown) process.stdout.write(renderMarkdown(obj));
+    return;
+  }
+  const result = await capture(args, plan);
+  const obj = { args, trace, plan, result };
+  if (result.killAttempted && !result.killOk) {
+    console.error(`[警告] 浏览器未能自动关闭，请手动关闭残留的 trace Firefox（profile: ${plan.profileDir}）`);
+  }
+  if (args.json) process.stdout.write(JSON.stringify(obj, null, 2) + '\n');
+  if (args.markdown) process.stdout.write(renderMarkdown(obj));
+  if (result.importCoverageWarning) {
+    console.error(`[警告] 导入覆盖不足：${result.importCoverageWarning}`);
+    for (const cmd of result.manualImportCommands || []) console.error(`[手动导入] ${cmd}`);
+  }
+  if (!result.logs.length) process.exitCode = 3;
+  // 目标信号硬门禁只针对主 DOM trace 日志（importResults[0]）：分类日志无业务接口路径，
+  // 逐文件判定必然误报；主日志命中即覆盖、未命中才退出 4。
+  if (result.importResults && result.importResults.length && !result.importResults[0].ok) process.exitCode = 4;
+  // 主 DOM trace 完全未导入时，importResults[0] 是分类日志（不带信号判定，恒 ok），
+  // 不能让它把“没有页面 JS 证据”伪装成成功；直接按覆盖不足退出 4。
+  if (args.importAfter && result.logs.length && !(result.logLabels || []).some((l) => l.startsWith('主 DOM trace'))) {
+    process.exitCode = 4;
+  }
+}
+
+main().catch((err) => {
+  console.error(err.message || String(err));
+  console.error('完整参数说明：node scripts/capture_ruyitrace_log.js --help');
+  process.exit(1);
+});
