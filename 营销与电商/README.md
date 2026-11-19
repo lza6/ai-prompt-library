@@ -1,59 +1,61 @@
 # 营销与电商
 
-> 营销与电商运营技能
+> 营销、增长与电商运营
 
-## 营销53技（53）
+本分类共 53 个技能。
 
-- [ab-testing](营销53技/ab-testing/SKILL.md) — ab-testing（MIT）
-- [ad-creative](营销53技/ad-creative/SKILL.md) — ad-creative（MIT）
-- [ads](营销53技/ads/SKILL.md) — ads（MIT）
-- [ai-seo](营销53技/ai-seo/SKILL.md) — ai-seo（MIT）
-- [analytics](营销53技/analytics/SKILL.md) — analytics（MIT）
-- [aso](营销53技/aso/SKILL.md) — aso（MIT）
-- [attribution](营销53技/attribution/SKILL.md) — attribution（MIT）
-- [churn-prevention](营销53技/churn-prevention/SKILL.md) — churn-prevention（MIT）
-- [co-marketing](营销53技/co-marketing/SKILL.md) — co-marketing（MIT）
-- [cold-email](营销53技/cold-email/SKILL.md) — cold-email（MIT）
-- [community-marketing](营销53技/community-marketing/SKILL.md) — community-marketing（MIT）
-- [competitor-profiling](营销53技/competitor-profiling/SKILL.md) — competitor-profiling（MIT）
-- [competitors](营销53技/competitors/SKILL.md) — competitors（MIT）
-- [content-strategy](营销53技/content-strategy/SKILL.md) — content-strategy（MIT）
-- [conversion-tracking](营销53技/conversion-tracking/SKILL.md) — conversion-tracking（MIT）
-- [copy-editing](营销53技/copy-editing/SKILL.md) — copy-editing（MIT）
-- [copywriting](营销53技/copywriting/SKILL.md) — copywriting（MIT）
-- [cro](营销53技/cro/SKILL.md) — cro（MIT）
-- [customer-research](营销53技/customer-research/SKILL.md) — customer-research（MIT）
-- [directory-submissions](营销53技/directory-submissions/SKILL.md) — directory-submissions（MIT）
-- [emails](营销53技/emails/SKILL.md) — emails（MIT）
-- [events](营销53技/events/SKILL.md) — events（MIT）
-- [free-tools](营销53技/free-tools/SKILL.md) — free-tools（MIT）
-- [image](营销53技/image/SKILL.md) — image（MIT）
-- [influencer-marketing](营销53技/influencer-marketing/SKILL.md) — influencer-marketing（MIT）
-- [launch](营销53技/launch/SKILL.md) — launch（MIT）
-- [lead-magnets](营销53技/lead-magnets/SKILL.md) — lead-magnets（MIT）
-- [link-building](营销53技/link-building/SKILL.md) — link-building（MIT）
-- [marketing-council](营销53技/marketing-council/SKILL.md) — marketing-council（MIT）
-- [marketing-ideas](营销53技/marketing-ideas/SKILL.md) — marketing-ideas（MIT）
-- [marketing-loops](营销53技/marketing-loops/SKILL.md) — marketing-loops（MIT）
-- [marketing-plan](营销53技/marketing-plan/SKILL.md) — marketing-plan（MIT）
-- [marketing-psychology](营销53技/marketing-psychology/SKILL.md) — marketing-psychology（MIT）
-- [offers](营销53技/offers/SKILL.md) — offers（MIT）
-- [onboarding](营销53技/onboarding/SKILL.md) — onboarding（MIT）
-- [paywalls](营销53技/paywalls/SKILL.md) — paywalls（MIT）
-- [popups](营销53技/popups/SKILL.md) — popups（MIT）
-- [pricing](营销53技/pricing/SKILL.md) — pricing（MIT）
-- [product-marketing](营销53技/product-marketing/SKILL.md) — product-marketing（MIT）
-- [programmatic-seo](营销53技/programmatic-seo/SKILL.md) — programmatic-seo（MIT）
-- [prospecting](营销53技/prospecting/SKILL.md) — prospecting（MIT）
-- [public-relations](营销53技/public-relations/SKILL.md) — public-relations（MIT）
-- [referrals](营销53技/referrals/SKILL.md) — referrals（MIT）
-- [reverse-engineer-marketing](营销53技/reverse-engineer-marketing/SKILL.md) — reverse-engineer-marketing（MIT）
-- [revops](营销53技/revops/SKILL.md) — revops（MIT）
-- [sales-enablement](营销53技/sales-enablement/SKILL.md) — sales-enablement（MIT）
-- [schema](营销53技/schema/SKILL.md) — schema（MIT）
-- [seo-audit](营销53技/seo-audit/SKILL.md) — seo-audit（MIT）
-- [signup](营销53技/signup/SKILL.md) — signup（MIT）
-- [site-architecture](营销53技/site-architecture/SKILL.md) — site-architecture（MIT）
-- [sms](营销53技/sms/SKILL.md) — sms（MIT）
-- [social](营销53技/social/SKILL.md) — social（MIT）
-- [video](营销53技/video/SKILL.md) — video（MIT）
+## 技能清单（53）
+
+- [A-B测试](A-B测试/A-B测试.md)
+- [AI搜索优化](AI搜索优化/AI搜索优化.md)
+- [SEO审计](SEO审计/SEO审计.md)
+- [产品发布](产品发布/产品发布.md)
+- [产品营销](产品营销/产品营销.md)
+- [付费墙](付费墙/付费墙.md)
+- [优惠设计](优惠设计/优惠设计.md)
+- [免费工具策略](免费工具策略/免费工具策略.md)
+- [公关](公关/公关.md)
+- [内容策略](内容策略/内容策略.md)
+- [冷邮件](冷邮件/冷邮件.md)
+- [图片素材](图片素材/图片素材.md)
+- [增长循环](增长循环/增长循环.md)
+- [外链建设](外链建设/外链建设.md)
+- [定价策略](定价策略/定价策略.md)
+- [客户开发](客户开发/客户开发.md)
+- [广告创意](广告创意/广告创意.md)
+- [广告投放](广告投放/广告投放.md)
+- [应用商店优化](应用商店优化/应用商店优化.md)
+- [弹窗策略](弹窗策略/弹窗策略.md)
+- [归因分析](归因分析/归因分析.md)
+- [收入运营](收入运营/收入运营.md)
+- [数据分析](数据分析/数据分析.md)
+- [文案写作](文案写作/文案写作.md)
+- [文案润色](文案润色/文案润色.md)
+- [新手引导](新手引导/新手引导.md)
+- [注册优化](注册优化/注册优化.md)
+- [活动营销](活动营销/活动营销.md)
+- [流失预防](流失预防/流失预防.md)
+- [用户调研](用户调研/用户调研.md)
+- [目录提交](目录提交/目录提交.md)
+- [短信营销](短信营销/短信营销.md)
+- [社交媒体](社交媒体/社交媒体.md)
+- [社区营销](社区营销/社区营销.md)
+- [程序化SEO](程序化SEO/程序化SEO.md)
+- [站点架构](站点架构/站点架构.md)
+- [竞品分析](竞品分析/竞品分析.md)
+- [竞品画像](竞品画像/竞品画像.md)
+- [结构化数据](结构化数据/结构化数据.md)
+- [网红营销](网红营销/网红营销.md)
+- [联合营销](联合营销/联合营销.md)
+- [获客诱饵](获客诱饵/获客诱饵.md)
+- [营销心理学](营销心理学/营销心理学.md)
+- [营销点子](营销点子/营销点子.md)
+- [营销计划](营销计划/营销计划.md)
+- [营销议会](营销议会/营销议会.md)
+- [视频营销](视频营销/视频营销.md)
+- [转介绍](转介绍/转介绍.md)
+- [转化率优化](转化率优化/转化率优化.md)
+- [转化追踪](转化追踪/转化追踪.md)
+- [逆向营销](逆向营销/逆向营销.md)
+- [邮件营销](邮件营销/邮件营销.md)
+- [销售赋能](销售赋能/销售赋能.md)
