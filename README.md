@@ -7,20 +7,15 @@
 ```
 提示词库/
 ├── 全栈语言系列/    # 各语言与专项技术提示词
-├── UI设计/          # 前端界面、视觉与体验设计（含设计风格库）
-├── 渗透测试/        # 安全测试与自动化渗透（含技能包/验证码对抗/威胁建模）
+├── UI设计/          # 前端界面、视觉与体验设计
+├── 渗透测试/        # 安全测试与自动化渗透
 ├── 文档生成/        # PRD 与技术文档
 ├── 工作流与执行/    # 任务执行、断点续作、元提示词
 ├── SaaS交付与质量/  # SaaS 全栈交付与项目质量
 ├── 代码审查/        # 代码审查与安全审计
 ├── 架构与专项/      # 后端架构、数据库、容器
-├── Agent技能库/     # 可整包复用的 Agent 技能（SKILL.md 体系）
-├── 元提示词/        # 系统提示词库与提示词模式研究
-├── 文案创作/        # 去 AI 味、人味写作技能
-├── 营销与电商/      # 营销技能与电商视觉文案
-├── 产品经理/        # 产品方法论技能
-├── 视频创作/        # 视频生成与发布预检技能
-└── 逆向方法论/      # APK/JS 逆向与网关对接通用方法论
+├── 逆向方法论/      # APK 逆向与网关对接通用方法论
+└── 技能全集/        # 1343 个第三方开源 Agent 技能打散重编（三级中文分类）
 ```
 
 ## 目录索引
@@ -154,124 +149,83 @@
 
 #### 技能包（`逆向方法论/` 下子目录）
 
-| 目录 | 说明 | 许可 |
+原始整包已打散重编进 `技能全集/`，此表保留来源对照。
+
+### 技能全集（`技能全集/`）
+
+> 1343 个第三方开源 Agent 技能（SKILL.md 体系）的打散重编版：每个技能一个目录、一份 `SKILL.md` 原文，按「一级领域 → 二级子类 → 技能」三级中文分类。完整索引见 [技能全集/README.md](技能全集/README.md)。
+
+| 一级分类 | 数量 | 内容 |
 |------|------|------|
-| [js-reverse网页逆向技能](逆向方法论/js-reverse网页逆向技能/) | 网页端 JS 加密参数逆向与纯协议还原全流程（JSVMP/WASM/混淆/补环境） | MIT |
-| [rev-skills逆向122技](逆向方法论/rev-skills逆向122技/) | 122 个逆向技能：恶意软件/固件/协议/移动/脱壳/反混淆/CTF | Apache-2.0 |
-
-### Agent技能库（`Agent技能库/`）
-
-> 收录可整包复用的 Agent 技能库（SKILL.md 体系），保留原包结构与许可文件。来源与许可见各包内 LICENSE。
-
-| 目录 | 说明 | 许可 |
-|------|------|------|
-| [superpowers工程方法论](Agent技能库/superpowers工程方法论/) | 完整软件开发方法论技能集：TDD/系统化调试/计划编写/并行派发/代码审查收发/收尾 | MIT |
-| [mattpocock工程技能](Agent技能库/mattpocock工程技能/) | Matt Pocock 工程技能 39 个：诊断循环/领域建模/实现规范/架构改进/PR | MIT |
-| [tstack工作流技能](Agent技能库/tstack工作流技能/) | T3 工作流技能：council 多模型评审、sol-loop 审查循环、PR 全流程 | MIT |
-| [compound-engineering复合工程](Agent技能库/compound-engineering复合工程/) | EveryInc 复合工程插件 36 技能：头脑风暴/计划/调试/评审/打磨/交接 | MIT |
-| [产品工程技能包](Agent技能库/产品工程技能包/) | 产品工程 44 技能：AI 交付/发布门禁/测试推导/静态安全审计/SaaS 技术栈/增长 | MIT |
-| [ljg思维技能包](Agent技能库/ljg思维技能包/) | 李继刚思维模型 26 个：追本之箭/类比/约束/机制/论文解读/表达 | MIT |
-| [baoyu效率技能包](Agent技能库/baoyu效率技能包/) | 宝玉效率技能 22 个：图表/信息图/翻译/转 Markdown/公众号与社交媒体发布 | MIT |
-| [argue多智能体辩论](Agent技能库/argue多智能体辩论/) | 结构化多 Agent 辩论引擎：独立分析 → 交叉质询 → 投票收敛 | MIT |
-| [awesome-codex-subagents子代理](Agent技能库/awesome-codex-subagents子代理/) | 136+ 个 Codex 子代理定义（10 大类：核心开发/语言/基础设施/质量安全/数据AI/商业产品等） | MIT |
-| [last30days舆情检索](Agent技能库/last30days舆情检索/) | 检索近 30 天 Reddit/X/YouTube/HN/GitHub 等平台真实讨论 | MIT |
-| [ffmpeg多媒体处理](Agent技能库/ffmpeg多媒体处理/) | 本地 FFmpeg 多媒体处理技能（无云、无密钥） | MIT |
-
-### 元提示词（`元提示词/`）
-
-> 系统提示词原文库与提示词工程模式研究，适合研究优秀产品的提示词设计。
-
-| 目录 | 说明 | 许可 |
-|------|------|------|
-| [claude-code-prompts模式库](元提示词/claude-code-prompts模式库/) | 独立撰写的 Claude Code 风格提示词模板：系统提示词架构/行为规则/工具指令/子代理/记忆/验证 | MIT |
-| [awesome-system-prompts](元提示词/awesome-system-prompts/) | 知名 AI 产品系统提示词合集（Cursor/Manus/Devin/Lovable/Claude Code 等） | Apache-2.0 |
-| [AI工具系统提示词中文库](元提示词/AI工具系统提示词中文库/) | 主流 AI 工具系统提示词中文翻译库（68 家产品） | MIT |
-| [Fabric模式库256](元提示词/Fabric模式库256/) | Fabric 256 个提示词模式（分析/提取/总结/创作/安全等） | MIT |
-| [opus5精确工程伙伴提示词](元提示词/opus5精确工程伙伴提示词/) | 单文件系统提示词：把啰嗦模型调成精确资深工程伙伴 | MIT |
-| [HERO反过度防御](元提示词/HERO反过度防御/) | 防"堡垒式过度建设"的规则集：哈希/边界情况/评分表/过度建设四大反模式 | MIT |
-
-### 文案创作（`文案创作/`）
-
-| 目录 | 说明 | 许可 |
-|------|------|------|
-| [avoid-ai-writing去AI味](文案创作/avoid-ai-writing去AI味/) | 审计并改写内容，去除 AI 写作痕迹 | MIT |
-| [humanize人味写作](文案创作/humanize人味写作/) | 基于 50+ 同行评审研究的"人味"改写技能（含 AI 检测对照） | MIT |
-| [sepia去AI味写作](文案创作/sepia去AI味写作/) | 从话语层去除 AI 味的写作技能族（写/改/评/重构/复刻） | MIT |
-
-### 营销与电商（`营销与电商/`）
-
-| 目录 | 说明 | 许可 |
-|------|------|------|
-| [marketingskills营销53技](营销与电商/marketingskills营销53技/) | 营销技能 53 个：广告/SEO/ASO/漏斗/留存/冷邮件/联投/分析 | MIT |
-| [电商视觉文案策划](营销与电商/电商视觉文案策划/) | 电商主图与详情页视觉策划 SOP：Storyboard 确认门 + 分品类合规边界 | MIT |
-
-### 产品经理（`产品经理/`）
-
-| 目录 | 说明 | 许可 |
-|------|------|------|
-| [nuwa女娲造人技能](产品经理/nuwa女娲造人技能/) | 输入人名/主题自动调研 → 提炼思维框架 → 生成可运行的人物视角 Skill | MIT |
-
-### 视频创作（`视频创作/`）
-
-| 目录 | 说明 | 许可 |
-|------|------|------|
-| [seedance-2.0视频技能](视频创作/seedance-2.0视频技能/) | Seedance 2.0 视频生成全渠道操作循环：提示词/首尾帧/对口型/IP 安全改写 | MIT |
-| [guoshen视频过审预检](视频创作/guoshen视频过审预检/) | 小红书/抖音/B站/视频号发布前风险预检：语音/字幕/画面联合检查 | MIT |
-
-### UI设计 · 设计风格库（`UI设计/设计风格库/`）
-
-| 目录 | 说明 | 许可 |
-|------|------|------|
-| [awesome-design-68风格](UI设计/设计风格库/awesome-design-68风格/) | 68 种设计风格 Skill（brutalism/claymorphism/bento/editorial 等即用型设计系统指南） | MIT |
-| [emilkowalski动效技能](UI设计/设计风格库/emilkowalski动效技能/) | Emil Kowalski 动效技能 19 个：动画构建/编排/性能/评审 | MIT |
-| [unslop去AI味设计](UI设计/设计风格库/unslop去AI味设计/) | 把"AI 味 UI"改成有产品个性的设计：间距/颜色/图标/文案/排版逐层修 | CC-BY-4.0 |
+| [Agent工程](技能全集/Agent工程/) | 184 | Superpowers 方法论、MattPocock 工程实践、T3 工作流、复合工程 CE、产品工程、ljg 思维模型、多 Agent 辩论等 |
+| [渗透测试](技能全集/渗透测试/) | 657 | Anthropic 安全技能（Web/API/云/域/恶意软件/取证/工控等 18 子类）+ Obsius 中文攻防 + 验证码对抗 + 威胁建模 |
+| [逆向工程](技能全集/逆向工程/) | 123 | 网页 JS 逆向 + 通用逆向 122 技（恶意软件/固件/协议/移动/脱壳/CTF） |
+| [UI设计](技能全集/UI设计/) | 87 | 设计风格 68 式 + Emil 动效 19 技 + 去 AI 味设计 |
+| [营销与电商](技能全集/营销与电商/) | 53 | 营销 53 技（广告/SEO/漏斗/留存/冷邮件等） |
+| [视频创作](技能全集/视频创作/) | 31 | Seedance 2.0 视频生成 + FFmpeg 音视频 + 发布过审预检 |
+| [文案创作](技能全集/文案创作/) | 16 | 去 AI 味写作三系（avoid-ai-writing / humanize / sepia） |
+| [威胁情报与检测](技能全集/威胁情报与检测/) | 75 | 威胁情报运营、安全监测与日志、检测工程、内部威胁 |
+| [Web与API渗透](技能全集/Web与API渗透/) | 79 | Web/API 渗透便捷入口（与渗透测试分类同源） |
+| [取证与应急](技能全集/取证与应急/) | 43 | 数字取证 + 应急响应 |
+| [综合与流程](技能全集/综合与流程/) | 74 | 安全工程与流程、红队作战管理 |
+| [身份与域渗透](技能全集/身份与域渗透/) | 41 | 域攻击与检测、密钥与证书管理 |
+| [网络安全防护](技能全集/网络安全防护/) | 14 | 零信任与边界防护 |
+| [恶意软件分析](技能全集/恶意软件分析/) | 71 | 恶意软件分析 + C2 与攻击基础设施 |
+| [容器与基础设施](技能全集/容器与基础设施/) | 50 | 容器/K8s 安全 + 软件供应链 |
+| [漏洞利用](技能全集/漏洞利用/) | 40 | 漏洞管理、扫描与利用 |
+| [社工与钓鱼](技能全集/社工与钓鱼/) | 31 | 钓鱼、邮件安全、语音与深伪 |
+| [合规与治理](技能全集/合规与治理/) | 28 | 合规框架审计（CIS/NIST/GDPR/PCI 等） |
+| [移动安全](技能全集/移动安全/) | 11 | 安卓/iOS 渗透与取证 |
+| [云安全](技能全集/云安全/) | 81 | AWS/Azure/GCP 安全技能 |
+| [网络与侦察](技能全集/网络与侦察/) | 74 | 侦察、OSINT、流量分析 |
+| [后渗透与提权](技能全集/后渗透与提权/) | 37 | 提权、横向移动、持久化 |
+| [IoT与工控](技能全集/IoT与工控/) | 14 | 工控协议与 IoT 安全 |
+| [AI安全](技能全集/AI安全/) | 14 | LLM/Agent 安全 |
+| [产品经理](技能全集/产品经理/) | 16 | 女娲造人 + 15 个人物视角示例 |
+| [元提示词](技能全集/元提示词/) | 3 | ClaudeCode 提示词模式 |
+| [其他一级](技能全集/) | — | 完整清单见技能全集 README |
 
 ## 使用说明
 
 - 文件名即主题，`.txt` / `.md` 均为纯文本提示词，可直接复制到任意 LLM 对话或 Agent 系统中使用。
 - 同名多版本（如 1.0 / 2.0 / 3.0）为迭代关系，优先使用最新版本。
 - 部分提示词为英文或法文原文，使用时保持原文即可。
-- `Agent技能库/`、`元提示词/` 及各分类下的技能包子目录为第三方开源技能包整包收录，保留原目录结构与 LICENSE；使用前请遵循各包许可与原仓库声明。
+- `技能全集/` 为第三方开源技能打散重编版，SKILL.md 原文未改动；每个技能的来源与许可见技能全集 README 与下方 SOURCES 表。
 
 ## 来源与许可（SOURCES）
 
-本仓库在自有原创提示词之外，整包收录了以下第三方开源项目（均保留其原 LICENSE 文件）：
+`技能全集/` 收录了以下第三方开源项目的内容（SKILL.md 原文保留，上游 许可均允许再分发）：
 
-| 本仓库目录 | 上游项目 | 许可 |
-|------|----------|------|
-| Agent技能库/superpowers工程方法论 | obra/superpowers | MIT |
-| Agent技能库/mattpocock工程技能 | mattpocock/skills | MIT |
-| Agent技能库/tstack工作流技能 | t3dotgg/tstack | MIT |
-| Agent技能库/compound-engineering复合工程 | EveryInc/compound-engineering-plugin | MIT |
-| Agent技能库/产品工程技能包 | phuryn/product-engineering | MIT |
-| Agent技能库/ljg思维技能包 | lijigang/ljg-skills | MIT |
-| Agent技能库/baoyu效率技能包 | baoyu-skills | MIT |
-| Agent技能库/argue多智能体辩论 | onevcat/argue | MIT |
-| Agent技能库/awesome-codex-subagents子代理 | VoltAgent/awesome-codex-subagents | MIT |
-| Agent技能库/last30days舆情检索 | mvanhorn/last30days-skill | MIT |
-| Agent技能库/ffmpeg多媒体处理 | ffmpeg-skill | MIT |
-| 元提示词/claude-code-prompts模式库 | claude-code-prompts | MIT |
-| 元提示词/awesome-system-prompts | awesome-system-prompts | Apache-2.0 |
-| 元提示词/AI工具系统提示词中文库 | system-prompts-and-models-of-ai-tools 中文翻译项目 | MIT |
-| 元提示词/Fabric模式库256 | Fabric | MIT |
-| 元提示词/opus5精确工程伙伴提示词 | fixing-smartass-opus-5 | MIT |
-| 元提示词/HERO反过度防御 | HERO-Anti-OverDefense | MIT |
-| 渗透测试/Anthropic安全技能库818 | Anthropic-Cybersecurity-Skills | Apache-2.0 |
-| 渗透测试/Obsius中文攻防知识库 | ILOVCTRY/Obsius-AI | Apache-2.0 |
-| 渗透测试/cloudflare安全审计技能 | cloudflare/security-audit-skill | MIT |
-| 渗透测试/验证码对抗/腾讯TCaptcha滑块求解 | Jasper-Lian/tcaptcha-solver | MIT |
-| 渗透测试/验证码对抗/阿里云滑块求解 | black-mouse-sha/aliyun-slider-solve | MIT |
-| 渗透测试/威胁建模/grim-prompter威胁建模 | jmanico/grim-prompter | MIT |
-| 逆向方法论/js-reverse网页逆向技能 | js-reverse-skill | MIT |
-| 逆向方法论/rev-skills逆向122技 | dslsdzc/rev-skills | Apache-2.0 |
-| UI设计/设计风格库/awesome-design-68风格 | awesome-design-skills | MIT |
-| UI设计/设计风格库/emilkowalski动效技能 | emilkowalski/skills | MIT |
-| UI设计/设计风格库/unslop去AI味设计 | heydamir/unslop | CC-BY-4.0 |
-| 文案创作/avoid-ai-writing去AI味 | avoid-ai-writing | MIT |
-| 文案创作/humanize人味写作 | humanize | MIT |
-| 文案创作/sepia去AI味写作 | sepia | MIT |
-| 营销与电商/marketingskills营销53技 | coreyhaines31/marketingskills | MIT |
-| 营销与电商/电商视觉文案策划 | feichanggege/ecommerce-visual-copywriting-skill | MIT |
-| 产品经理/nuwa女娲造人技能 | nuwa-skill | MIT |
-| 视频创作/seedance-2.0视频技能 | seedance-2.0 | MIT |
-| 视频创作/guoshen视频过审预检 | huangbai-AI/guoshen | MIT |
+| 上游项目 | 许可 | 技能数 |
+|----------|------|--------|
+| obra/superpowers | MIT | 15 |
+| mattpocock/skills | MIT | 39 |
+| t3dotgg/tstack | MIT | 9 |
+| EveryInc/compound-engineering-plugin | MIT | 36 |
+| phuryn/product-engineering | MIT | 44 |
+| lijigang/ljg-skills | MIT | 26 |
+| baoyu-skills | MIT | 22 |
+| onevcat/argue | MIT | 2 |
+| VoltAgent/awesome-codex-subagents | MIT | 136（.toml 定义，未入 SKILL 全集） |
+| mvanhorn/last30days-skill | MIT | 1 |
+| ffmpeg-skill | MIT | 13 |
+| claude-code-prompts | MIT | 3 |
+| Anthropic-Cybersecurity-Skills | Apache-2.0 | 818 |
+| ILOVCTRY/Obsius-AI | Apache-2.0 | 25 |
+| cloudflare/security-audit-skill | MIT | 1 |
+| Jasper-Lian/tcaptcha-solver | MIT | 1 |
+| black-mouse-sha/aliyun-slider-solve | MIT | 1 |
+| jmanico/grim-prompter | MIT | 72 |
+| js-reverse-skill | MIT | 1 |
+| dslsdzc/rev-skills | Apache-2.0 | 122 |
+| awesome-design-skills | MIT | 67 |
+| emilkowalski/skills | MIT | 19 |
+| heydamir/unslop | CC-BY-4.0 | 1 |
+| avoid-ai-writing | MIT | 8 |
+| humanize | MIT | 2 |
+| sepia | MIT | 6 |
+| coreyhaines31/marketingskills | MIT | 53 |
+| feichanggege/ecommerce-visual-copywriting-skill | MIT | 1 |
+| nuwa-skill | MIT | 16 |
+| seedance-2.0 | MIT | 29 |
+| huangbai-AI/guoshen | MIT | 1 |

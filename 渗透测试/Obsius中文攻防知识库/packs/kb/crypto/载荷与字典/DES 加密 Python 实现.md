@@ -1,1 +1,0 @@
-﻿# DES 加密 Python 实现DES_Python==========des.py 用于加密，des_1.py 用于 DES 解密！## 用法- `des.py`：加密入口- `des_1.py`：解密入口详情： http://my.oschina.net/liupengs/blog/124230
