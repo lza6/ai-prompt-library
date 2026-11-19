@@ -4,9 +4,9 @@
 
 我会提供两个路径：
 主项目路径：
-C:\Users\Administrator.DESKTOP-EGNE9ND\Desktop\智能渗透\CyberStrikeAI
+<你的主项目路径>
 参考项目根路径：
-C:\Users\Administrator.DESKTOP-EGNE9ND\Desktop\智能渗透\参考项目
+<参考项目路径>
 
 工作流状态文件：
 "<主项目路径>\参考的结果计划指南.md"

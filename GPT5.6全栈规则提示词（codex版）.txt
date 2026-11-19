@@ -1266,14 +1266,14 @@ Quick 任务不要制造无必要文档。
 
 如果以下本地规则文件可访问，可在首次大型任务或文件发生变化时读取：
 
-- `C:\Users\Administrator.DESKTOP-EGNE9ND\Desktop\编码规则\全栈工程师提示词2.0.txt`
-- `C:\Users\Administrator.DESKTOP-EGNE9ND\Desktop\编码规则\全栈工程师提示词3.0.txt`
-- `C:\Users\Administrator.DESKTOP-EGNE9ND\Desktop\编码规则\新saas全栈交付1.0.txt`
-- `C:\Users\Administrator.DESKTOP-EGNE9ND\Desktop\编码规则\新saas全栈交付2.0.txt`
-- `C:\Users\Administrator.DESKTOP-EGNE9ND\Desktop\编码规则\全栈项目质量.txt`
-- `C:\Users\Administrator.DESKTOP-EGNE9ND\Desktop\编码规则\强迫AI真实现2.0.txt`
-- `C:\Users\Administrator.DESKTOP-EGNE9ND\Desktop\编码规则\第一性原理.txt`
-- `C:\Users\Administrator.DESKTOP-EGNE9ND\Desktop\编码规则\UI规则skills.md`
+- `./全栈工程师提示词2.0.txt`
+- `./全栈工程师提示词3.0.txt`
+- `./新saas全栈交付1.0.txt`
+- `./新saas全栈交付2.0.txt`
+- `./全栈项目质量.txt`
+- `./强迫AI真实现2.0.txt`
+- `./第一性原理.txt`
+- `./UI规则skills.md`
 
 处理规则：
 
