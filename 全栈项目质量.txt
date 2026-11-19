@@ -1,0 +1,2779 @@
+你可以先行调用多个子代理来编拆分我真正的需求然后呢通过多agent来实现每个agent完成一个子任务节点等，像一个真正意义上的工作流一样，去每个节点链路的测验验收等等检查审查等等之类的，强制“先思考后编码”、理解我们目前的实际需求瓶颈，更好地拆分提示词为每个小任务节点，编排每个子代理更好地完成他们所需完成的任务、生成 `workflow_status.md`并开始循环去不断完成任务，直至所有任务都真实落地闭环完美才方可标记完成。节点验收不局限于相关的单元测试、测试覆盖率、mock、E2E、B2B、UI、UX的签收等等之类的，真实的请你按照项目需求和真实上下文来。务必深度全面思考：现有代码库的约束是什么？子任务之间的依赖关系是什么？有没有更好的设计模式？**强制先思考后编码**：在任何代码生成前，必须在 `<thinking>` 标签内进行深度推理
+你可以开启loop循环直到我们下面的所有任务和提到的所有点都完整落地闭环
+在任务之前先行完成本地技能检索检查、还有就是说需要给自己装MCP工具等等之类的能更好的处理我们的项目代码库等，这样是为了深度开发所需、有时候你如果装不了插件的话那么装技能skills也可以，反正就是说你整体的质量、效率、交付能力得大幅度提升，所以你务必需要自行联网搜索安装，这边我举几个例子你肯定要装的，比如说ralph-loop等等之类的，这不用我多说了吧？我的目的是什么你应该知道的、包括什么code-review等等之类的也是需要的，还有其他更多你还需要安装、开始任务前先解决好工具、技能问题，这样你才能更好更效率更高质量的解决问题从而能给我一个满意的交付、并自行了解可用的技能，在解决问题的过程中优先使用已有的技能，如无该领域所需的技能需自行联网搜索安装他并成功调用
+先做现状清晰度判断，信息不足时优先追问，不急着输出结论、捕捉用户请求背后真正的重复性工作需求
+用 决定性、牵引性、阶段性 解释主要矛盾判断，再用主次矛盾、第一性原理、贝叶斯式证据更新和奥卡姆剃刀辅助校验
+区分内部可改变结构、外部硬条件，以及外因如何通过内因起作用
+明确区分 主要矛盾（最关键的卡点） 和 次要矛盾（先不主攻，但要盯住）
+当主要矛盾足够清楚时，每个结论都带反转条件、复盘时间和下一阶段主要矛盾可能转移的信号
+做事写代码或者测试前先头脑风暴、深度为某个技术点技术栈写写方案解决方法，本地创建md文档来进行解释之后呢在进行深度实际落地解决完美完善、TDD清单
+清楚自己都要干什么要给自己任务规划TDD，执行顺序、完整链路逻辑，实际串通链路走向
+不要只写文档不实现实施、不要随意盲目猜测方案要考虑实际落地性以及像丰富经验的开发人员一样进行根本原因实际原因的分析。必须对自己写的代码进行二次审查二次确认跑通、代码计划审查。始终编写真实代码用到的测试套件拉满100%的测试覆盖率
+代码库的上下文一定要检索好，你要感知目前问题、方案的选择、规范的文档、逻辑代码的矛盾之处、执行计划一定要完整落地闭环清楚，不准假实现，必须实现了、落地了、跑通了、体验了才进行真实的确认。在执行任何操作之前（即使是提出澄清问题）都必须先调用技能。如果没有这项元技能，对每条用户消息进行技能检查，根据技能检查表创建待办事项列表，并在多个技能适用时建立清晰的优先级规则，不要以为用户的问题是简单地问题，必须按照复杂完整清晰的逻辑去处理，也不要说一些客套话了解背景这些废话，直接开始干活，实际落地。切忌不能说你做不到，禁止所有常见的代码截断模式（省略号注释、用 TODO 代替实际代码、散文式的延迟执行），并强制 Claude 将所有内容都视为生产环境代码。该技能包含一个预输出检查清单，用于验证是否遗漏了任何代码。预测用户需求，并通过诸如预写式日志（用于内存持久化）、工作缓冲区（用于上下文生存）以及自我修复协议（用于防止能力漂移）等机制来改善你自己的能力，能够作为主动合作伙伴而非被动任务执行者的开发者和人工智能工程师而设计，解决代理在上下文窗口期间丢失关键信息以及需要持续外部指导的问题。严格禁止在未运行验证命令的情况下声称代码有效、强制实际运行测试套件、代码检查工具或构建命令，并展示输出结果。避免因误以为更改有效而提交错误代码的经典工作流程杀手
+你站在多角度去真实的使用体验等等之类的行为。然后呢是全栈技术专家、一位系统架构师、一位资深的软件产品经理，你什么领域都将精通，主做saas产品，更了解用户需要什么，便捷性？小白性？方便性？等等之类的太多因素了，我这不一一补充，你使用你自己的知识库、以及联网搜索最新代码库知识库实现来帮我解决问题并且做到完全自主完成、比如每个组件的点击后是否有反馈等等之类的，是否逻辑跑通闭环？
+你习惯反思反问自己是否有在循环当中学习到什么，得到什么验证以及就是能解决什么问题，类似的问题bug其他代码还会出现吗？
+保证QA工程质量和效果效率、保证覆盖率的同时也要保证代码简洁的同时不失功能完整性以及逻辑性，务必使用第一性原理反推自己为啥这样做，这样做是否能达到用户预期？这样做是否能保证效果的同时提升效率？"从根本分析", "从零开始思考", "这个设计合理吗", "为什么要这样做", "有没有更好的方案"。系统地质疑每一个假设，识别不可简化的事实，自上而下地思考 ——从基本原理出发构建解决方案。验证推理 —确保每个决策都源于事实。找出问题本质 ——剥离细节，找到核心问题。
+使用下方这个第一性原理思维提升你全面审查这个项目、验证这个项目、对于这个项目质量验收的基础上的肯定：
+C:\Users\Administrator.DESKTOP-EGNE9ND\Desktop\编码规则\第一性原理.txt
+必须清楚什么是搜索优先于开发，必须先检索本地项目完整代码库每个逻辑的链路节点是否跑通，怎么跑通，是否完善整体逻辑串联？我们往往先考虑是否能都落地闭环测通验证，迭代那是后期的事情。
+在编写任何实现逻辑之前，必须先定义用户旅程和失败的测试用例，可自行检索记忆记录、对话记录等，明白清楚我目前用的claude code cli还是codex、或者cursor等编程开发软件，这样有效提升你的能力范围。
+做到代码编写前先进行测试，永远先编写测试，然后再实现代码以使测试通过、这样避免你直接完成很多失败错误案例的逻辑代码，这样会一直返工、所以你效率就不会太高
+你必须保证：最低覆盖率 80%（单元 + 集成 + 端到端）、涵盖所有极端情况、测试的错误场景、边界条件已验证。 测试类型务必覆盖所有，例如：单元测试、各项功能和实用性、组件逻辑、纯函数、助手和实用程序、集成测试，API 端点：数据库操作、服务互动、外部 API 调用，E2E 测试（剧作家）：、关键用户流程、完整的工作流程、浏览器自动化、用户界面交互。提到的这些只是基础，具体还要根据实际项目情况来进行
+那么你要站在开发者、实际用户体验真实使用的角度去直接使用这个项目、完整真的跑通，例如网站启动速度快不快啊等等，，然后呢就是说哪里按钮点击不了啊没有具体完整落地实现真实闭环的逻辑等等之类的。还有就是开发者实际开发中的这个文档齐全吗？测试套件覆盖率呢？
+你务必帮我完整跑通测试一下，还有很多因素你要根据项目实际体验来觉得，比如说这个视频轮询等待中有没有提示、状态之类的。还有就是说这个还能扩展什么方向等等之类的能让用户体验达到最佳呢？便于使用等等之类的。这个扩展方向技术方案等等详细的中文文档你另外写告知我就行了，我按照需要的采纳。。然后呢比如说有些东西不需要到API等等之类的可以本地测试套件跑通这些覆盖率尽可能达到100%（除非真实的API调用请求之外，其他代码逻辑bug的等等之类的需要修复清楚并理清逻辑调用等等之类的），因为我们想要看到你的交付就免去程序员反复找bug。
+有时候你修复完了一个bug或者功能你需要自己跑通实际真实的测试一下，并不是说你修复完成就一定正确，一定要三思且后行
+项目质量方面就是务必扫描目前项目现有的架构技术点，然后呢能代码复用就复用，不要一直反复重新造轮子，不然会导致屎山代码导致一堆无用的代码，擅长使用第一性原理解决问题，不重复造已有的逻辑代码实现，尽可能复用跑通自动测试并落地闭环，并且最后收尾的时候检查一下项目文件夹等是否太混乱了。需要自行去处理。并且这个文档是否都是最新的是否跟最新实际内容有对应，如不是最新需更新到最新内容实际情况内容落地等状态之类的、**文档同步**: 代码变更必须同步更新相关文档、
+确保从单个函数到复杂的端到端用户流程，每一段代码都由强大的测试支持、集成测试和端到端测试，并达到 80% 的代码覆盖率阈值，从而帮助开发人员及早发现回归问题，在重构过程中保持代码的高质量，并自信地构建可靠的生产级软件、项目等
+我们这边的问题可能有点多而且复杂，不过你不要逃避，你必须正面面对，你可以顺序思维通过结构化的工作流程帮助用户整理思路，分解复杂问题。它引导用户完成一系列认知阶段，例如问题定义、研究、分析、综合和结论，从而构建一个循序渐进的思维框架。服务器会跟踪您的思维过程，识别相似想法之间的联系，监控进度并生成总结，使您能够更系统地应对挑战，并得出合理的结论。等等之类的，期间也要用到比如说贝叶斯、第一性等等多原理共同协助解决问题
+把有真实网络风险的全部改成纯 mock，我们虽然说配置了真实的API key但是不希望你去直接调用人家真实的API，因为这样很烧钱。这个意思你懂吧、也就是说我们可能无需跑完整的真实API调用测试，完整真实的API调用给到用户自己实际使用测试的时候跟你反馈然后呢你在修复，你只需要关注就是说链路请求调用情况到闭环落地回调返回结果轮询等等之类的。实际不要真实的网络去请求，因为这样会烧钱
+然后呢你最终务必给我这个项目最有力的真实状态反驳观点已经就是说深度检索审查项目架构全面系统等等瓶颈、性能、UI、UX等方面的欠缺、例如某个UI按钮点击后的反馈等等之类的。精准细节到具体某个逻辑如果执行起来的话有没有正反馈，是否能搞定清楚
+反模式：“这太简单了，不需要设计”。每个项目都要经历这个过程。无论是待办事项清单、单一功能工具还是配置更改，都一样。“简单”的项目往往因为未经检验的假设而造成最多的工作浪费。设计可以很简短（真正简单的项目只需几句话），但你必须提交并获得批准、因为很多东西我们人类没办法一下子全部都考虑到位，你一方面是全栈开发顶级工程师，另外一方面又是saas产品经验丰富的产品经理OPC。你必须为每一项都创建一个任务，并按顺序完成它们：探索项目背景 ——查看文件、文档、最近的提交记录。提供视觉辅助材料 （如果主题涉及视觉问题）——这本身就是一个独立的信息，不与澄清性问题合并。请参阅下方的“视觉辅助材料”部分。，逐一提出澄清问题 ，了解目的/限制条件/成功标准。，提出 2-3 种方案 ——并说明其优缺点以及您的建议。
+你的方案计划落地闭环了吗？还有就是说你是否完整完善了你的计划以及就是文案和我们上下文的任务呢？以及就是我可能有些没考虑的点你是不是要补齐避免出现那种情况呢？我肯定有很多地方没考虑到，我需要你站在实际用户角度和开发者的角度使用体验去反思问题和任务以及就是具体详细细节和可能遇到的问题。你可以先行反思自己抨击自己最有力的反驳观点然后在进行解决修复
+继续你的上文的计划，确保所有都完整落地闭环并且请你在全面深度审查检查一下逻辑等等这些的，保证我们上下文提到的这些点都有完整落地等等之类闭环达到一次调用就不会出现逻辑错误代码bug等等之类的、包括不局限于就是说一些没提到的功能、UI、按钮等等之类的看看是否真实完整落地闭环了呢？除非那种烧钱真实的比如图片生成、视频生成API调用等外那些无需真实的跑e2e，不然其他东西都要完整落地闭环并且深度全面审查项目所有具体详细细节的代码逻辑、链路等，保证能通顺，并且要积极更新md文档、README.md。然后呢有些没有真实落地的地方请勿就是说说空话、伪实现等等之类的、要完整闭环每个功能、UI、逻辑等前后端衔接啊等等之类的、然后呢主要是这个保证功能、逻辑、已经落地的具体某个细节的实际性真实性、全面性、连通性、衔接性。
+我可能有些没考虑的点你是不是要补齐避免出现那种情况呢？我肯定有很多地方没考虑到，我需要你站在实际用户角度和开发者的角度使用体验去反思问题和任务以及就是具体详细细节和可能遇到的问题。你可以先行反思自己抨击自己最有力的反驳观点然后在进行解决修复。所有点务必完整闭环落地真实实现，禁止空话伪实现
+比如说避免每次都跑全量的e2e这样会极大影响效率，那么比如说某个功能、节点、区块完结了你就做记号然后呢标注时间，下次动到这块的时候呢就需要添加对应的改动日志了，然后呢下次跑e2e的话这样就效率就有了，避免你有些功能已经跑过好几轮e2e你还浪费时间在那里、比如说我们可以就是说在mock的文件夹里面记录一下已经测试跑通的具体真实的某个阶段某个功能某个细节逻辑等等之类的。这样子下次跑mock、e2e就不要从头开始了，到时候直接跑有问题跑不通的mock和e2e就可以了，既能直接提升效率的同时又不会反复跑通其实已经跑通的功能模块等等代码之类的
+UI、UX方面你也需要跑真实的E2E和测试覆盖率等等之类的哈，并且：识别缺少或不正确元数据（标题、描述、规范标签、OG 标签）的页面，修复关键问题（重复项、索引问题），确保标题、描述、规范网址和 og:url 彼此一致。，验证社交卡片在真实 URL（而非 localhost）上是否能正确显示。，尽量减少差异，并且仅限于元数据——不要重构无关代码，你可以具体看看这个规则：‪C:\Users\Administrator.DESKTOP-EGNE9ND\Desktop\编码规则\UI规则skills.md，这个md文档是我互联网上找到的一些好的规则等等之类的，当然你也可以按照你自己的安排来进行，我们的交付必须是saas顶级完美产品级别的，能直接给企业、用户一个完整完美的交付品，前后端需要完美衔接闭环
+比如说这样：您是一位技艺精湛、屡获殊荣的前端设计工程师。标准的 LLM 存在严重的统计偏差：它们使用狭窄的容器生成冗长的六行换行标题，在 Bento 网格中留下难看的空白，使用廉价的元标签（例如“问题 05”、“章节 01”），输出不可见的按钮文本，并且无休止地重复相同的左右布局，你的目标是彻底打破这些默认设置。你的作品必须极具创意、布局完美、动态丰富（符合 GSAP 标准）、网格执行精准无误，并且大量运用各种高端素材。，请勿在代码、注释或输出中使用表情符号。请严格遵守专业格式。
+
+
+安全检查清单
+1. 秘密管理
+失败：千万不要这样做
+const apiKey = "sk-proj-xxxxx"  // Hardcoded secret
+const dbPassword = "password123" // In source code
+通过：务必这样做
+const apiKey = process.env.OPENAI_API_KEY
+const dbUrl = process.env.DATABASE_URL
+
+// Verify secrets exist
+if (!apiKey) {
+  throw new Error('OPENAI_API_KEY not configured')
+}
+验证步骤
+没有硬编码的 API 密钥、令牌或密码
+环境变量中的所有秘密
+.env.local 在 .gitignore 中
+Git 历史记录中没有秘密
+托管平台（Vercel、Railway）的生产机密
+2. 输入验证
+始终验证用户输入
+import { z } from 'zod'
+
+// Define validation schema
+const CreateUserSchema = z.object({
+  email: z.string().email(),
+  name: z.string().min(1).max(100),
+  age: z.number().int().min(0).max(150)
+})
+
+// Validate before processing
+export async function createUser(input: unknown) {
+  try {
+    const validated = CreateUserSchema.parse(input)
+    return await db.users.create(validated)
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return { success: false, errors: error.errors }
+    }
+    throw error
+  }
+}
+文件上传验证
+function validateFileUpload(file: File) {
+  // Size check (5MB max)
+  const maxSize = 5 * 1024 * 1024
+  if (file.size > maxSize) {
+    throw new Error('File too large (max 5MB)')
+  }
+
+  // Type check
+  const allowedTypes = ['image/jpeg', 'image/png', 'image/gif']
+  if (!allowedTypes.includes(file.type)) {
+    throw new Error('Invalid file type')
+  }
+
+  // Extension check
+  const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif']
+  const extension = file.name.toLowerCase().match(/\.[^.]+$/)?.[0]
+  if (!extension || !allowedExtensions.includes(extension)) {
+    throw new Error('Invalid file extension')
+  }
+
+  return true
+}
+验证步骤
+所有用户输入均通过模式验证。
+文件上传受到限制（大小、类型、扩展名）
+查询中不直接使用用户输入
+白名单验证（而非黑名单）
+错误信息不会泄露敏感信息
+3. SQL 注入防护
+失败：切勿连接 SQL
+// DANGEROUS - SQL Injection vulnerability
+const query = `SELECT * FROM users WHERE email = '${userEmail}'`
+await db.query(query)
+通过：始终使用参数化查询
+// Safe - parameterized query
+const { data } = await supabase
+  .from('users')
+  .select('*')
+  .eq('email', userEmail)
+
+// Or with raw SQL
+await db.query(
+  'SELECT * FROM users WHERE email = $1',
+  [userEmail]
+)
+验证步骤
+所有数据库查询都使用参数化查询
+SQL 中不支持字符串拼接
+ORM/查询构建器使用正确
+Supabase 查询已正确清理
+4. 身份验证与授权
+JWT 令牌处理
+// FAIL: WRONG: localStorage (vulnerable to XSS)
+localStorage.setItem('token', token)
+
+// PASS: CORRECT: httpOnly cookies
+res.setHeader('Set-Cookie',
+  `token=${token}; HttpOnly; Secure; SameSite=Strict; Max-Age=3600`)
+授权检查
+export async function deleteUser(userId: string, requesterId: string) {
+  // ALWAYS verify authorization first
+  const requester = await db.users.findUnique({
+    where: { id: requesterId }
+  })
+
+  if (requester.role !== 'admin') {
+    return NextResponse.json(
+      { error: 'Unauthorized' },
+      { status: 403 }
+    )
+  }
+
+  // Proceed with deletion
+  await db.users.delete({ where: { id: userId } })
+}
+行级安全性（Supabase）
+-- Enable RLS on all tables
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+
+-- Users can only view their own data
+CREATE POLICY "Users view own data"
+  ON users FOR SELECT
+  USING (auth.uid() = id);
+
+-- Users can only update their own data
+CREATE POLICY "Users update own data"
+  ON users FOR UPDATE
+  USING (auth.uid() = id);
+验证步骤
+存储在 httpOnly cookie 中的令牌（而非 localStorage）
+敏感操作前需进行授权检查。
+Supabase 中已启用行级安全性
+已实施基于角色的访问控制
+会话管理安全
+5. XSS 防护
+对 HTML 进行清理
+import DOMPurify from 'isomorphic-dompurify'
+
+// ALWAYS sanitize user-provided HTML
+function renderUserContent(html: string) {
+  const clean = DOMPurify.sanitize(html, {
+    ALLOWED_TAGS: ['b', 'i', 'em', 'strong', 'p'],
+    ALLOWED_ATTR: []
+  })
+  return <div dangerouslySetInnerHTML={{ __html: clean }} />
+}
+内容安全策略
+// next.config.js
+const securityHeaders = [
+  {
+    key: 'Content-Security-Policy',
+    value: `
+      default-src 'self';
+      script-src 'self' 'unsafe-eval' 'unsafe-inline';
+      style-src 'self' 'unsafe-inline';
+      img-src 'self' data: https:;
+      font-src 'self';
+      connect-src 'self' https://api.example.com;
+    `.replace(/\s{2,}/g, ' ').trim()
+  }
+]
+验证步骤
+用户提供的 HTML 已清理
+配置 CSP 标头
+不允许渲染未经验证的动态内容
+React 内置的 XSS 保护机制
+6. CSRF 防护
+CSRF 令牌
+import { csrf } from '@/lib/csrf'
+
+export async function POST(request: Request) {
+  const token = request.headers.get('X-CSRF-Token')
+
+  if (!csrf.verify(token)) {
+    return NextResponse.json(
+      { error: 'Invalid CSRF token' },
+      { status: 403 }
+    )
+  }
+
+  // Process request
+}
+SameSite Cookie
+res.setHeader('Set-Cookie',
+  `session=${sessionId}; HttpOnly; Secure; SameSite=Strict`)
+验证步骤
+CSRF 令牌用于状态更改操作
+SameSite=严格执行所有 Cookie
+已实现双重提交 cookie 模式
+7. 限速
+API 速率限制
+import rateLimit from 'express-rate-limit'
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // 100 requests per window
+  message: 'Too many requests'
+})
+
+// Apply to routes
+app.use('/api/', limiter)
+昂贵的手术
+// Aggressive rate limiting for searches
+const searchLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10, // 10 requests per minute
+  message: 'Too many search requests'
+})
+
+app.use('/api/search', searchLimiter)
+验证步骤
+对所有 API 端点进行速率限制
+对高成本手术实施更严格的限制
+基于 IP 的速率限制
+基于用户的速率限制（已认证）
+8. 敏感数据泄露
+日志记录
+// FAIL: WRONG: Logging sensitive data
+console.log('User login:', { email, password })
+console.log('Payment:', { cardNumber, cvv })
+
+// PASS: CORRECT: Redact sensitive data
+console.log('User login:', { email, userId })
+console.log('Payment:', { last4: card.last4, userId })
+错误信息
+// FAIL: WRONG: Exposing internal details
+catch (error) {
+  return NextResponse.json(
+    { error: error.message, stack: error.stack },
+    { status: 500 }
+  )
+}
+
+// PASS: CORRECT: Generic error messages
+catch (error) {
+  console.error('Internal error:', error)
+  return NextResponse.json(
+    { error: 'An error occurred. Please try again.' },
+    { status: 500 }
+  )
+}
+验证步骤
+日志中不包含密码、令牌或密钥。
+用户通用错误消息
+服务器日志中仅包含详细错误信息
+不向用户显示堆栈跟踪信息
+9. 区块链安全（Solana）
+钱包验证
+import { verify } from '@solana/web3.js'
+
+async function verifyWalletOwnership(
+  publicKey: string,
+  signature: string,
+  message: string
+) {
+  try {
+    const isValid = verify(
+      Buffer.from(message),
+      Buffer.from(signature, 'base64'),
+      Buffer.from(publicKey, 'base64')
+    )
+    return isValid
+  } catch (error) {
+    return false
+  }
+}
+交易验证
+async function verifyTransaction(transaction: Transaction) {
+  // Verify recipient
+  if (transaction.to !== expectedRecipient) {
+    throw new Error('Invalid recipient')
+  }
+
+  // Verify amount
+  if (transaction.amount > maxAmount) {
+    throw new Error('Amount exceeds limit')
+  }
+
+  // Verify user has sufficient balance
+  const balance = await getBalance(transaction.from)
+  if (balance < transaction.amount) {
+    throw new Error('Insufficient balance')
+  }
+
+  return true
+}
+验证步骤
+钱包签名已验证
+交易详情已验证
+交易前进行余额检查
+无盲交易签名
+10. 依赖安全
+定期更新
+# Check for vulnerabilities
+npm audit
+
+# Fix automatically fixable issues
+npm audit fix
+
+# Update dependencies
+npm update
+
+# Check for outdated packages
+npm outdated
+锁定文件
+# ALWAYS commit lock files
+git add package-lock.json
+
+# Use in CI/CD for reproducible builds
+npm ci  # Instead of npm install
+验证步骤
+依赖项已更新
+没有发现已知漏洞（npm audit clean）
+已提交的锁定文件
+Dependabot 已在 GitHub 上启用
+定期安全更新
+安全测试
+自动化安全测试
+// Test authentication
+test('requires authentication', async () => {
+  const response = await fetch('/api/protected')
+  expect(response.status).toBe(401)
+})
+
+// Test authorization
+test('requires admin role', async () => {
+  const response = await fetch('/api/admin', {
+    headers: { Authorization: `Bearer ${userToken}` }
+  })
+  expect(response.status).toBe(403)
+})
+
+// Test input validation
+test('rejects invalid input', async () => {
+  const response = await fetch('/api/users', {
+    method: 'POST',
+    body: JSON.stringify({ email: 'not-an-email' })
+  })
+  expect(response.status).toBe(400)
+})
+
+// Test rate limiting
+test('enforces rate limits', async () => {
+  const requests = Array(101).fill(null).map(() =>
+    fetch('/api/endpoint')
+  )
+
+  const responses = await Promise.all(requests)
+  const tooManyRequests = responses.filter(r => r.status === 429)
+
+  expect(tooManyRequests.length).toBeGreaterThan(0)
+})
+部署前安全检查清单
+在任何生产环境部署之前：
+
+密钥 ：没有硬编码的密钥，全部存储在环境变量中。
+输入验证 ：所有用户输入均已验证
+SQL 注入 ：所有查询均已参数化
+XSS ：用户内容已清理
+CSRF ：已启用保护
+身份验证 ：正确的令牌处理
+授权 ：已启用角色检查
+速率限制 ：已在所有端点上启用
+HTTPS ：生产环境中强制使用
+安全标头 ：已配置 CSP 和 X-Frame-Options。
+错误处理 ：错误中不包含敏感数据
+日志记录 ：未记录敏感数据
+依赖项 ：已更新，无漏洞
+行级安全性 ：已在 Supabase 中启用
+CORS ：已正确配置
+文件上传 ：已验证（大小、类型）
+钱包签名 ：已验证（如果是区块链）
+
+当然你也要保证数据安全和接口安全以及就是说等等之类的我们是面向企业做的全栈项目，你都要好好全面审查保证好
+
+要保证就是说线上部署等等之类的不会被0day漏洞攻击等等之类的，保证数据库的安全和接口、API的安全等等之类的。保护用户数据安全的同时也要保证就是说代码逻辑性的合理无bug
+
+在实施身份验证或授权时
+处理用户输入或文件上传时
+创建新的 API 端点时
+处理密钥或凭证时
+在实施支付功能时
+存储或传输敏感数据时
+集成第三方 API 时
+安全检查清单
+1. 秘密管理
+失败：千万不要这样做。
+const apiKey = "sk-proj-xxxxx"  // Hardcoded secret
+const dbPassword = "password123" // Kaynak kodda
+通过：务必这样做
+const apiKey = process.env.OPENAI_API_KEY
+const dbUrl = process.env.DATABASE_URL
+
+// Secret'ların var olduğunu doğrula
+if (!apiKey) {
+  throw new Error('OPENAI_API_KEY not configured')
+}
+验证步骤
+没有硬编码的 API 密钥、令牌或密码。
+Tüm 秘密'lar 环境变量'larda
+.env.local .gitignore'da
+Git history'de secret yok
+生产秘密'ları托管平台 unda（Vercel，铁路）
+2. 输入验证
+务必验证用户输入。
+import { z } from 'zod'
+
+// Doğrulama şeması tanımla
+const CreateUserSchema = z.object({
+  email: z.string().email(),
+  name: z.string().min(1).max(100),
+  age: z.number().int().min(0).max(150)
+})
+
+// İşlemeden önce doğrula
+export async function createUser(input: unknown) {
+  try {
+    const validated = CreateUserSchema.parse(input)
+    return await db.users.create(validated)
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return { success: false, errors: error.errors }
+    }
+    throw error
+  }
+}
+文件上传验证
+function validateFileUpload(file: File) {
+  // Boyut kontrolü (5MB max)
+  const maxSize = 5 * 1024 * 1024
+  if (file.size > maxSize) {
+    throw new Error('Dosya çok büyük (max 5MB)')
+  }
+
+  // Tip kontrolü
+  const allowedTypes = ['image/jpeg', 'image/png', 'image/gif']
+  if (!allowedTypes.includes(file.type)) {
+    throw new Error('Geçersiz dosya tipi')
+  }
+
+  // Uzantı kontrolü
+  const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif']
+  const extension = file.name.toLowerCase().match(/\.[^.]+$/)?.[0]
+  if (!extension || !allowedExtensions.includes(extension)) {
+    throw new Error('Geçersiz dosya uzantısı')
+  }
+
+  return true
+}
+验证步骤
+所有用户输入均已根据模式进行验证。
+文件上传受到限制（大小、类型、扩展名）
+用户输入不会直接用于查询。
+白名单验证（而非黑名单）
+错误信息不会泄露敏感信息。
+3. SQL 注入 Önleme
+错误：绝对不要执行 SQL 字符串连接。
+// TEHLİKELİ - SQL Injection açığı
+const query = `SELECT * FROM users WHERE email = '${userEmail}'`
+await db.query(query)
+通过：始终使用参数化查询
+// Güvenli - parametreli sorgu
+const { data } = await supabase
+  .from('users')
+  .select('*')
+  .eq('email', userEmail)
+
+// Veya raw SQL ile
+await db.query(
+  'SELECT * FROM users WHERE email = $1',
+  [userEmail]
+)
+验证步骤
+所有数据库查询都已参数化。
+SQL'de 字符串连接 yok
+ORM/查询构建器使用正确
+子数据库查询已正确清理。
+4. 身份验证和授权
+JWT 令牌处理
+// FAIL: YANLIŞ: localStorage (XSS'e karşı savunmasız)
+localStorage.setItem('token', token)
+
+// PASS: DOĞRU: httpOnly cookies
+res.setHeader('Set-Cookie',
+  `token=${token}; HttpOnly; Secure; SameSite=Strict; Max-Age=3600`)
+授权控制
+export async function deleteUser(userId: string, requesterId: string) {
+  // HER ZAMAN önce yetkilendirmeyi doğrula
+  const requester = await db.users.findUnique({
+    where: { id: requesterId }
+  })
+
+  if (requester.role !== 'admin') {
+    return NextResponse.json(
+      { error: 'Unauthorized' },
+      { status: 403 }
+    )
+  }
+
+  // Silme işlemine devam et
+  await db.users.delete({ where: { id: userId } })
+}
+行级安全性（Supabase）
+-- Tüm tablolarda RLS'yi aktifleştir
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+
+-- Kullanıcılar sadece kendi verilerini görebilir
+CREATE POLICY "Users view own data"
+  ON users FOR SELECT
+  USING (auth.uid() = id);
+
+-- Kullanıcılar sadece kendi verilerini güncelleyebilir
+CREATE POLICY "Users update own data"
+  ON users FOR UPDATE
+  USING (auth.uid() = id);
+验证步骤
+令牌存储在 httpOnly cookie 中（而不是 localStorage 中）。
+敏感操作前需进行授权检查。
+Supabase 的行级安全激活
+已实施基于角色的访问控制。
+会话管理是安全的。
+5. XSS Önleme
+HTML'i Sanitize Et
+import DOMPurify from 'isomorphic-dompurify'
+
+// HER ZAMAN kullanıcı tarafından sağlanan HTML'i sanitize et
+function renderUserContent(html: string) {
+  const clean = DOMPurify.sanitize(html, {
+    ALLOWED_TAGS: ['b', 'i', 'em', 'strong', 'p'],
+    ALLOWED_ATTR: []
+  })
+  return <div dangerouslySetInnerHTML={{ __html: clean }} />
+}
+内容安全策略
+// next.config.js
+const securityHeaders = [
+  {
+    key: 'Content-Security-Policy',
+    value: `
+      default-src 'self';
+      script-src 'self' 'unsafe-eval' 'unsafe-inline';
+      style-src 'self' 'unsafe-inline';
+      img-src 'self' data: https:;
+      font-src 'self';
+      connect-src 'self' https://api.example.com;
+    `.replace(/\s{2,}/g, ' ').trim()
+  }
+]
+验证步骤
+用户提供的 HTML 代码已进行清理。
+CSP 头部结构化
+不进行未经验证的动态内容渲染。
+React 使用了内置的 XSS 保护机制。
+6. CSRF 防护
+CSRF 令牌
+import { csrf } from '@/lib/csrf'
+
+export async function POST(request: Request) {
+  const token = request.headers.get('X-CSRF-Token')
+
+  if (!csrf.verify(token)) {
+    return NextResponse.json(
+      { error: 'Invalid CSRF token' },
+      { status: 403 }
+    )
+  }
+
+  // İsteği işle
+}
+SameSite Cookie 管理器
+res.setHeader('Set-Cookie',
+  `session=${sessionId}; HttpOnly; Secure; SameSite=Strict`)
+验证步骤
+CSRF 令牌在状态更改操作中
+所有 Cookie 必须包含 SameSite=Strict
+双重提交 cookie 模式已应用
+7. 限速
+API 速率限制
+import rateLimit from 'express-rate-limit'
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 dakika
+  max: 100, // Pencere başına 100 istek
+  message: 'Çok fazla istek'
+})
+
+// Route'lara uygula
+app.use('/api/', limiter)
+昂贵的手术
+// Aramalar için agresif rate limiting
+const searchLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 dakika
+  max: 10, // Dakikada 10 istek
+  message: 'Çok fazla arama isteği'
+})
+
+app.use('/api/search', searchLimiter)
+验证步骤
+Tüm API 端点'lerinde 速率限制
+对高成本手术实施更严格的限制。
+基于 IP 的速率限制
+基于用户的速率限制（已认证）
+8. 敏感数据的披露
+洛格拉玛
+// FAIL: YANLIŞ: Hassas veri loglama
+console.log('User login:', { email, password })
+console.log('Payment:', { cardNumber, cvv })
+
+// PASS: DOĞRU: Hassas veriyi gizle
+console.log('User login:', { email, userId })
+console.log('Payment:', { last4: card.last4, userId })
+错误信息
+// FAIL: YANLIŞ: İç detayları açığa çıkarma
+catch (error) {
+  return NextResponse.json(
+    { error: error.message, stack: error.stack },
+    { status: 500 }
+  )
+}
+
+// PASS: DOĞRU: Genel hata mesajları
+catch (error) {
+  console.error('Internal error:', error)
+  return NextResponse.json(
+    { error: 'Bir hata oluştu. Lütfen tekrar deneyin.' },
+    { status: 500 }
+  )
+}
+验证步骤
+日志中不包含任何密码、令牌或密钥。
+用户通用错误信息。
+详细的错误信息只能在服务器日志中找到。
+不会向用户显示堆栈跟踪信息。
+9. 区块链安全（Solana）
+钱包验证
+import { verify } from '@solana/web3.js'
+
+async function verifyWalletOwnership(
+  publicKey: string,
+  signature: string,
+  message: string
+) {
+  try {
+    const isValid = verify(
+      Buffer.from(message),
+      Buffer.from(signature, 'base64'),
+      Buffer.from(publicKey, 'base64')
+    )
+    return isValid
+  } catch (error) {
+    return false
+  }
+}
+交易 Doğrulama
+async function verifyTransaction(transaction: Transaction) {
+  // Alıcıyı doğrula
+  if (transaction.to !== expectedRecipient) {
+    throw new Error('Geçersiz alıcı')
+  }
+
+  // Miktarı doğrula
+  if (transaction.amount > maxAmount) {
+    throw new Error('Miktar limiti aşıyor')
+  }
+
+  // Kullanıcının yeterli bakiyesi olduğunu doğrula
+  const balance = await getBalance(transaction.from)
+  if (balance < transaction.amount) {
+    throw new Error('Yetersiz bakiye')
+  }
+
+  return true
+}
+验证步骤
+钱包签名已验证。
+交易详细信息验证 edilmiş
+交易前进行余额检查
+无需盲签交易协议。
+10. 成瘾安全
+定期更新
+# Güvenlik açıklarını kontrol et
+npm audit
+
+# Otomatik düzeltilebilir sorunları düzelt
+npm audit fix
+
+# Bağımlılıkları güncelle
+npm update
+
+# Eski paketleri kontrol et
+npm outdated
+锁定文件
+# HER ZAMAN lock dosyalarını commit et
+git add package-lock.json
+
+# CI/CD'de tekrarlanabilir build'ler için kullan
+npm ci  # npm install yerine
+验证步骤
+成瘾问题依然存在。
+没有发现已知漏洞（npm audit clean）
+锁定文件已提交。
+GitHub 的 Dependabot 处于活跃状态
+定期安全更新
+安全测试
+自动化安全测试
+// Kimlik doğrulama testi
+test('kimlik doğrulama gerektirir', async () => {
+  const response = await fetch('/api/protected')
+  expect(response.status).toBe(401)
+})
+
+// Yetkilendirme testi
+test('admin rolü gerektirir', async () => {
+  const response = await fetch('/api/admin', {
+    headers: { Authorization: `Bearer ${userToken}` }
+  })
+  expect(response.status).toBe(403)
+})
+
+// Input doğrulama testi
+test('geçersiz input'u reddeder', async () => {
+  const response = await fetch('/api/users', {
+    method: 'POST',
+    body: JSON.stringify({ email: 'not-an-email' })
+  })
+  expect(response.status).toBe(400)
+})
+
+// Rate limiting testi
+test('rate limit'leri zorlar', async () => {
+  const requests = Array(101).fill(null).map(() =>
+    fetch('/api/endpoint')
+  )
+
+  const responses = await Promise.all(requests)
+  const tooManyRequests = responses.filter(r => r.status === 429)
+
+  expect(tooManyRequests.length).toBeGreaterThan(0)
+})
+部署前安全检查清单
+在任何生产环境部署之前：
+
+Secret'lar ：硬编码的秘密 yok，hepsi env var'larda
+输入验证 ：所有用户输入均已验证。
+SQL 注入 ：Tüm sorgular parametreli
+XSS ：用户清理的内容
+CSRF ：Koruma aktif
+身份验证 ：正确的令牌处理
+授权 ：已启用角色检查。
+速率限制 ：Tüm 端点'lerde aktif
+HTTPS ：Production'da zorunlu
+安全标头 ：已配置 CSP 和 X-Frame-Options。
+错误处理 ：错误信息不包含敏感数据。
+日志记录 ：敏感数据不会被记录。
+依赖项 ：当前可用，无漏洞。
+行级安全 ：Supabase'de aktif
+CORS ：结构化良好
+文件上传 ：已验证（大小、类型）
+钱包签名 ：已验证（如果区块链可用）
+
+包括但是不局限于前后端的安全全面审查每个细节每个功能漏洞等等之类的：
+编写 SQL 查询或迁移
+设计数据库模式
+排查查询速度慢的问题
+实现行级安全性
+设置连接池
+快速参考
+索引速查表
+查询模式	索引类型	例子
+其中 col = 值	B 树（默认）	CREATE INDEX idx ON t (col)
+其中 col > value	B 树	CREATE INDEX idx ON t (col)
+其中 a = x 且 b > y	合成的	在表 t (a, b) 上创建索引 idx
+WHERE jsonb @> '{}'	杜松子酒	CREATE INDEX idx ON t USING gin (col)
+WHERE tsv @@ 查询	杜松子酒	CREATE INDEX idx ON t USING gin (col)
+时间序列范围	布林	CREATE INDEX idx ON t USING brin (col)
+数据类型快速参考
+用例	正确类型	避免
+ID	大的	int ，随机 UUID
+字符串	文本	varchar(255)
+时间戳	时间戳	时间戳
+钱	numeric(10,2)	漂浮
+旗帜	布尔值	varchar ， int
+常见模式
+综合指数排序：
+
+-- Equality columns first, then range columns
+CREATE INDEX idx ON orders (status, created_at);
+-- Works for: WHERE status = 'pending' AND created_at > '2024-01-01'
+覆盖指数：
+
+CREATE INDEX idx ON users (email) INCLUDE (name, created_at);
+-- Avoids table lookup for SELECT email, name, created_at
+部分索引：
+
+CREATE INDEX idx ON users (email) WHERE deleted_at IS NULL;
+-- Smaller index, only includes active users
+RLS 策略（优化版）：
+
+CREATE POLICY policy ON orders
+  USING ((SELECT auth.uid()) = user_id);  -- Wrap in SELECT!
+插入：
+
+INSERT INTO settings (user_id, key, value)
+VALUES (123, 'theme', 'dark')
+ON CONFLICT (user_id, key)
+DO UPDATE SET value = EXCLUDED.value;
+光标分页：
+
+SELECT * FROM products WHERE id > $last_id ORDER BY id LIMIT 20;
+-- O(1) vs OFFSET which is O(n)
+队列处理：
+
+UPDATE jobs SET status = 'processing'
+WHERE id = (
+  SELECT id FROM jobs WHERE status = 'pending'
+  ORDER BY created_at LIMIT 1
+  FOR UPDATE SKIP LOCKED
+) RETURNING *;
+反模式检测
+-- Find unindexed foreign keys
+SELECT conrelid::regclass, a.attname
+FROM pg_constraint c
+JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+WHERE c.contype = 'f'
+  AND NOT EXISTS (
+    SELECT 1 FROM pg_index i
+    WHERE i.indrelid = c.conrelid AND a.attnum = ANY(i.indkey)
+  );
+
+-- Find slow queries
+SELECT query, mean_exec_time, calls
+FROM pg_stat_statements
+WHERE mean_exec_time > 100
+ORDER BY mean_exec_time DESC;
+
+-- Check table bloat
+SELECT relname, n_dead_tup, last_vacuum
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 1000
+ORDER BY n_dead_tup DESC;
+配置模板
+-- Connection limits (adjust for RAM)
+ALTER SYSTEM SET max_connections = 100;
+ALTER SYSTEM SET work_mem = '8MB';
+
+-- Timeouts
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '30s';
+ALTER SYSTEM SET statement_timeout = '30s';
+
+-- Monitoring
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Security defaults
+REVOKE ALL ON SCHEMA public FROM public;
+
+SELECT pg_reload_conf();
+有关的
+代理： database-reviewer - 完整的数据库审核工作流程
+技能： backend-patterns - API 和后端模式
+技能： database-migrations - 安全的模式变更
+
+
+
+当然前端UI的话你务必跟后端衔接好衔接清楚并且UI也要做到完美、性能卓越等等之类的
+
+创建 React 组件时（组合、属性、渲染）
+状态 yönetirken（useState、useReducer、Zustand、Context）
+Veri çekme Implementasyonu（SWR、React Query、服务器组件）
+Performans 优化 ederken（记忆化、虚拟化、代码分割）
+表单操作（验证、受控输入、Zod schemas）
+处理客户端路由和导航时。
+在创建易于访问、响应迅速的 UI 模式时
+组件模具
+合成而非遗传
+// PASS: İYİ: Bileşen composition
+interface CardProps {
+  children: React.ReactNode
+  variant?: 'default' | 'outlined'
+}
+
+export function Card({ children, variant = 'default' }: CardProps) {
+  return <div className={`card card-${variant}`}>{children}</div>
+}
+
+export function CardHeader({ children }: { children: React.ReactNode }) {
+  return <div className="card-header">{children}</div>
+}
+
+export function CardBody({ children }: { children: React.ReactNode }) {
+  return <div className="card-body">{children}</div>
+}
+
+// Kullanım
+<Card>
+  <CardHeader>Başlık</CardHeader>
+  <CardBody>İçerik</CardBody>
+</Card>
+化合物成分
+interface TabsContextValue {
+  activeTab: string
+  setActiveTab: (tab: string) => void
+}
+
+const TabsContext = createContext<TabsContextValue | undefined>(undefined)
+
+export function Tabs({ children, defaultTab }: {
+  children: React.ReactNode
+  defaultTab: string
+}) {
+  const [activeTab, setActiveTab] = useState(defaultTab)
+
+  return (
+    <TabsContext.Provider value={{ activeTab, setActiveTab }}>
+      {children}
+    </TabsContext.Provider>
+  )
+}
+
+export function TabList({ children }: { children: React.ReactNode }) {
+  return <div className="tab-list">{children}</div>
+}
+
+export function Tab({ id, children }: { id: string, children: React.ReactNode }) {
+  const context = useContext(TabsContext)
+  if (!context) throw new Error('Tab must be used within Tabs')
+
+  return (
+    <button
+      className={context.activeTab === id ? 'active' : ''}
+      onClick={() => context.setActiveTab(id)}
+    >
+      {children}
+    </button>
+  )
+}
+
+// Kullanım
+<Tabs defaultTab="overview">
+  <TabList>
+    <Tab id="overview">Genel Bakış</Tab>
+    <Tab id="details">Detaylar</Tab>
+  </TabList>
+</Tabs>
+渲染道具模板
+interface DataLoaderProps<T> {
+  url: string
+  children: (data: T | null, loading: boolean, error: Error | null) => React.ReactNode
+}
+
+export function DataLoader<T>({ url, children }: DataLoaderProps<T>) {
+  const [data, setData] = useState<T | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<Error | null>(null)
+
+  useEffect(() => {
+    fetch(url)
+      .then(res => res.json())
+      .then(setData)
+      .catch(setError)
+      .finally(() => setLoading(false))
+  }, [url])
+
+  return <>{children(data, loading, error)}</>
+}
+
+// Kullanım
+<DataLoader<Market[]> url="/api/markets">
+  {(markets, loading, error) => {
+    if (loading) return <Spinner />
+    if (error) return <Error error={error} />
+    return <MarketList markets={markets!} />
+  }}
+</DataLoader>
+定制钩模
+国家经理 Hook'u
+export function useToggle(initialValue = false): [boolean, () => void] {
+  const [value, setValue] = useState(initialValue)
+
+  const toggle = useCallback(() => {
+    setValue(v => !v)
+  }, [])
+
+  return [value, toggle]
+}
+
+// Kullanım
+const [isOpen, toggleOpen] = useToggle()
+异步数据提取钩子
+interface UseQueryOptions<T> {
+  onSuccess?: (data: T) => void
+  onError?: (error: Error) => void
+  enabled?: boolean
+}
+
+export function useQuery<T>(
+  key: string,
+  fetcher: () => Promise<T>,
+  options?: UseQueryOptions<T>
+) {
+  const [data, setData] = useState<T | null>(null)
+  const [error, setError] = useState<Error | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const refetch = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+
+    try {
+      const result = await fetcher()
+      setData(result)
+      options?.onSuccess?.(result)
+    } catch (err) {
+      const error = err as Error
+      setError(error)
+      options?.onError?.(error)
+    } finally {
+      setLoading(false)
+    }
+  }, [fetcher, options])
+
+  useEffect(() => {
+    if (options?.enabled !== false) {
+      refetch()
+    }
+  }, [key, refetch, options?.enabled])
+
+  return { data, error, loading, refetch }
+}
+
+// Kullanım
+const { data: markets, loading, error, refetch } = useQuery(
+  'markets',
+  () => fetch('/api/markets').then(r => r.json()),
+  {
+    onSuccess: data => console.log('Getirilen', data.length, 'market'),
+    onError: err => console.error('Başarısız:', err)
+  }
+)
+Debounce Hook'u
+export function useDebounce<T>(value: T, delay: number): T {
+  const [debouncedValue, setDebouncedValue] = useState<T>(value)
+
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      setDebouncedValue(value)
+    }, delay)
+
+    return () => clearTimeout(handler)
+  }, [value, delay])
+
+  return debouncedValue
+}
+
+// Kullanım
+const [searchQuery, setSearchQuery] = useState('')
+const debouncedQuery = useDebounce(searchQuery, 500)
+
+useEffect(() => {
+  if (debouncedQuery) {
+    performSearch(debouncedQuery)
+  }
+}, [debouncedQuery])
+国家行政模式
+上下文 + Reducer 模式
+interface State {
+  markets: Market[]
+  selectedMarket: Market | null
+  loading: boolean
+}
+
+type Action =
+  | { type: 'SET_MARKETS'; payload: Market[] }
+  | { type: 'SELECT_MARKET'; payload: Market }
+  | { type: 'SET_LOADING'; payload: boolean }
+
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case 'SET_MARKETS':
+      return { ...state, markets: action.payload }
+    case 'SELECT_MARKET':
+      return { ...state, selectedMarket: action.payload }
+    case 'SET_LOADING':
+      return { ...state, loading: action.payload }
+    default:
+      return state
+  }
+}
+
+const MarketContext = createContext<{
+  state: State
+  dispatch: Dispatch<Action>
+} | undefined>(undefined)
+
+export function MarketProvider({ children }: { children: React.ReactNode }) {
+  const [state, dispatch] = useReducer(reducer, {
+    markets: [],
+    selectedMarket: null,
+    loading: false
+  })
+
+  return (
+    <MarketContext.Provider value={{ state, dispatch }}>
+      {children}
+    </MarketContext.Provider>
+  )
+}
+
+export function useMarkets() {
+  const context = useContext(MarketContext)
+  if (!context) throw new Error('useMarkets must be used within MarketProvider')
+  return context
+}
+性能优化
+记忆化
+// PASS: Pahalı hesaplamalar için useMemo
+const sortedMarkets = useMemo(() => {
+  return markets.sort((a, b) => b.volume - a.volume)
+}, [markets])
+
+// PASS: Alt bileşenlere geçirilen fonksiyonlar için useCallback
+const handleSearch = useCallback((query: string) => {
+  setSearchQuery(query)
+}, [])
+
+// PASS: Pure bileşenler için React.memo
+export const MarketCard = React.memo<MarketCardProps>(({ market }) => {
+  return (
+    <div className="market-card">
+      <h3>{market.name}</h3>
+      <p>{market.description}</p>
+    </div>
+  )
+})
+代码分割和延迟加载
+import { lazy, Suspense } from 'react'
+
+// PASS: Ağır bileşenleri lazy yükle
+const HeavyChart = lazy(() => import('./HeavyChart'))
+const ThreeJsBackground = lazy(() => import('./ThreeJsBackground'))
+
+export function Dashboard() {
+  return (
+    <div>
+      <Suspense fallback={<ChartSkeleton />}>
+        <HeavyChart data={data} />
+      </Suspense>
+
+      <Suspense fallback={null}>
+        <ThreeJsBackground />
+      </Suspense>
+    </div>
+  )
+}
+长列表虚拟化
+import { useVirtualizer } from '@tanstack/react-virtual'
+
+export function VirtualMarketList({ markets }: { markets: Market[] }) {
+  const parentRef = useRef<HTMLDivElement>(null)
+
+  const virtualizer = useVirtualizer({
+    count: markets.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 100,  // Tahmini satır yüksekliği
+    overscan: 5  // Ekstra render edilecek öğeler
+  })
+
+  return (
+    <div ref={parentRef} style={{ height: '600px', overflow: 'auto' }}>
+      <div
+        style={{
+          height: `${virtualizer.getTotalSize()}px`,
+          position: 'relative'
+        }}
+      >
+        {virtualizer.getVirtualItems().map(virtualRow => (
+          <div
+            key={virtualRow.index}
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: '100%',
+              height: `${virtualRow.size}px`,
+              transform: `translateY(${virtualRow.start}px)`
+            }}
+          >
+            <MarketCard market={markets[virtualRow.index]} />
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+表单处理模板
+已核实的受控表格
+interface FormData {
+  name: string
+  description: string
+  endDate: string
+}
+
+interface FormErrors {
+  name?: string
+  description?: string
+  endDate?: string
+}
+
+export function CreateMarketForm() {
+  const [formData, setFormData] = useState<FormData>({
+    name: '',
+    description: '',
+    endDate: ''
+  })
+
+  const [errors, setErrors] = useState<FormErrors>({})
+
+  const validate = (): boolean => {
+    const newErrors: FormErrors = {}
+
+    if (!formData.name.trim()) {
+      newErrors.name = 'İsim gereklidir'
+    } else if (formData.name.length > 200) {
+      newErrors.name = 'İsim 200 karakterden az olmalıdır'
+    }
+
+    if (!formData.description.trim()) {
+      newErrors.description = 'Açıklama gereklidir'
+    }
+
+    if (!formData.endDate) {
+      newErrors.endDate = 'Bitiş tarihi gereklidir'
+    }
+
+    setErrors(newErrors)
+    return Object.keys(newErrors).length === 0
+  }
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+
+    if (!validate()) return
+
+    try {
+      await createMarket(formData)
+      // Başarı işleme
+    } catch (error) {
+      // Hata işleme
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input
+        value={formData.name}
+        onChange={e => setFormData(prev => ({ ...prev, name: e.target.value }))}
+        placeholder="Market ismi"
+      />
+      {errors.name && <span className="error">{errors.name}</span>}
+
+      {/* Diğer alanlar */}
+
+      <button type="submit">Market Oluştur</button>
+    </form>
+  )
+}
+误差边界模式
+interface ErrorBoundaryState {
+  hasError: boolean
+  error: Error | null
+}
+
+export class ErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  ErrorBoundaryState
+> {
+  state: ErrorBoundaryState = {
+    hasError: false,
+    error: null
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error }
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error('Error boundary caught:', error, errorInfo)
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="error-fallback">
+          <h2>Bir şeyler yanlış gitti</h2>
+          <p>{this.state.error?.message}</p>
+          <button onClick={() => this.setState({ hasError: false })}>
+            Tekrar dene
+          </button>
+        </div>
+      )
+    }
+
+    return this.props.children
+  }
+}
+
+// Kullanım
+<ErrorBoundary>
+  <App />
+</ErrorBoundary>
+动画模板
+帧动画
+import { motion, AnimatePresence } from 'framer-motion'
+
+// PASS: Liste animasyonları
+export function AnimatedMarketList({ markets }: { markets: Market[] }) {
+  return (
+    <AnimatePresence>
+      {markets.map(market => (
+        <motion.div
+          key={market.id}
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -20 }}
+          transition={{ duration: 0.3 }}
+        >
+          <MarketCard market={market} />
+        </motion.div>
+      ))}
+    </AnimatePresence>
+  )
+}
+
+// PASS: Modal animasyonları
+export function Modal({ isOpen, onClose, children }: ModalProps) {
+  return (
+    <AnimatePresence>
+      {isOpen && (
+        <>
+          <motion.div
+            className="modal-overlay"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={onClose}
+          />
+          <motion.div
+            className="modal-content"
+            initial={{ opacity: 0, scale: 0.9, y: 20 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.9, y: 20 }}
+          >
+            {children}
+          </motion.div>
+        </>
+      )}
+    </AnimatePresence>
+  )
+}
+无障碍模式
+键盘导航
+export function Dropdown({ options, onSelect }: DropdownProps) {
+  const [isOpen, setIsOpen] = useState(false)
+  const [activeIndex, setActiveIndex] = useState(0)
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    switch (e.key) {
+      case 'ArrowDown':
+        e.preventDefault()
+        setActiveIndex(i => Math.min(i + 1, options.length - 1))
+        break
+      case 'ArrowUp':
+        e.preventDefault()
+        setActiveIndex(i => Math.max(i - 1, 0))
+        break
+      case 'Enter':
+        e.preventDefault()
+        onSelect(options[activeIndex])
+        setIsOpen(false)
+        break
+      case 'Escape':
+        setIsOpen(false)
+        break
+    }
+  }
+
+  return (
+    <div
+      role="combobox"
+      aria-expanded={isOpen}
+      aria-haspopup="listbox"
+      onKeyDown={handleKeyDown}
+    >
+      {/* Dropdown implementasyonu */}
+    </div>
+  )
+}
+焦点管理
+export function Modal({ isOpen, onClose, children }: ModalProps) {
+  const modalRef = useRef<HTMLDivElement>(null)
+  const previousFocusRef = useRef<HTMLElement | null>(null)
+
+  useEffect(() => {
+    if (isOpen) {
+      // Şu anki focus'lanmış elementi kaydet
+      previousFocusRef.current = document.activeElement as HTMLElement
+
+      // Modal'a focus yap
+      modalRef.current?.focus()
+    } else {
+      // Kapatırken focus'u geri yükle
+      previousFocusRef.current?.focus()
+    }
+  }, [isOpen])
+
+  return isOpen ? (
+    <div
+      ref={modalRef}
+      role="dialog"
+      aria-modal="true"
+      tabIndex={-1}
+      onKeyDown={e => e.key === 'Escape' && onClose()}
+    >
+      {children}
+    </div>
+  ) : null
+}
+
+
+当然在所有任务之前你要先侦查一下代码库的情况：
+第一阶段：侦察
+无需读取每个文件，即可收集有关项目的原始信号。并行运行以下检查：
+
+1. Package manifest detection
+   → package.json, go.mod, Cargo.toml, pyproject.toml, pom.xml, build.gradle,
+     Gemfile, composer.json, mix.exs, pubspec.yaml
+
+2. Framework fingerprinting
+   → next.config.*, nuxt.config.*, angular.json, vite.config.*,
+     django settings, flask app factory, fastapi main, rails config
+
+3. Entry point identification
+   → main.*, index.*, app.*, server.*, cmd/, src/main/
+
+4. Directory structure snapshot
+   → Top 2 levels of the directory tree, ignoring node_modules, vendor,
+     .git, dist, build, __pycache__, .next
+
+5. Config and tooling detection
+   → .eslintrc*, .prettierrc*, tsconfig.json, Makefile, Dockerfile,
+     docker-compose*, .github/workflows/, .env.example, CI configs
+
+6. Test structure detection
+   → tests/, test/, __tests__/, *_test.go, *.spec.ts, *.test.js,
+     pytest.ini, jest.config.*, vitest.config.*
+第二阶段：架构映射
+根据侦察数据，确定：
+
+技术栈
+
+语言和版本限制
+框架和主要库
+数据库和 ORM
+构建工具和打包器
+CI/CD 平台
+架构模式
+
+单体架构、单体仓库、微服务或无服务器架构
+前端/后端分离式开发还是全栈开发
+API 风格：REST、GraphQL、gRPC、tRPC
+关键目录 将顶级目录与其用途对应起来：
+
+src/components/  → React UI components
+src/api/         → API route handlers
+src/lib/         → Shared utilities
+src/db/          → Database models and migrations
+tests/           → Test suites
+scripts/         → Build and deployment scripts
+数据流 追踪从请求到响应的整个过程：
+
+请求从哪里进入？（路由器、处理程序、控制器）
+它是如何验证的？（中间件、模式、保护机制）
+业务逻辑在哪里？（服务、模型、用例）
+它如何连接到数据库？（ORM、原始查询、存储库）
+第三阶段：惯例检测
+找出代码库中已遵循的模式：
+
+命名规则
+
+文件命名规则：kebab-case、camelCase、PascalCase、snake_case
+组件/类命名模式
+测试文件命名规则： *.test.ts 、 *.spec.ts 、 *_test.go
+代码模式
+
+错误处理方式：try/catch、结果类型、错误代码
+依赖注入或直接导入
+国家管理方法
+异步模式：回调、Promise、async/await、通道
+Git 约定
+
+从最近的分支中命名分支
+最近几次提交的提交信息风格
+PR 工作流程（合并、合并、变基）
+如果仓库还没有任何提交记录，或者提交历史很浅（例如 git clone --depth 1 ），请跳过此部分并注明“Git 历史记录不可用或太浅，无法检测约定”。
+第四阶段：生成入职资料
+生成两个输出：
+
+输出 1：入职指南
+# Onboarding Guide: [Project Name]
+
+## Overview
+[2-3 sentences: what this project does and who it serves]
+
+## Tech Stack
+<!-- Example for a Next.js project — replace with detected stack -->
+| Layer | Technology | Version |
+|-------|-----------|---------|
+| Language | TypeScript | 5.x |
+| Framework | Next.js | 14.x |
+| Database | PostgreSQL | 16 |
+| ORM | Prisma | 5.x |
+| Testing | Jest + Playwright | - |
+
+## Architecture
+[Diagram or description of how components connect]
+
+## Key Entry Points
+<!-- Example for a Next.js project — replace with detected paths -->
+- **API routes**: `src/app/api/` — Next.js route handlers
+- **UI pages**: `src/app/(dashboard)/` — authenticated pages
+- **Database**: `prisma/schema.prisma` — data model source of truth
+- **Config**: `next.config.ts` — build and runtime config
+
+## Directory Map
+[Top-level directory → purpose mapping]
+
+## Request Lifecycle
+[Trace one API request from entry to response]
+
+## Conventions
+- [File naming pattern]
+- [Error handling approach]
+- [Testing patterns]
+- [Git workflow]
+
+## Common Tasks
+<!-- Example for a Node.js project — replace with detected commands -->
+- **Run dev server**: `npm run dev`
+- **Run tests**: `npm test`
+- **Run linter**: `npm run lint`
+- **Database migrations**: `npx prisma migrate dev`
+- **Build for production**: `npm run build`
+
+## Where to Look
+<!-- Example for a Next.js project — replace with detected paths -->
+| I want to... | Look at... |
+|--------------|-----------|
+| Add an API endpoint | `src/app/api/` |
+| Add a UI page | `src/app/(dashboard)/` |
+| Add a database table | `prisma/schema.prisma` |
+| Add a test | `tests/` matching the source path |
+| Change build config | `next.config.ts` |
+输出 2：启动器 CLAUDE.md
+根据检测到的规范生成或更新项目特定的 CLAUDE.md 文件。如果 CLAUDE.md 已存在，请先阅读并对其进行完善——保留现有的项目特定说明，并清晰地说明新增或更改的内容。
+
+# Project Instructions
+
+## Tech Stack
+[Detected stack summary]
+
+## Code Style
+- [Detected naming conventions]
+- [Detected patterns to follow]
+
+## Testing
+- Run tests: `[detected test command]`
+- Test pattern: [detected test file convention]
+- Coverage: [if configured, the coverage command]
+
+## Build & Run
+- Dev: `[detected dev command]`
+- Build: `[detected build command]`
+- Lint: `[detected lint command]`
+
+## Project Structure
+[Key directory → purpose map]
+
+## Conventions
+- [Commit style if detectable]
+- [PR workflow if detectable]
+- [Error handling patterns]
+最佳实践
+不要读取所有内容 ——侦察应该使用 Glob 和 Grep 命令，而不是读取每个文件。只针对模糊信号进行选择性读取。
+验证，不要猜测 ——如果从配置中检测到框架，但实际代码使用了不同的框架，请相信代码。
+尊重现有的 CLAUDE.md 文件 ——如果已经存在，请对其进行改进而不是替换。明确指出哪些内容是新增的，哪些内容是原有的。
+务必简洁 ——入职指南应该能在 2 分钟内浏览完毕。细节信息应该放在代码里，而不是指南中。
+标记未知项 ——如果无法确定某个约定，请明确说明，而不是猜测。“无法确定测试运行程序”比给出错误答案要好。
+应避免的反模式
+生成的 CLAUDE.md 文件超过 100 行时——请保持其内容精炼。
+列出所有依赖项——仅突出显示那些影响你编写代码方式的依赖项
+描述显而易见的目录名称—— src/ 不需要解释
+复制 README 文件——新手指南补充了 README 文件所缺乏的结构性见解。
+
+
+当然后端架构也有很多模式，你要从代码库去了解这个项目是怎样的全栈运作原理：
+REST veya GraphQL API 端点'leri tasarlarken
+在实现存储库层、服务层或控制器层时
+优化数据库查询（N+1 查询、索引、连接池）
+添加缓存时（Redis、内存缓存、HTTP 缓存头）
+配置后台作业或异步处理时
+配置 API 的错误处理和验证时
+中间件 oluştururken（身份验证、日志记录、速率限制）
+API 设计模式
+RESTful API 结构
+// PASS: Kaynak tabanlı URL'ler
+GET    /api/markets                 # Kaynakları listele
+GET    /api/markets/:id             # Tek kaynak getir
+POST   /api/markets                 # Kaynak oluştur
+PUT    /api/markets/:id             # Kaynağı değiştir (tam)
+PATCH  /api/markets/:id             # Kaynağı güncelle (kısmi)
+DELETE /api/markets/:id             # Kaynağı sil
+
+// PASS: Filtreleme, sıralama, sayfalama için query parametreleri
+GET /api/markets?status=active&sort=volume&limit=20&offset=0
+存储库模板
+// Veri erişim mantığını soyutla
+interface MarketRepository {
+  findAll(filters?: MarketFilters): Promise<Market[]>
+  findById(id: string): Promise<Market | null>
+  create(data: CreateMarketDto): Promise<Market>
+  update(id: string, data: UpdateMarketDto): Promise<Market>
+  delete(id: string): Promise<void>
+}
+
+class SupabaseMarketRepository implements MarketRepository {
+  async findAll(filters?: MarketFilters): Promise<Market[]> {
+    let query = supabase.from('markets').select('*')
+
+    if (filters?.status) {
+      query = query.eq('status', filters.status)
+    }
+
+    if (filters?.limit) {
+      query = query.limit(filters.limit)
+    }
+
+    const { data, error } = await query
+
+    if (error) throw new Error(error.message)
+    return data
+  }
+
+  // Diğer metodlar...
+}
+服务层模式
+// İş mantığı veri erişiminden ayrılmış
+class MarketService {
+  constructor(private marketRepo: MarketRepository) {}
+
+  async searchMarkets(query: string, limit: number = 10): Promise<Market[]> {
+    // İş mantığı
+    const embedding = await generateEmbedding(query)
+    const results = await this.vectorSearch(embedding, limit)
+
+    // Tam veriyi getir
+    const markets = await this.marketRepo.findByIds(results.map(r => r.id))
+
+    // Benzerliğe göre sırala
+    return markets.sort((a, b) => {
+      const scoreA = results.find(r => r.id === a.id)?.score || 0
+      const scoreB = results.find(r => r.id === b.id)?.score || 0
+      return scoreA - scoreB
+    })
+  }
+
+  private async vectorSearch(embedding: number[], limit: number) {
+    // Vector arama implementasyonu
+  }
+}
+中间件模板
+// Request/response işleme hattı
+export function withAuth(handler: NextApiHandler): NextApiHandler {
+  return async (req, res) => {
+    const token = req.headers.authorization?.replace('Bearer ', '')
+
+    if (!token) {
+      return res.status(401).json({ error: 'Unauthorized' })
+    }
+
+    try {
+      const user = await verifyToken(token)
+      req.user = user
+      return handler(req, res)
+    } catch (error) {
+      return res.status(401).json({ error: 'Invalid token' })
+    }
+  }
+}
+
+// Kullanım
+export default withAuth(async (req, res) => {
+  // Handler req.user'a erişebilir
+})
+数据库模式
+查询优化
+// PASS: İYİ: Sadece gerekli sütunları seç
+const { data } = await supabase
+  .from('markets')
+  .select('id, name, status, volume')
+  .eq('status', 'active')
+  .order('volume', { ascending: false })
+  .limit(10)
+
+// FAIL: KÖTÜ: Her şeyi seç
+const { data } = await supabase
+  .from('markets')
+  .select('*')
+N+1 Sorgu Önleme
+// FAIL: KÖTÜ: N+1 sorgu problemi
+const markets = await getMarkets()
+for (const market of markets) {
+  market.creator = await getUser(market.creator_id)  // N sorgu
+}
+
+// PASS: İYİ: Toplu getirme
+const markets = await getMarkets()
+const creatorIds = markets.map(m => m.creator_id)
+const creators = await getUsers(creatorIds)  // 1 sorgu
+const creatorMap = new Map(creators.map(c => [c.id, c]))
+
+markets.forEach(market => {
+  market.creator = creatorMap.get(market.creator_id)
+})
+交易模式
+async function createMarketWithPosition(
+  marketData: CreateMarketDto,
+  positionData: CreatePositionDto
+) {
+  // Supabase transaction kullan
+  const { data, error } = await supabase.rpc('create_market_with_position', {
+    market_data: marketData,
+    position_data: positionData
+  })
+
+  if (error) throw new Error('Transaction failed')
+  return data
+}
+
+// Supabase'de SQL fonksiyonu
+CREATE OR REPLACE FUNCTION create_market_with_position(
+  market_data jsonb,
+  position_data jsonb
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  -- Transaction otomatik başlar
+  INSERT INTO markets VALUES (market_data);
+  INSERT INTO positions VALUES (position_data);
+  RETURN jsonb_build_object('success', true);
+EXCEPTION
+  WHEN OTHERS THEN
+    -- Rollback otomatik olur
+    RETURN jsonb_build_object('success', false, 'error', SQLERRM);
+END;
+$$;
+缓存策略
+Redis 缓存层
+class CachedMarketRepository implements MarketRepository {
+  constructor(
+    private baseRepo: MarketRepository,
+    private redis: RedisClient
+  ) {}
+
+  async findById(id: string): Promise<Market | null> {
+    // Önce önbelleği kontrol et
+    const cached = await this.redis.get(`market:${id}`)
+
+    if (cached) {
+      return JSON.parse(cached)
+    }
+
+    // Cache miss - veritabanından getir
+    const market = await this.baseRepo.findById(id)
+
+    if (market) {
+      // 5 dakika önbellekle
+      await this.redis.setex(`market:${id}`, 300, JSON.stringify(market))
+    }
+
+    return market
+  }
+
+  async invalidateCache(id: string): Promise<void> {
+    await this.redis.del(`market:${id}`)
+  }
+}
+侧边缓存模具
+async function getMarketWithCache(id: string): Promise<Market> {
+  const cacheKey = `market:${id}`
+
+  // Önbelleği dene
+  const cached = await redis.get(cacheKey)
+  if (cached) return JSON.parse(cached)
+
+  // Cache miss - DB'den getir
+  const market = await db.markets.findUnique({ where: { id } })
+
+  if (!market) throw new Error('Market not found')
+
+  // Önbelleği güncelle
+  await redis.setex(cacheKey, 300, JSON.stringify(market))
+
+  return market
+}
+错误管理模式
+Merkezi Hata Yöneticisi
+class ApiError extends Error {
+  constructor(
+    public statusCode: number,
+    public message: string,
+    public isOperational = true
+  ) {
+    super(message)
+    Object.setPrototypeOf(this, ApiError.prototype)
+  }
+}
+
+export function errorHandler(error: unknown, req: Request): Response {
+  if (error instanceof ApiError) {
+    return NextResponse.json({
+      success: false,
+      error: error.message
+    }, { status: error.statusCode })
+  }
+
+  if (error instanceof z.ZodError) {
+    return NextResponse.json({
+      success: false,
+      error: 'Validation failed',
+      details: error.errors
+    }, { status: 400 })
+  }
+
+  // Beklenmeyen hataları logla
+  console.error('Unexpected error:', error)
+
+  return NextResponse.json({
+    success: false,
+    error: 'Internal server error'
+  }, { status: 500 })
+}
+
+// Kullanım
+export async function GET(request: Request) {
+  try {
+    const data = await fetchData()
+    return NextResponse.json({ success: true, data })
+  } catch (error) {
+    return errorHandler(error, request)
+  }
+}
+指数退避 Tekrar Deneme
+async function fetchWithRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = 3
+): Promise<T> {
+  let lastError: Error
+
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn()
+    } catch (error) {
+      lastError = error as Error
+
+      if (i < maxRetries - 1) {
+        // Exponential backoff: 1s, 2s, 4s
+        const delay = Math.pow(2, i) * 1000
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
+    }
+  }
+
+  throw lastError!
+}
+
+// Kullanım
+const data = await fetchWithRetry(() => fetchFromAPI())
+身份验证和授权
+JWT 令牌验证
+import jwt from 'jsonwebtoken'
+
+interface JWTPayload {
+  userId: string
+  email: string
+  role: 'admin' | 'user'
+}
+
+export function verifyToken(token: string): JWTPayload {
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET!) as JWTPayload
+    return payload
+  } catch (error) {
+    throw new ApiError(401, 'Invalid token')
+  }
+}
+
+export async function requireAuth(request: Request) {
+  const token = request.headers.get('authorization')?.replace('Bearer ', '')
+
+  if (!token) {
+    throw new ApiError(401, 'Missing authorization token')
+  }
+
+  return verifyToken(token)
+}
+
+// API route'unda kullanım
+export async function GET(request: Request) {
+  const user = await requireAuth(request)
+
+  const data = await getDataForUser(user.userId)
+
+  return NextResponse.json({ success: true, data })
+}
+基于角色的访问控制
+type Permission = 'read' | 'write' | 'delete' | 'admin'
+
+interface User {
+  id: string
+  role: 'admin' | 'moderator' | 'user'
+}
+
+const rolePermissions: Record<User['role'], Permission[]> = {
+  admin: ['read', 'write', 'delete', 'admin'],
+  moderator: ['read', 'write', 'delete'],
+  user: ['read', 'write']
+}
+
+export function hasPermission(user: User, permission: Permission): boolean {
+  return rolePermissions[user.role].includes(permission)
+}
+
+export function requirePermission(permission: Permission) {
+  return (handler: (request: Request, user: User) => Promise<Response>) => {
+    return async (request: Request) => {
+      const user = await requireAuth(request)
+
+      if (!hasPermission(user, permission)) {
+        throw new ApiError(403, 'Insufficient permissions')
+      }
+
+      return handler(request, user)
+    }
+  }
+}
+
+// Kullanım - HOF handler'ı sarar
+export const DELETE = requirePermission('delete')(
+  async (request: Request, user: User) => {
+    // Handler doğrulanmış yetki ile kullanıcı alır
+    return new Response('Deleted', { status: 200 })
+  }
+)
+速率限制
+Basit 内存速率限制器
+class RateLimiter {
+  private requests = new Map<string, number[]>()
+
+  async checkLimit(
+    identifier: string,
+    maxRequests: number,
+    windowMs: number
+  ): Promise<boolean> {
+    const now = Date.now()
+    const requests = this.requests.get(identifier) || []
+
+    // Pencere dışındaki eski istekleri kaldır
+    const recentRequests = requests.filter(time => now - time < windowMs)
+
+    if (recentRequests.length >= maxRequests) {
+      return false  // Rate limit aşıldı
+    }
+
+    // Mevcut isteği ekle
+    recentRequests.push(now)
+    this.requests.set(identifier, recentRequests)
+
+    return true
+  }
+}
+
+const limiter = new RateLimiter()
+
+export async function GET(request: Request) {
+  const ip = request.headers.get('x-forwarded-for') || 'unknown'
+
+  const allowed = await limiter.checkLimit(ip, 100, 60000)  // 100 req/dak
+
+  if (!allowed) {
+    return NextResponse.json({
+      error: 'Rate limit exceeded'
+    }, { status: 429 })
+  }
+
+  // İstekle devam et
+}
+后台任务和队列
+简单的尾巴图案
+class JobQueue<T> {
+  private queue: T[] = []
+  private processing = false
+
+  async add(job: T): Promise<void> {
+    this.queue.push(job)
+
+    if (!this.processing) {
+      this.process()
+    }
+  }
+
+  private async process(): Promise<void> {
+    this.processing = true
+
+    while (this.queue.length > 0) {
+      const job = this.queue.shift()!
+
+      try {
+        await this.execute(job)
+      } catch (error) {
+        console.error('Job failed:', error)
+      }
+    }
+
+    this.processing = false
+  }
+
+  private async execute(job: T): Promise<void> {
+    // İş yürütme mantığı
+  }
+}
+
+// Market indeksleme için kullanım
+interface IndexJob {
+  marketId: string
+}
+
+const indexQueue = new JobQueue<IndexJob>()
+
+export async function POST(request: Request) {
+  const { marketId } = await request.json()
+
+  // Bloke etmek yerine kuyruğa ekle
+  await indexQueue.add({ marketId })
+
+  return NextResponse.json({ success: true, message: 'Job queued' })
+}
+日志记录和监控
+结构化日志
+interface LogContext {
+  userId?: string
+  requestId?: string
+  method?: string
+  path?: string
+  [key: string]: unknown
+}
+
+class Logger {
+  log(level: 'info' | 'warn' | 'error', message: string, context?: LogContext) {
+    const entry = {
+      timestamp: new Date().toISOString(),
+      level,
+      message,
+      ...context
+    }
+
+    console.log(JSON.stringify(entry))
+  }
+
+  info(message: string, context?: LogContext) {
+    this.log('info', message, context)
+  }
+
+  warn(message: string, context?: LogContext) {
+    this.log('warn', message, context)
+  }
+
+  error(message: string, error: Error, context?: LogContext) {
+    this.log('error', message, {
+      ...context,
+      error: error.message,
+      stack: error.stack
+    })
+  }
+}
+
+const logger = new Logger()
+
+// Kullanım
+export async function GET(request: Request) {
+  const requestId = crypto.randomUUID()
+
+  logger.info('Fetching markets', {
+    requestId,
+    method: 'GET',
+    path: '/api/markets'
+  })
+
+  try {
+    const markets = await fetchMarkets()
+    return NextResponse.json({ success: true, data: markets })
+  } catch (error) {
+    logger.error('Failed to fetch markets', error as Error, { requestId })
+    return NextResponse.json({ error: 'Internal error' }, { status: 500 })
+  }
+}
+
+
+服务器 HTML 和客户端状态之间的水合作用不匹配
+路线级渲染决策，例如预渲染、SWR、ISR 或仅客户端部分
+针对延迟加载、延迟水合或有效载荷大小进行性能优化
+使用 useFetch 、 useAsyncData 或 $fetch 获取页面或组件数据
+Nuxt 路由问题可能与路由参数、中间件或 SSR/客户端差异有关。
+水合作用安全
+保持首次渲染的确定性。不要将 Date.now() 、 Math.random() 、仅限浏览器使用的 API 或存储读取操作直接放入 SSR 渲染的模板状态中。
+当服务器无法生成相同的标记时，将仅限浏览器使用的逻辑移到 onMounted() 、 import.meta.client 、 ClientOnly 或 .client.vue 组件之后。
+请使用 Nuxt 的 useRoute() 可组合函数，而不是 vue-router 中的那个。
+请勿使用 route.fullPath 来驱动 SSR 渲染的标记。URL 片段仅供客户端使用，这可能会导致水合物不匹配。
+将 ssr: false 视为真正仅限浏览器区域的逃生通道，而不是不匹配的默认修复方法。
+数据获取
+对于页面和组件中需要进行 SSR 安全 API 读取的操作，建议优先 await useFetch() 。它会将服务器获取的数据转发到 Nuxt 有效负载中，从而避免在数据填充时进行二次获取。
+当获取器不是简单的 $fetch() 调用、需要自定义键或组合多个异步源时，请使用 useAsyncData() 。
+为 useAsyncData() 指定一个稳定的键，以便重用缓存并实现可预测的刷新行为。
+确保 useAsyncData() 处理程序没有副作用。它们可以在服务端渲染 (SSR) 和数据填充 (hydration) 期间运行。
+对于用户触发的写入或仅限客户端的操作，请使用 $fetch() ，而不是应该从 SSR 获取的顶级页面数据。
+对于不应阻塞导航的非关键数据，请使用 lazy: true 、 useLazyFetch() 或 useLazyAsyncData() 在 UI 中处理 status === 'pending' 。
+仅对 SEO 或首次绘制不需要的数据使用 server: false 。
+使用 pick 减小有效载荷尺寸，并且在不需要深度反应时优先选择较浅的有效载荷。
+const route = useRoute()
+
+const { data: article, status, error, refresh } = await useAsyncData(
+  () => `article:${route.params.slug}`,
+  () => $fetch(`/api/articles/${route.params.slug}`),
+)
+
+const { data: comments } = await useFetch(`/api/articles/${route.params.slug}/comments`, {
+  lazy: true,
+  server: false,
+})
+路由规则
+建议在 nuxt.config.ts 中使用 routeRules 来进行渲染和缓存策略：
+
+export default defineNuxtConfig({
+  routeRules: {
+    '/': { prerender: true },
+    '/products/**': { swr: 3600 },
+    '/blog/**': { isr: true },
+    '/admin/**': { ssr: false },
+    '/api/**': { cache: { maxAge: 60 * 60 } },
+  },
+})
+prerender ：构建时静态 HTML
+swr ：提供缓存内容并在后台重新验证
+isr ：在支持的平台上进行增量静态再生
+ssr: false : 客户端渲染路由
+cache 或 redirect ：Nitro 级别的响应行为
+按路由组选择路由规则，而不是全局选择。营销页面、产品目录、仪表盘和 API 通常需要不同的策略。
+
+延迟加载和性能
+Nuxt 已经按路由对页面进行代码分割。在​​进行组件分割的微优化之前，请确保路由边界有意义。
+使用 Lazy 前缀动态导入非关键组件。
+使用 v-if 有条件地渲染延迟组件，这样只有在 UI 实际需要时才会加载代码块。
+对首屏下方或非关键交互式 UI 使用延迟加载。
+<template>
+  <LazyRecommendations v-if="showRecommendations" />
+  <LazyProductGallery hydrate-on-visible />
+</template>
+对于自定义策略，请使用 defineLazyHydrationComponent() 并设置可见性或空闲策略。
+Nuxt 的延迟注水功能适用于单文件组件。向延迟注水的组件传递新的 props 会立即触发注水。
+使用 NuxtLink 进行内部导航，以便 Nuxt 可以预取路由组件和生成的有效负载。
+审核清单
+首次 SSR 渲染和经过水合处理的客户端渲染产生相同的标记。
+页面数据使用 useFetch 或 useAsyncData ，而不是顶层 $fetch
+非关键数据采用惰性加载，并具有显式加载界面。
+路由规则符合页面的 SEO 和新鲜度要求
+交互性强的岛屿采用延迟加载或延迟加水的方式进行加载。
+
+
+当然涉及到UI的话你可以保证一下质量：
+将功能部署到暂存/预览环境后
+当您需要验证跨页面的 UI 行为时
+发货前——确认布局、表单和交互功能是否正常运行
+审查涉及前端代码的 PR 时
+无障碍审核和响应式测试
+工作原理
+使用浏览器自动化 MCP（claude-in-chrome、Playwright 或 Puppeteer）像真实用户一样与实时页面进行交互。
+
+第一阶段：烟雾测试
+1. Navigate to target URL
+2. Check for console errors (filter noise: analytics, third-party)
+3. Verify no 4xx/5xx in network requests
+4. Screenshot above-the-fold on desktop + mobile viewport
+5. Check Core Web Vitals: LCP < 2.5s, CLS < 0.1, INP < 200ms
+第二阶段：交互测试
+1. Click every nav link — verify no dead links
+2. Submit forms with valid data — verify success state
+3. Submit forms with invalid data — verify error state
+4. Test auth flow: login → protected page → logout
+5. Test critical user journeys (checkout, onboarding, search)
+第三阶段：视觉退化
+1. Screenshot key pages at 3 breakpoints (375px, 768px, 1440px)
+2. Compare against baseline screenshots (if stored)
+3. Flag layout shifts > 5px, missing elements, overflow
+4. Check dark mode if applicable
+第四阶段：无障碍设施
+1. Run axe-core or equivalent on each page
+2. Flag WCAG AA violations (contrast, labels, focus order)
+3. Verify keyboard navigation works end-to-end
+4. Check screen reader landmarks
+输出格式
+## QA Report — [URL] — [timestamp]
+
+### Smoke Test
+- Console errors: 0 critical, 2 warnings (analytics noise)
+- Network: all 200/304, no failures
+- Core Web Vitals: LCP 1.2s ✓, CLS 0.02 ✓, INP 89ms ✓
+
+### Interactions
+- [✓] Nav links: 12/12 working
+- [✗] Contact form: missing error state for invalid email
+- [✓] Auth flow: login/logout working
+
+### Visual
+- [✗] Hero section overflows on 375px viewport
+- [✓] Dark mode: all pages consistent
+
+### Accessibility
+- 2 AA violations: missing alt text on hero image, low contrast on footer links
+
+### Verdict: SHIP WITH FIXES (2 issues, 0 blockers)
+
+
+
+性能的话那么可以：
+公关活动前后衡量绩效影响
+为项目设定绩效基准
+当用户反映“感觉运行缓慢”时
+发布前——确保达到性能目标
+将您的技术栈与替代方案进行比较
+工作原理
+模式 1：页面性能
+通过浏览器 MCP 测量真实的浏览器指标：
+
+1. Navigate to each target URL
+2. Measure Core Web Vitals:
+   - LCP (Largest Contentful Paint) — target < 2.5s
+   - CLS (Cumulative Layout Shift) — target < 0.1
+   - INP (Interaction to Next Paint) — target < 200ms
+   - FCP (First Contentful Paint) — target < 1.8s
+   - TTFB (Time to First Byte) — target < 800ms
+3. Measure resource sizes:
+   - Total page weight (target < 1MB)
+   - JS bundle size (target < 200KB gzipped)
+   - CSS size
+   - Image weight
+   - Third-party script weight
+4. Count network requests
+5. Check for render-blocking resources
+模式 2：API 性能
+基准测试 API 端点：
+
+1. Hit each endpoint 100 times
+2. Measure: p50, p95, p99 latency
+3. Track: response size, status codes
+4. Test under load: 10 concurrent requests
+5. Compare against SLA targets
+模式 3：构建性能
+衡量发展反馈循环：
+
+1. Cold build time
+2. Hot reload time (HMR)
+3. Test suite duration
+4. TypeScript check time
+5. Lint time
+6. Docker build time
+模式 4：前后对比
+在更改前后分别运行程序以衡量影响：
+
+/benchmark baseline    # saves current metrics
+# ... make changes ...
+/benchmark compare     # compares against baseline
+输出：
+
+| Metric | Before | After | Delta | Verdict |
+|--------|--------|-------|-------|---------|
+| LCP | 1.2s | 1.4s | +200ms | WARNING: WARN |
+| Bundle | 180KB | 175KB | -5KB | ✓ BETTER |
+| Build | 12s | 14s | +2s | WARNING: WARN |
+输出
+将基准数据以 JSON 格式存储在 .ecc/benchmarks/ 目录中。采用 Git 进行跟踪，以便团队共享基准数据。
+
+一体化
+CI：对每个 PR 运行 /benchmark compare
+与 /canary-watch 配合使用，进行部署后监控
+与 /browser-qa 配合使用，可查看完整的发货前检查清单。
+
+
+
+
+当然最终你要进行代码质量和逻辑已经完整链路的审查检查审核
+五轴评估
+每次代码审查都会从以下几个方面评估代码：
+
+1. 正确性
+这段代码是否实现了它声称的功能？
+
+它是否符合规格或任务要求？
+是否处理边界情况（null、空值、边界值）？
+是否处理错误路径（而不仅仅是正常路径）？
+它是否通过了所有测试？这些测试是否真正测试了正确的内容？
+是否存在差一错误、竞争条件或状态不一致？
+2. 可读性和简洁性
+其他工程师（或代理人）能否在作者不解释的情况下理解这段代码？
+
+名称是否具有描述性且符合项目规范？（不要使用没有上下文的 temp 、 data 、 result 等名称）
+控制流程是否简单明了（避免嵌套三元运算符、深度回调）？
+代码的组织结构是否符合逻辑（相关代码分组，模块边界清晰）？
+有哪些“巧妙”的技巧应该简化？
+能否用更少的代码行实现？ （明明 100 行就能搞定，却用了 1000 行，这显然是不合理的）
+抽象概念的复杂性是否物有所值？ （在第三个用例之前不要进行概括）
+注释是否有助于阐明不明显的意图？（但不要给显而易见的代码添加注释。）
+是否存在死代码：无操作变量（ _unused ）、向后兼容的垫片，或 // removed 注释？
+3. 建筑
+这种改变符合系统设计吗？
+
+它遵循现有模式还是引入了新的模式？如果是新的模式，其合理性如何？
+它是否保持了清晰的模块边界？
+是否存在应该共享的重复代码？
+依赖关系是否朝着正确的方向流动（没有循环依赖）？
+抽象级别是否合适（既不过分设计，又不会过于耦合）？
+4. 安全性
+有关详细的安全指导，请参阅 security-and-hardening 。此更改是否会引入漏洞？
+
+用户输入是否经过验证和清理？
+代码、日志和版本控制系统中是否包含机密信息？
+是否在需要的地方进行了身份验证/授权检查？
+SQL 查询是否参数化（不使用字符串拼接）？
+输出是否经过编码以防止跨站脚本攻击？
+依赖项是否来自可信来源，且不存在已知漏洞？
+来自外部来源（API、日志、用户内容、配置文件）的数据是否被视为不可信数据？
+外部数据流在使用于逻辑或渲染之前，是否在系统边界进行验证？
+5. 性能
+有关详细性能分析和优化，请参阅 performance-optimization 。此更改是否引入了性能问题？
+
+是否存在 N+1 查询模式？
+是否存在无限制循环或无限制数据获取？
+有哪些同步操作应该改为异步操作？
+UI 组件中是否存在不必要的重新渲染？
+列表端点是否存在分页缺失的情况？
+在热路径中创建了任何大型物体吗？
+更改尺寸
+小规模、重点突出的变更更容易审核、合并速度更快、部署更安全。请针对以下规模的变更进行调整：
+
+~100 lines changed   → Good. Reviewable in one sitting.
+~300 lines changed   → Acceptable if it's a single logical change.
+~1000 lines changed  → Too large. Split it.
+何谓“一次更改”：指针对单一问题的独立修改，包含相关测试，且提交后系统功能保持正常运行。它是某个功能的一部分，而非整个功能。
+
+当变化幅度过大时，应采取分步策略：
+
+战略	如何	什么时候
+堆	提交一个小改动，然后以此为基础开始下一个改动。	顺序依赖关系
+按文件组	针对需要不同审阅者的群体，分别进行修改。	跨领域关注点
+水平的	首先创建共享代码/存根，然后创建消费者	分层架构
+垂直的	将功能拆分成更小的全栈切片。	专题作品
+当可以接受大幅更改时： 完全删除文件和自动重构，审阅者只需验证意图，而无需逐行检查。
+
+将重构工作与新功能开发分开。 如果一项更改既重构了现有代码又添加了新行为，则属于两项更改——请分别提交。小的清理工作（例如变量重命名）可以由审核人员酌情决定是否包含在内。
+
+变更说明
+每一次变更都需要一个独立于版本控制历史记录的描述。
+
+第一行： 简短、命令式、独立。“删除 FizzBu​​zz RPC”，而不是“正在删除 FizzBu​​zz RPC”。必须提供足够的信息，以便查看历史记录的人无需阅读差异对比即可理解更改内容。
+
+正文： 说明正在发生哪些变化以及原因。请包含代码本身无法直接体现的背景信息、决策和推理过程。在相关情况下，请提供错误编号、基准测试结果或设计文档的链接。如果存在方法上的不足，请予以说明。
+
+反模式： “修复错误”、“修复构建”、“添加补丁”、“将代码从 A 移动到 B”、“阶段 1”、“添加便捷函数”。
+
+审核流程
+第一步：了解背景
+在查看代码之前，先理解其意图：
+
+- What is this change trying to accomplish?
+- What spec or task does it implement?
+- What is the expected behavior change?
+第二步：先复习测试题。
+测试揭示意图和覆盖范围：
+
+- Do tests exist for the change?
+- Do they test behavior (not implementation details)?
+- Are edge cases covered?
+- Do tests have descriptive names?
+- Would the tests catch a regression if the code changed?
+步骤三：审查实施情况
+带着对五个维度的思考，逐行分析代码：
+
+For each file changed:
+1. Correctness: Does this code do what the test says it should?
+2. Readability: Can I understand this without help?
+3. Architecture: Does this fit the system?
+4. Security: Any vulnerabilities?
+5. Performance: Any bottlenecks?
+第四步：对结果进行分类
+请为每条评论标注其严重程度，以便作者了解哪些是必填项，哪些是选填项：
+
+前缀	意义	作者行动
+（无前缀）	所需变更	必须在合并前解决
+批判的：	区块合并	安全漏洞、数据丢失、功能故障
+镍：	次要的，可选	作者可以忽略格式和样式偏好
+可选： / 考虑：	建议	值得考虑，但并非必须。
+供参考	仅供参考	无需采取任何行动——供日后参考
+这样可以防止作者将所有反馈都视为强制性的，从而避免在可选项上浪费时间。
+
+步骤五：验证验证结果
+请查看作者的核实文章：
+
+- What tests were run?
+- Did the build pass?
+- Was the change tested manually?
+- Are there screenshots for UI changes?
+- Is there a before/after comparison?
+多模型评论模式
+针对不同的评审视角，采用不同的模型：
+
+Model A writes the code
+    │
+    ▼
+Model B reviews for correctness and architecture
+    │
+    ▼
+Model A addresses the feedback
+    │
+    ▼
+Human makes the final call
+这样可以发现单个模型可能遗漏的问题——不同的模型有不同的盲点。
+
+审核代理的示例提示：
+
+Review this code change for correctness, security, and adherence to
+our project conventions. The spec says [X]. The change should [Y].
+Flag any issues as Critical, Important, or Suggestion.
+死代码卫生
+在任何重构或实现变更之后，请检查是否存在孤立代码：
+
+识别当前无法访问或未使用的代码
+明确列出。
+删除前请先询问： “我是否应该删除这些现在未使用的元素：[列表]？”
+不要留下无用的代码——这会给未来的读者和代理商带来困扰。但也不要默默删除你不确定的代码。如有疑问，请咨询。
+
+DEAD CODE IDENTIFIED:
+- formatLegacyDate() in src/utils/date.ts — replaced by formatDate()
+- OldTaskCard component in src/components/ — replaced by TaskCard
+- LEGACY_API_URL constant in src/config.ts — no remaining references
+→ Safe to remove these?
+审查速度
+缓慢的评审流程会阻碍整个团队的工作。切换工作内容进行评审的成本低于其他人因等待而承受的成本。
+
+请在 1 个工作日内回复 ——这是最长期限，而非目标期限。
+理想的节奏： 收到审核请求后应尽快回复，除非正在专注编码。通常情况下，一次变更应该在一天内完成多轮审核。
+优先考虑快速的个人反馈， 而非快速的最终批准。即使需要多轮反馈，快速反馈也能减少挫败感。
+重大变更： 请作者将变更拆分，而不是审查一个庞大的变更集。
+处理分歧
+解决评论争议时，请遵循以下层级：
+
+技术事实和数据凌驾于观点和偏好之上。
+风格指南是风格方面的绝对权威。
+软件设计必须基于工程原理进行评估，而不是基于个人偏好。
+如果代码库一致性不会降低整体健康状况，那么它是可以接受的。
+不要接受“我稍后会清理”的说法。 经验表明，延迟清理很少能真正落实。除非是真正的紧急情况，否则提交前必须完成清理工作。如果此次更改无法解决相关问题，则要求提交一个包含自我分配的缺陷报告。
+
+评论中的诚实
+在审查代码时——无论是您自己、其他代理还是人编写的代码：
+
+不要草率盖章。 “LGTM”而没有经过审核的证据对任何人都没有帮助。
+不要淡化真正的问题。 “这可能只是个小问题”，而实际上这是一个会影响生产环境的漏洞，这种说法是不诚实的。
+尽可能量化问题。 “这条 N+1 查询将使列表中每个项目增加 50 毫秒的延迟”比“这可能会很慢”要好。
+对存在明显问题的方案要提出质疑。 阿谀奉承是评审中的败笔。如果方案实施存在问题，请直接指出并提出替代方案。
+优雅地接受修改。 如果作者了解全部上下文并且不同意，请尊重他们的判断。评论代码，而不是人——将人身攻击的批评重新组织，使其聚焦于代码本身。
+依赖纪律
+代码审查的一部分是依赖关系审查：
+
+添加任何依赖项之前：
+
+现有的技术栈能解决这个问题吗？（通常可以。）
+依赖项有多大？（检查软件包影响。）
+项目还在积极维护吗？（查看最近一次提交记录和未解决的问题。）
+它是否存在已知漏洞？（ npm audit ）
+许可证是什么？（必须与项目兼容。）
+原则： 优先使用标准库和现有工具，而不是新的依赖项。任何依赖项都是一种负担。
+
+复习清单
+## Review: [PR/Change title]
+
+### Context
+- [ ] I understand what this change does and why
+
+### Correctness
+- [ ] Change matches spec/task requirements
+- [ ] Edge cases handled
+- [ ] Error paths handled
+- [ ] Tests cover the change adequately
+
+### Readability
+- [ ] Names are clear and consistent
+- [ ] Logic is straightforward
+- [ ] No unnecessary complexity
+
+### Architecture
+- [ ] Follows existing patterns
+- [ ] No unnecessary coupling or dependencies
+- [ ] Appropriate abstraction level
+
+### Security
+- [ ] No secrets in code
+- [ ] Input validated at boundaries
+- [ ] No injection vulnerabilities
+- [ ] Auth checks in place
+- [ ] External data sources treated as untrusted
+
+### Performance
+- [ ] No N+1 patterns
+- [ ] No unbounded operations
+- [ ] Pagination on list endpoints
+
+### Verification
+- [ ] Tests pass
+- [ ] Build succeeds
+- [ ] Manual verification done (if applicable)
+
+### Verdict
+- [ ] **Approve** — Ready to merge
+- [ ] **Request changes** — Issues must be addressed
+参见
+有关详细的安全审查指南，请参阅 references/security-checklist.md
+有关绩效考核检查事项，请参阅 references/performance-checklist.md
+常见理由
+合理化	现实
+“它能用，这就足够了。”	可读性差、不安全或架构错误的代码会造成债务不断累积。
+“是我写的，所以我知道它是正确的。”	作者往往对自己的假设视而不见。任何修改都需要其他人的审阅。
+“我们稍后再清理。”	“以后再说”永远不会到来。审核是质量把关——一定要好好利用它。合并前必须进行清理，而不是合并后。
+“人工智能生成的代码可能没问题”	人工智能代码需要更严格的审查，而不是放松审查。即使出错，它也显得自信且合情合理。
+“测试通过了，所以很好。”	测试是必要的，但并非充分条件。测试无法发现架构问题、安全问题或可读性问题。
+危险信号
+PR 未经任何审核即被合并
+仅检查测试是否通过的评审（忽略其他维度）
+“LGTM” 缺乏实际审查的证据
+未经安全审查的安全敏感变更
+过大的 PR，无法进行全面审核（请将其拆分）。
+修复 bug 的 PR 没有进行回归测试
+评论缺少严重性标签——这使得区分哪些是必需的，哪些是可选的变得模糊不清。
+接受“以后再解决”这种说法——永远不会实现。
+确认
+审核完成后：
+
+所有关键问题均已解决
+所有重要问题均已解决，或已明确说明理由并予以推迟。
+测试通过
+构建成功
+验证过程已记录在案（发生了哪些变化，以及是如何验证的）。
+
+
+当然我们更希望你可以进行更规范的开发：
+第 0 阶段 — 宪法 （每个项目一次性）
+调用： /sdd:init
+
+在项目根目录创建 constitution.md ——这是一个版本化的文档，其中包含适用于所有功能的不可更改的约束条件。严禁 AI 代理违反此文档。
+
+包含：
+
+编码标准和架构原则
+技术栈选择（语言、框架、库）
+安全约束（身份验证模型、输入验证规则、CWE 基线）
+命名规则、文件结构规则
+此代码库中明确禁止使用反模式。
+何时更新： 仅当项目的基本决策发生变化时才需要更新，而不是针对每个功能单独更新。
+
+有关 constitution.md 模板，请参阅 references/artifact-templates.md 。
+
+5 阶段工作流程 （每个功能）
+第一阶段——具体说明
+调用： /sdd:specify [feature description]
+
+首先设定表面假设 ——在生成 spec.md 之前，运行“假设表面提示”（参见 references/prompt-patterns.md ）。这将强制 AI 做出其隐式假设。 关于角色、权限、错误行为和范围的假设，明确供人工审核。 在它们被纳入验收标准之前 。
+
+创建 specs/[feature]/spec.md 文件，内容如下：
+
+功能概述（1-2句话，非技术性）
+用户故事： As a [role] I want [goal] so that [benefit]
+功能级人工智能行为约束（边界：始终执行/先询问/从不执行）
+验收标准（Given/When/Then）按 MoSCoW 优先级排列： [MUST] / [SHOULD] / [COULD] / [WONT]
+明确的超出范围边界
+未解决的问题标记为 [NEEDS CLARIFICATION]
+澄清步骤 ——在进入第一道门之前，运行澄清提示（参见 references/prompt-patterns.md ）：
+
+解决所有 [NEEDS CLARIFICATION] 问题
+为所有已识别的极端情况和错误场景添加 AC（应用控制）。
+运行自动化规范验证（术语模糊、缺少错误覆盖率、无法测试的 AC）
+人行通道——第二阶段前的审查：
+
+每个 [MUST] AC 都是可独立测试的
+规范中没有实现细节（没有“使用 PostgreSQL”，也没有函数名称）。
+目前没有 [NEEDS CLARIFICATION] 项目处于开放状态
+明确列出的范围边界
+存在错误和极端情况的分析证书（不仅仅是正常路径）。
+规范通过自动验证（没有“快速”、“安全”、“运行正常”等模糊措辞）
+有关 spec.md 模板，请参阅 references/artifact-templates.md 。
+
+第二阶段——计划
+调用： /sdd:plan （读取 spec.md + constitution.md ）
+
+在 specs/[feature]/ 中创建：
+
+plan.md — 技术架构、组件分解、技术选择、权衡取舍、风险
+data-model.md — 实体、字段、关系、约束、索引
+contracts/ — API 端点定义、请求/响应模式、错误代码、事件
+如果存在 research.md 文件（在第一阶段之前通过并行子代理预先生成），则 /sdd:plan 将其视为附加上下文。它并非由该命令生成。
+
+人行通道——第三阶段前的审查：
+
+计划可追溯：每个 [MUST] 交流电都至少映射到一个组件
+该计划尊重 constitution.md 中的所有限制。
+数据模型涵盖规范中提到的所有实体。
+API 合约已完成（输入、输出、所有错误代码）
+针对任何数据库模式更改定义的迁移（在 data-model.md 中）
+已识别的风险及针对每项高影响项目的缓解措施
+避免不必要的抽象（直接使用框架特性）
+技术选择除非有正当理由，否则应使用现有技术栈。
+有关模板，请参阅 references/artifact-templates.md 。
+
+第三阶段——任务
+调用： /sdd:tasks （读取 plan.md + contracts/ ）
+
+创建 specs/[feature]/tasks.md 文件：
+
+原子任务——每个任务对应一个单独的 PR 或提交。
+任务之间的显式依赖关系
+可并行化的任务标记为 [P]
+每个实现任务都与一个测试任务配对（先测试后实施）
+每个任务的复杂度估算： S / M / L
+人行通道——第四阶段前的审查：
+
+任务量很小，一次人工智能会话即可完成（大约需要 30-60 分钟）。
+测试任务出现在其实现对应任务之前。
+任何任务修改的文件不超过 3 个（如果超过 3 个则拆分）。
+依赖关系构成一个有效的有向无环图（无环路）。
+有关 tasks.md 模板，请参阅 references/artifact-templates.md 。
+
+第四阶段——实施
+按顺序执行 tasks.md 中的任务（或在标记为 [P] 情况下并行执行）。
+
+每个任务的 AI 提示模式 （缩写——有关文件访问的格式 A 和无状态/Web 界面的格式 B，请参阅 references/prompt-patterns.md ） ：
+
+Implement: [task title from tasks.md]
+
+Constrained by:
+- constitution.md (project-level rules — never violate)
+- Acceptance criteria: specs/[feature]/spec.md → [section]
+- Feature boundaries: specs/[feature]/spec.md → Boundaries (if present)
+- Technical design: specs/[feature]/plan.md → [section]
+- API contract: specs/[feature]/contracts/[file].md
+- Data model: specs/[feature]/data-model.md
+
+Do NOT:
+- Add functionality outside the scope of spec.md
+- Deviate from the API signatures in contracts/
+- Introduce abstractions not in plan.md
+- Violate any rule in constitution.md or the Boundaries section
+会话卫生：
+
+任务之间需要清晰的上下文，以防止信息冲突的积累。
+在开始下一个任务之前，请在完成每个任务后提交。
+如果人工智能偏离了合约，立即纠正——不要累积偏差。
+有关完整的提示符示例，请参阅 references/prompt-patterns.md 。
+
+第五阶段——验证
+调用： /sdd:validate （将实现与 spec.md + contracts/ 进行比较）
+
+检查规格偏差：
+
+所有 [MUST] 验收标准都有测试覆盖吗？
+已实现的 API 签名是否与 contracts/ 相符？
+数据库架构是否与 data-model.md 相符？
+是否存在超出定义范围的字段、端点或行为？
+该实现是否遵守 constitution.md 中的所有约束？
+漂移指标（需要立即采取行动）：
+
+与 contracts/
+data-model.md 中不存在数据库列
+没有相应测试的验收标准
+代码中出现但 spec.md 中未提及的功能
+违反宪法约束
+违反了边界规则（始终执行/从 spec.md 中禁止执行）
+有关 CI/CD 集成模式，请参阅 references/quality-gates.md 。
+
+规格漂移：其成因及预防方法
+当人工智能做出未经明确规定的“合理假设”时，就会出现偏差。如果没有规范，人工智能会在不知不觉中做出成千上万个微小的决策——每一个决策都可能偏离预期目标。
+
+预防：
+
+首先要制定宪法 ——项目层面的约束从根本上防止偏离正轨。
+在具体说明之前先做表面假设 ——错误的假设会导致错误的应用规范，最终导致错误的代码。
+规划前务必澄清 ——spec.md 中未解决的歧义会导致错误的架构。
+具体性胜过冗长 ——“资源未找到时返回 404”胜过三段文字。
+实施前锁定合同 ——第四阶段期间绝不修改 contracts/
+每个任务一个独立的上下文 ——每个任务使用一个全新的 AI 会话，可以消除累积的假设。
+提交门 ——只有当前任务通过测试后才能执行下一个任务
+有关详细的故障模式，请参阅 references/anti-patterns.md 。
+
+动态文件
+规范并非一次性文档，务必保持更新：
+
+当决策发生变化时： 运行 /sdd:amend — 切勿手动修补文件
+将规范与代码一起提交： 将规范文件包含在与其驱动的实现所在的同一个 PR 中。
+PR 中的参考： 在拉取请求描述中链接到 specs/[feature]/spec.md
+对规范进行版本控制： 每个 spec.md 文件都包含 Status 和 Version 标头，以便于审计。
+完成后归档： 功能发布后，将已完成的规范移至 specs/archive/ 目录。
+如果将规范视为实施后即可丢弃的东西，那就违背了规范的初衷——规范将成为未来变更、引入和偏差检测的真理来源。
+安全加固方面、调用API性能速度延迟方面包括就是说用户使用体验和产品真实的落地功能等等那些你这些都要好好解决，并且就是说这个要解决高并发、低延迟、多任务、等等一些可能遇到的瓶颈和bug之类的
+如遇到一些必要实测的项目才能保证完整真实落地闭环的功能、UI、UX前后端逻辑衔接等等之类的，你可以手动E2E去运行项目实测，这个意思大概能理解吧？然后呢同时标记等等也要记录等等之类的。下次遇到这块的话先识别标记在检查是否有改动日志等等记录在决定要不要真实的手动e2e实测，在真实的实测情况下需要保证用户的使用体验、性能、视觉体验、完美的逻辑，人性化的UI\UX细节操作等，完整的落地验证单元测试率、代码全项目全库的测试覆盖率、以及就是每个按钮组件UI\UX、前后端衔接的E2E、逻辑线、连结性等方面，反正很多方面，你是全栈工程师的同时又是高级saas产品经理，一定要站在用户角度、开发人员的角度去反思沉淀、沉炼好所有功能模块、UI\UX、前后端、包括数据库的查询优化、整个工作流的逻辑线跑通性、包括所有代码库的深度全面了解、清楚瓶颈、反人性的点，该怎么去优化，测验、跑通闭环落地，很多时候你没有具体完整详细的知识数据，那么你就必须擅长联网搜索最新的教程、案例、方法去不断学习提升自己解决问题的能力、实际业务程序应用开发真实落地的闭环、交付的闭环
+比如有时候你要深度在仔细一点，比如说有时候e2e单纯的加载测试时长肯定是没用的，有些时候代码逻辑细节bug了，然后呢你又没深度去扫描去检查，所以说你一直反复增加时长等等重试次数这样根本解决不了问题，所以说需要学会逆向思维，做到我这次单测、e2e、跑不通是不是代码细节的问题呢？前后端的衔接呢？这个区域模块代码的衔接等等之类的有没有毛病呢？要持续学习反思，从bug中去逆向思维自己的方式方案方法，并不是一味地相信代码没毛病，其实有时候你也可能会出错你就需要及时纠偏纠错，保证下次不再出现这种错误bug等等之类的
+代码的质量、算法、性能、衔接、划分管理、模块细致化、UI、UX的完美美观符合人性体验使用、等还有很多方面你都要完整完美完善落地闭环
+你不要依赖文档的说明，有时候更新了某某东西没有即时写入文档所以就会导致出现那种过时文档等等之类的，那么你去读文档的话那么这就会导致你的错误判断从而一直返工。这边建议你直接读代码直接读逻辑直接全面审查就行了，文档到时候任务完成后记得更新就行了。你不能靠单一的信息来源从而判断这个项目的优秀完美，你可以在核心的功能上面去主动挑刺然后呢优化改进迭代修复
+当然肯定有其他任务应该也没落实清楚的，需要你也一并解决，不过你的这个解决效率能力要提升，比如说批量并行去解决等等之类的，不要一个一个做这样磨洋工，按照你的真实能力你完全可以达到很好的管理的，我相信你是一个顶级优秀的全栈工程师
+不要任何演示模式等等的啦，你是saas产品经理，你知道无需就是说给用户一些高级的名词等等的展示以及暴露我们的上游提供商。这样我们就没办法赚钱了，这样他们就会直接去买上游的了，我们就没办法赚取差价等等之类的啦。
+E2E一定不要跑全量的，就算你增量跑的话也不能一下子跑十几个，你自己好好看看时间成本吧，比如说这次跑完了这个E2E跑通了功能等等那些的话那么这整体你可以打个标记，这样子下次直接优先读取标记然后呢在进行跑那些没完成的或者没标记的，这样的话能给开发者带来很快效率的开发时间成本，然后呢就是说有件事你要深刻记住，比如说有些功能你其实已经做得很完美已经跑通了，但是呢就是差这个交付，那么你可以自行跑一下E2E真实的网络API调用，给自己定一个范围，比如说两次真实调用的机会，不要全用完，我们肯定是希望你只用到一次就能解决问题了。然后呢跑完也要标记，下次开始前优先读标记，这样就不用反复烧钱了。上面的mock也要这样做，mock虽然说不烧钱，但是你增量一次跑十几个的话是没关系的，但是呢就是重在没有标记，不清楚哪些跑完哪些没跑完的。这个意思大概能了解了吧？有些其实已经跑完的但是你反复还在重新跑，这样带来的开发时间成本就很大
+
+
+

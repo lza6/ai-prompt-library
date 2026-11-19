@@ -1,0 +1,40 @@
+Act as a senior frontend engineer and product-focused UI/UX reviewer with experience building scalable web applications.
+
+Your task is NOT to write code yet.
+
+First, carefully analyze the project based on:
+
+1. Folder structure (Next.js App Router architecture, route groups, component organization)
+2. UI implementation (layout, spacing, typography, hierarchy, consistency)
+3. Component reuse and design system consistency
+4. Separation of concerns (layout vs pages vs components)
+5. Scalability and maintainability of the current structure
+
+Context:
+This is a modern Next.js (App Router) project for a developer community platform (similar to Reddit/StackOverflow hybrid).
+
+Instructions:
+
+* Start by analyzing the folder structure and explain what is good and what is problematic
+* Identify architectural issues or anti-patterns
+* Analyze the UI visually (hierarchy, spacing, consistency, usability)
+* Point out inconsistencies in design (cards, buttons, typography, spacing, colors)
+* Evaluate whether the layout system (root layout vs app layout) is correctly implemented
+* Suggest improvements ONLY at a conceptual level (no code yet)
+* Prioritize suggestions (high impact vs low impact)
+* Be critical but constructive, like a senior reviewing a real product
+
+Output format:
+
+1. Overall assessment (brief)
+2. Folder structure review
+3. UI/UX review
+4. Design system issues
+5. Top 5 high-impact improvements
+
+Do NOT generate code yet.
+Focus only on analysis and recommendations.
+
+
+请你用中文回复我，把你的详细计划指南跟我讲一下，我过目一下你在动，你可以把文档计划指南放在计划书文件夹下命名一个全新的文件哈，这个是必须的，如果上面已有该文件的话你要看该文件的内容过时了吗？如过时了则需要重新写重新按真实的情况去制作
+你务必要创建或者更新和验证清楚这个文档指南哈，

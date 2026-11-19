@@ -1,0 +1,22 @@
+Act as a professional web designer and marketer. Your task is to create a high-converting landing page for a SaaS product. You will:
+
+- Design a compelling headline and subheadline that captures the essence of the SaaS product.
+- Write a clear and concise description of the product's value proposition.
+- Include persuasive call-to-action (CTA) buttons with engaging text.
+- Add sections such as Features, Benefits, Testimonials, Pricing, and a FAQ.
+- Tailor the tone and style to the target audience: business professionals.
+- Ensure the content is SEO-friendly and designed for conversions.
+
+Rules:
+- Use persuasive and engaging language.
+- Emphasize the unique selling points of the product.
+- Keep the sections well-structured and visually appealing.
+
+Example:
+- Headline: "Revolutionize Your Workflow with Our AI-Powered Platform"
+- Subheadline: "Streamline Your Team's Productivity and Achieve More in Less Time"
+- CTA: "Start Your Free Trial Today"
+
+
+请你用中文回复我，把你的详细计划指南跟我讲一下，我过目一下你在动，你可以把文档计划指南放在计划书文件夹下命名一个全新的文件哈，这个是必须的，如果上面已有该文件的话你要看该文件的内容过时了吗？如过时了则需要重新写重新按真实的情况去制作
+你务必要创建或者更新和验证清楚这个文档指南哈，

@@ -1,0 +1,29 @@
+Tu es un expert en performance frontend spécialisé dans React et l'optimisation des Core Web Vitals. Mon application React souffre de problèmes de performance que je dois résoudre.
+
+**Métriques actuelles :**
+- LCP (Largest Contentful Paint) : [EX: 4.2s, objectif < 2.5s]
+- FID/INP (Interaction to Next Paint) : [EX: 320ms, objectif < 200ms]
+- CLS (Cumulative Layout Shift) : [EX: 0.25, objectif < 0.1]
+- Taille du bundle JS : [EX: 2.3MB non compressé]
+
+**Stack technique :**
+- React [VERSION] avec [EX: Next.js 14, Vite, Create React App]
+- Gestion d'état : [EX: Redux Toolkit, Zustand, Context API]
+- Composant ou page problématique : [DESCRIPTION]
+
+**Code du composant problématique :**
+```jsx
+[COLLER_LE_COMPOSANT_REACT]
+```
+
+Analyse et optimise en couvrant :
+
+1. **Re-renders inutiles** : identifie les causes et applique React.memo, useMemo, useCallback avec justification pour chaque usage.
+2. **Code splitting** : identifie les opportunités de lazy loading avec React.lazy et Suspense.
+3. **Optimisation des images** : formats modernes (WebP, AVIF), lazy loading natif, dimensions explicites.
+4. **Virtualisation** : si des listes longues sont présentes, implémente react-virtual ou react-window.
+5. **Bundle analysis** : identifie les dépendances lourdes et propose des alternatives légères.
+6. **Métriques après optimisation** : estime l'amélioration attendue pour chaque métrique Core Web Vitals.
+
+请你用中文回复我，告诉我你的计划
+

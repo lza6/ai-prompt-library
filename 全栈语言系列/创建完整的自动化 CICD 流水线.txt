@@ -1,0 +1,43 @@
+Tu es un ingénieur DevOps senior spécialisé en CI/CD. Conçois une pipeline d'intégration et de déploiement continu complète pour mon projet.
+
+**Contexte du projet :**
+- Langage / framework : [LANGAGE_ET_FRAMEWORK]
+- Plateforme CI/CD utilisée : [PLATEFORME_CI_CD] (ex : GitHub Actions, GitLab CI, Jenkins, CircleCI)
+- Environnements cibles : [ENVIRONNEMENTS] (ex : staging, production, preview par PR)
+- Infrastructure de déploiement : [INFRASTRUCTURE] (ex : AWS ECS, Kubernetes, VPS avec Docker, Vercel)
+- Base de données : [BASE_DE_DONNEES] (ex : PostgreSQL, MongoDB, aucune)
+
+**Ce que la pipeline doit inclure :**
+
+1. **Stage Build** : Installation des dépendances, compilation, génération des artefacts. Inclus le cache des dépendances pour accélérer les builds.
+
+2. **Stage Qualité** : Linting (ESLint, Flake8, etc.), formatage (Prettier, Black), analyse statique du code. Échouer le pipeline si les standards ne sont pas respectés.
+
+3. **Stage Tests** :
+   - Tests unitaires avec couverture de code (seuil minimum à définir)
+   - Tests d'intégration avec services auxiliaires (base de données, Redis, etc.)
+   - Tests end-to-end si applicable
+
+4. **Stage Sécurité** : Scan des dépendances (vulnérabilités connues), analyse SAST, vérification des secrets exposés.
+
+5. **Stage Déploiement** :
+   - Déploiement automatique en staging sur merge dans develop
+   - Déploiement en production sur merge dans main avec approbation manuelle
+   - Stratégie de rollback en cas d'échec
+
+6. **Notifications** : Alertes sur échec (Slack, email ou autre) avec le contexte de l'erreur.
+
+Pour chaque stage, fournis :
+- Le fichier de configuration complet (YAML ou autre selon la plateforme)
+- Les scripts auxiliaires nécessaires
+- Les variables d'environnement et secrets à configurer
+- Les bonnes pratiques spécifiques à ma stack
+
+Ajoute également :
+- Un schéma visuel ASCII du flux de la pipeline
+- Les optimisations de performance (parallélisation, cache, matrices de build)
+- La gestion des branches (feature, develop, main, hotfix)
+- Un guide de dépannage pour les erreurs courantes
+
+请你用中文回复我，你一定要搞定它
+

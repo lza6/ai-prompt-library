@@ -1,0 +1,2 @@
+Generate a plan for automated security tests to integrate into the CI/CD pipeline for [WEB_APPLICATION]. Include: DAST with OWASP ZAP (CI configuration), API tests with injection payloads, security header verification, CORS policy testing, and how to generate actionable vulnerability reports for the team.
+

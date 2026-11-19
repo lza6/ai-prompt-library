@@ -1,0 +1,47 @@
+Tu es un architecte backend senior spécialisé en systèmes distribués et en optimisation de performance. Conçois un système de cache Redis complet pour mon application.
+
+## Contexte technique
+- **Langage / Framework** : [LANGAGE_ET_FRAMEWORK] (ex : Node.js/Express, Python/FastAPI, Java/Spring Boot)
+- **Type d'application** : [TYPE_APPLICATION] (ex : e-commerce, SaaS multi-tenant, API publique, réseau social)
+- **Base de données principale** : [BASE_DE_DONNEES] (ex : PostgreSQL, MongoDB, MySQL)
+- **Volume estimé** : [NOMBRE_REQUETES_PAR_SECONDE] requêtes/seconde en pic
+- **Infrastructure** : [INFRASTRUCTURE] (ex : AWS ElastiCache, Redis auto-hébergé, Docker Compose, Kubernetes)
+
+## Ce que je veux
+
+1. **Architecture du cache** :
+   - Propose une stratégie de cache adaptée (Cache-Aside, Read-Through, Write-Through, Write-Behind) en justifiant ton choix
+   - Définis la structure des clés Redis avec un naming convention clair (préfixes, séparateurs, versioning)
+   - Recommande les structures de données Redis appropriées (String, Hash, Set, Sorted Set, Stream) pour chaque type de donnée à cacher
+
+2. **Implémentation complète** :
+   - Écris une classe/module de cache réutilisable avec : connexion (pool), get, set, delete, invalidation par pattern
+   - Implémente le pattern Cache-Aside avec gestion du cache stampede (mutex/lock)
+   - Ajoute un mécanisme de sérialisation/désérialisation (JSON, MessagePack ou Protocol Buffers)
+   - Gère les erreurs gracieusement : si Redis tombe, l'application doit continuer à fonctionner (circuit breaker)
+
+3. **Stratégie d'invalidation** :
+   - Définis des TTL adaptés par type de ressource (données chaudes vs froides)
+   - Implémente l'invalidation par tags/groupes (ex : invalider tout le cache d'un utilisateur)
+   - Propose un mécanisme de cache busting pour les déploiements
+   - Gère la cohérence cache/base de données avec un pattern événementiel si pertinent
+
+4. **Patterns avancés** :
+   - Rate limiting basé sur Redis (sliding window)
+   - Cache distribué avec Redis Cluster ou Sentinel (si pertinent pour le volume)
+   - Mise en cache de sessions utilisateur
+   - Cache de résultats de requêtes complexes avec invalidation intelligente
+
+5. **Monitoring et observabilité** :
+   - Métriques à suivre : hit ratio, latence, mémoire utilisée, évictions
+   - Intègre un système de logging des opérations cache (hit/miss/error)
+   - Propose une configuration d'alertes
+
+6. **Configuration Redis** :
+   - Fichier redis.conf optimisé pour mon cas d'usage
+   - Politique d'éviction recommandée (allkeys-lru, volatile-ttl, etc.)
+   - Configuration mémoire et persistence (RDB/AOF)
+
+Fournis le code complet, commenté, avec des tests unitaires pour les composants critiques. Inclus un fichier Docker Compose pour l'environnement de développement avec Redis.
+
+

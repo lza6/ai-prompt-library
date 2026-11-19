@@ -1,0 +1,127 @@
+---
+name: apk-2api-reverse
+description: Android APK 逆向 → 上游协议还原 → 2api demo 服务交付的完整工作流。当用户发来一个 APK 文件（或提到某 App 的 2api/逆向/渠道接入）时使用。
+---
+
+# APK → 2API 逆向交付 SOP
+
+已实战验证 5+ 次（NoTrackAI / OpenChat / tryingopen / Phota3A-videomate 等）。
+
+## 阶段 0: 召回与准备
+1. `icm.exe recall "<app名> 逆向 2api"` — 查历史会话记忆
+2. `icm.exe memoir show apk-2api-sop` — 查方法论知识库
+3. 建工作目录 `D:/apk-analysis/<app名>/`，复制 APK 进去并解压
+4. jadx 位置: `D:/tools/jadx/bin/jadx.bat`（`--no-res -j 8` 先反编译源码，res 单独跑）
+
+## 阶段 1: 静态侦察（不等 jadx，先做）
+- 解压 APK 后用 `tr -c '[:print:]' '\n'` 抽 dex 字符串 → grep URL/路径
+- 重点找: API host、端点路径（createTask/queryTask/upload 等）、`sign`/`token`/`md5` 关键字
+- assets/config/*.json 常有内置工具目录/参数
+
+## 阶段 2: 鉴权还原（核心）
+常见模式（按出现频率）:
+1. `sign = md5(signKey + timeStamp)` — signKey 硬编码或 DES/AES 加密藏在初始化代码
+2. DES 密钥常量搜 `DES_KEY`/`SecretKeySpec`；IV 常是 0123456789ABCDEF 变体
+3. 密文 Base64 常量 → 找解密调用点（app Application 初始化里）→ Python 复现解密
+4. 用 Python pycryptodome 解出 key 后**立即实测上游**：错误参数返回业务码（而非 auth fail）= 签名通过
+
+## 阶段 3: 链路实测
+- 逐端点 curl 探测：先只读 query 类（轻量、无副作用），再 create 类
+- 异步任务型: createTask → taskId → queryTask 轮询（`until ... grep` 循环 + run_in_background）
+- multipart 上传端点通常和 create 分离，先打通上传拿 URL
+- **计费墙判定**: 参数全对却返回 credit/invalid user 类业务码 → 立即停止盲试，转动态抓包（不要浪费几十次调用）
+
+## 阶段 4: 交付
+1. `demo_server.py`（Flask）: /health + /v1/* 封装 + /原生命令透传，端口避免 8901/8902 常用冲突
+2. `demo.html` 中文 demo 页（原生测试 + 业务流程）
+3. `stress_test.py`（基线/边界值/并发三场景，参考 D:/tools/notrack-stress.py）
+4. `逆向报告.md`（鉴权链/端点面谱/errCode 观测/剩余墙）
+5. 推 GitHub `lza6/<app>-2api-app`，配中文 description + topics
+6. ICM store + memoir add-concept（协议/坑/模式各一条）
+
+## 已知坑
+- Git Bash 的 `date +%s%3D` 不给毫秒（会拼出日期），用 `date +%s` 秒级并确认上游预期
+- Bash `UID` 是只读变量，用 `USERID`/`U` 等命名
+- curl 走本地代理 10808，需 `--ssl-no-revoke`（schannel 吊销检查离线报错）
+- 8901/8902 端口可能被旧 demo 占用，先 netstat 查
+- pip 缺 flask 时 demo 起不来：先装再启动
+- jadx 全量 25k 类约 10 分钟，先用 dex 字符串侦察并行推进
+
+## 知识库
+- Memoir: `apk-2api-sop`（协议/坑/模式概念图）
+- 本 skill 配合 OpenChat 项目记忆中的 Android SDK 模拟器路线做动态抓包
+
+---
+
+## 动态分析补充（nano-banana-trip + RemakeFace 三轮实战沉淀 2026-10-27）
+
+### 模拟器环境（D:/android-sdk，直接复用）
+- 现成 AVD：`openchat`(API30) / `remakeface`(API33)，emulator-5554 常驻
+- frida-server 17.24.3：`/data/local/tmp/fs17`，`su 0 sh -c 'nohup /data/local/tmp/fs17 >/dev/null 2>&1 &'`
+- 装机前先巡检灰产：`pm list packages`，见 `com.blackhole.*`（C2 后门，会卸你的目标 app）、`org.greatfire.gfvpn`（弹 VPN）→ `pm uninstall -k --user 0 <pkg>`
+- 权限弹窗一律 `pm grant` 批量绕过，不点 UI
+- adb 路径参数必须 `MSYS_NO_PATHCONV=1`（/sdcard 会被 Git Bash 转成 C:/Program Files/Git/sdcard）
+
+### Frida 17 规程
+- **python API 无 Java bridge**（`typeof Java === undefined`），CLI 有 → hook+触发全部走 CLI 单脚本（尾部 `setTimeout` 自执行），弃 python 驱动
+- API 变化：`Module.getExportByName/findExportByName` 已移除 → `Process.getModuleByName("libc.so").findExportByName(name)`
+- attach 用 PID（进程名被改时按包名 `pidof` 拿）；进程被冻结（`do_freezer_trap`）时 attach 超时，先 `am start` 前台化
+- **spawn 模式慎用**：会触发 native SDK 的 NetWorkSender 栈溢出（SEGV_ACCERR in frida-agent），一律 attach
+- hook 面最小化：不碰 Conscrypt socket（同上崩溃），Java 层只 hook ws 帧/回调/native libc 三类
+
+### native 层抓协议（SDK 自研网络时）
+```
+hook 点: getaddrinfo（直接传 IP 的=绕DNS直连）+ syscall(nr==42 connect) + write(fd, 0x16 0x03=TLS ClientHello)
+```
+- libssl.so 无导出可 hook = TLS 静态链接进 SDK so，只能 fd 层抓密文/握手特征
+- ClientHello 的 SNI 是明文，抓到即得真实 endpoint
+
+### 讯飞 SparkChain 专项（已还原）
+- 凭据两套来源：APK 硬编码（Application/App.java）+ 服务器下发（`findConfig` 返回 RSA 加密，PKCS1v15，私钥内嵌 `RsaUtils.java`）——**服务器那套通常权限更全，优先挖**
+- HTTP 开放平台（spark-api-open.xf-yun.com）直测：`Authorization: Bearer apiKey:apiSecret`
+- 错误码：11200=无HTTP权限 / 11201=AppIdNoEnoughLicence（license 配额耗尽，`tti`=text-to-image；硬编码共享凭据被全网 mod 用户打光是常态，图像 SDK 通道基本死）
+- SDK 网络层 native 静态 TLS 直连 IP，websocket 协议抓包价值有限——先判定 license 是否还有效再投入
+
+### 逆向产出物入库清单（每个项目固定）
+1. `demo_server.py` / `demo.html` / `stress_test.py`（压测 timeout 要匹配上游真实延迟，如星火 1.7s+ 需 60s）
+2. `hook_*.js`（静态 hook）+ `trigger_*.js`（RPC 主动触发）+ `native_probe*.js`（native 层）
+3. `server_creds.json`（服务器下发凭据）+ `ws_capture.json`（抓帧记录）
+4. ICM store（结论）+ memoir add-concept（协议/坑/模式各一条）+ 本文档追加新坑
+
+## 知识库
+- Memoir: `apk-2api-sop`（25+ 概念：协议/坑/模式）
+- ICM topic: `context-apk-reverse`（每个 app 的会话结论）
+- 本文档：`Desktop/编码规则/APK逆向2API工作流.txt`
+
+
+## [2026-10-27] 黑洞加速器案例补遗：模拟器 vs 壳的边界
+
+**x86_64 模拟器 + 加固壳 = 时间黑洞**（实证 40+ boot 全败）：
+- libndk_translation 对 guest 代码页自维护 W^X，壳的 native inline-hook 必 SIGSEGV
+- mprotect / MAP_FIXED remap / RWX unlock 全部绕不过；spawn+frida 又与壳的 verifier hook 互斥
+- 教训：**静态脱壳（code_cache 落盘 / frida memory dump）在模拟器上做；动态 hook 上真机**
+- 成功脱壳路径：app 正常启动一次（哪怕马上崩），壳已把 dex 落盘 code_cache/*.zip，adb 直接拉
+
+**PHP debug 端点探测**（新必做步骤）：
+- 对发现的 API 端点穷举 query 参数（var/debug/key/test/appid/url/token）
+- 响应出现 `string(N) "..."` = var_dump 泄露 = 服务端 sign/key 锚点白送
+
+**推荐 frida hook 组合**（壳类 app 通用起手式）：
+```js
+// 1. 反自杀（Java+libc 双层）→ 2. SecretKeySpec/Cipher.doFinal 全局抓 key → 3. 业务类方法 hook
+```
+
+
+## Cloudi AI 案例（leansoft 二包+同厂互杀, 2026-10-28/29）
+- 仓库: github.com/lza6/Cloudi-AI-APP-2api | 分析目录: D:/apk-analysis/cloudi/
+- 新增方法论:
+  1. Firebase Remote Config 提取链 (Installations API→RC fetch), 2API 启动自动跟随密钥轮换
+  2. capstone 静态还原 native 签名三板斧 (JNI 反汇编→PLT GOT→rodata 断言串/立即数)
+  3. 时间窗 token 格式: b64(AES-256-CBC("ts||pkg||ts+60"))
+  4. 同厂兄弟包互杀: 模拟器多装同厂 app 会 deletePackageX 互删, pm disable-user + daemon spawn 冻结
+  5. frida spawn-gating daemon 模式 (python API, 自动 attach 新进程)
+  6. app-classloader 定向 hook: enumerateClassLoadersSync + ClassFactory.get(appLoader)
+  7. frida-server 版本矩阵: python 17.x 无 Java bridge, 必须 frida==16.5.9+fs16
+  8. x86_64 模拟器 frida Java hook 长会话必崩 (ndk_translation W^X) → 真机路线
+  9. 代理质量分层: 免费池过不了 CF, v2ray/住宅级可; 直连 IP 被拉黑后挂出口即恢复
+  10. pairip licensecheck bypass 套装 (suspended 模式)

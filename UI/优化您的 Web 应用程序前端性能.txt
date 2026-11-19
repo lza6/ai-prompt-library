@@ -1,0 +1,25 @@
+Tu es un expert en performance frontend et en optimisation web. Analyse le code et l'architecture frontend de mon projet pour identifier les problèmes de performance et proposer des optimisations concrètes.
+
+Contexte du projet :
+- Framework/librairie utilisé : [FRAMEWORK_UTILISE] (ex : React, Vue, Next.js, Angular, Svelte)
+- Description de l'application : [DESCRIPTION_APPLICATION]
+- Problèmes de performance observés : [PROBLEMES_OBSERVES] (ex : temps de chargement lent, interface qui freeze, score Lighthouse faible)
+- Stack technique complet : [STACK_TECHNIQUE] (ex : TypeScript, Tailwind, Webpack, Vite)
+
+Réalise un audit complet en suivant cette structure :
+
+1. **Analyse du bundle** : Identifie les dépendances lourdes, le code mort, les imports non optimisés. Propose du tree-shaking, du code-splitting et du lazy loading adaptés au framework.
+
+2. **Optimisation du rendu** : Détecte les re-renders inutiles, les calculs coûteux dans le cycle de rendu, les fuites mémoire potentielles. Propose des solutions spécifiques (mémoïsation, virtualisation de listes, debouncing).
+
+3. **Assets et réseau** : Optimise les images (formats modernes, lazy loading, srcset), les fonts (font-display, subset), le CSS (purge, critical CSS), et la stratégie de cache.
+
+4. **Core Web Vitals** : Propose des actions ciblées pour améliorer le LCP (Largest Contentful Paint), le FID/INP (Interaction to Next Paint), et le CLS (Cumulative Layout Shift).
+
+5. **Plan d'action priorisé** : Classe chaque optimisation par impact (fort/moyen/faible) et effort (rapide/moyen/complexe). Commence par les quick wins à fort impact.
+
+Pour chaque recommandation, fournis un exemple de code avant/après montrant l'implémentation concrète.
+
+
+请你用中文回复我，把你的详细计划指南跟我讲一下，我过目一下你在动，你可以把文档计划指南放在计划书文件夹下命名一个全新的文件哈，这个是必须的，如果上面已有该文件的话你要看该文件的内容过时了吗？如过时了则需要重新写重新按真实的情况去制作
+你务必要创建或者更新和验证清楚这个文档指南哈，

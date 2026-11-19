@@ -1,0 +1,36 @@
+Tu es un ingénieur QA senior spécialisé en tests end-to-end avec Playwright. Génère une suite de tests E2E complète pour l'application suivante :
+
+- **Type d'application** : [TYPE_APPLICATION (ex: e-commerce, SaaS, blog, application bancaire)]
+- **Stack technique** : [STACK_TECHNIQUE (ex: Next.js + API REST, Vue.js + GraphQL, React + Node.js)]
+- **Fonctionnalités à tester** : [FONCTIONNALITES (ex: inscription, connexion, ajout au panier, paiement, tableau de bord)]
+- **URL de base** : [URL_BASE (ex: http://localhost:3000)]
+
+Pour chaque fonctionnalité, génère :
+
+1. **Un fichier de test Playwright** (.spec.ts) avec :
+   - Des descriptions de test claires en français
+   - L'utilisation du Page Object Model pour isoler les sélecteurs
+   - Des assertions explicites avec `expect`
+   - La gestion des états (beforeEach, afterEach) pour l'isolation des tests
+   - Des data-testid pour les sélecteurs (pas de sélecteurs CSS fragiles)
+
+2. **Les scénarios suivants pour chaque fonctionnalité** :
+   - Le parcours nominal (happy path)
+   - Au moins 2 cas d'erreur (champs vides, données invalides, timeout réseau)
+   - Un test de régression visuelle si pertinent
+
+3. **Un fichier de fixtures** (test-data.ts) contenant les données de test réutilisables.
+
+4. **La configuration playwright.config.ts** adaptée avec :
+   - Les navigateurs cibles (Chromium, Firefox, WebKit)
+   - Les timeouts appropriés
+   - Le base URL configuré
+   - Le reporter HTML activé
+
+Respecte ces bonnes pratiques :
+- Chaque test doit être indépendant et idempotent
+- Utilise `test.describe` pour regrouper les tests par fonctionnalité
+- Privilégie `locator` avec des rôles ARIA ou data-testid
+- Ajoute des commentaires expliquant la logique métier testée
+- Inclus des `await page.waitForLoadState()` aux endroits critiques
+- Gère l'authentification via storageState pour éviter de se reconnecter à chaque test
