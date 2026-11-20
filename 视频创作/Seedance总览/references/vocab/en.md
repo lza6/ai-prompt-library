@@ -92,6 +92,6 @@ A blocked result alone does not establish a false positive or reveal a trigger w
 | `blow up the image` means increasing its display size | `enlarge the image`; do not invent a new framing or output resolution |
 | `dead silence` refers to sound | Preserve the requested sound state. Ask only if it matters whether the user means a muted track or quiet ambience; do not automatically add room tone |
 
-Assess identity, consent, age, harm and other relevant context through [seedance-filter](../../skills/seedance-filter/SKILL.md) or the applicable rights route. A topic label is a reason to assess context, not proof that the request is prohibited or that a synonym will make it permissible. If the underlying request is prohibited, refuse it and offer a legitimate alternative only where appropriate.
+Assess identity, consent, age, harm and other relevant context through seedance-filter or the applicable rights route. A topic label is a reason to assess context, not proof that the request is prohibited or that a synonym will make it permissible. If the underlying request is prohibited, refuse it and offer a legitimate alternative only where appropriate.
 
 Load [filter-vocab](../filter-vocab.md) to distinguish clarification from content changes, and [anti-slop-lexicon](../anti-slop-lexicon.md) for editorial vocabulary guidance. No rewrite promises acceptance or authorizes another generation attempt.

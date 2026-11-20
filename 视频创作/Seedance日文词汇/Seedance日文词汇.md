@@ -20,7 +20,7 @@ metadata:
 
 # seedance-vocab-ja
 
-Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../../references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
+Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../Seedance总览/references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
 
 Use Japanese cinematic vocabulary when the user asks for Japanese prompt wording, bilingual delivery, compact translation, or production vocabulary for camera, lighting, motion, VFX, and audio. Preserve actual reference tags exactly; their spelling is independent of the prompt language.
 
@@ -48,11 +48,11 @@ Prefer concise production Japanese over literal translation. Keep the structure 
 
 ## Register Rule
 
-Preserve user-supplied dialogue. When drafting or adapting speech, load Register (文体) in [the vocabulary guide](../../references/vocab/ja.md) and keep the relationship and intended tone explicit. Offer register choices only where they affect the brief. Measure the actual spoken line; do not use a fixed multiplier or change politeness to fit an invented sync budget. Record any unresolved locale-review need.
+Preserve user-supplied dialogue. When drafting or adapting speech, load Register (文体) in [the vocabulary guide](../Seedance总览/references/vocab/ja.md) and keep the relationship and intended tone explicit. Offer register choices only where they affect the brief. Measure the actual spoken line; do not use a fixed multiplier or change politeness to fit an invented sync budget. Record any unresolved locale-review need.
 
 ## De-Slop Rule
 
-When an adjective leaves the intended shot unclear, load Slop Traps in [Japanese vocabulary](../../references/vocab/ja.md). Preserve a useful style or aesthetic term and add only the scene-specific action, framing, light, or sound needed to clarify it. The table offers authored options, not a default look or a proven model-performance rule. Keep the user's chosen energy, dialogue, reference tags, and settings. Offer distinct choices only when the ambiguity changes the scene; if the user delegated the choice, decide within that scope.
+When an adjective leaves the intended shot unclear, load Slop Traps in [Japanese vocabulary](../Seedance总览/references/vocab/ja.md). Preserve a useful style or aesthetic term and add only the scene-specific action, framing, light, or sound needed to clarify it. The table offers authored options, not a default look or a proven model-performance rule. Keep the user's chosen energy, dialogue, reference tags, and settings. Offer distinct choices only when the ambiguity changes the scene; if the user delegated the choice, decide within that scope.
 
 ## Output Contract
 

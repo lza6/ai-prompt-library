@@ -20,7 +20,7 @@ metadata:
 
 # seedance-filter
 
-Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../../references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
+Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../Seedance总览/references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
 
 ## Intent
 
@@ -36,7 +36,7 @@ This skill clarifies benign requests; it does not disguise prohibited content or
 2. Assess the underlying content. Ask only for missing context that materially affects the boundary or requested output; do not turn a complete benign brief into another interview.
 3. For an ambiguous phrase with a known benign meaning, clarify that meaning faithfully. Preserve exact dialogue, reference tokens, authorized roles, sound, framing and settings unless their revision was requested.
 4. If a proposal removes or replaces content, describe that change and offer it as an alternative, or draft within the user's already delegated scope. Do not label a different scene an equivalent wording repair or claim that adding “prop”, “original” or “authorized” establishes those facts.
-5. Do not promise acceptance or submit repeated synonym probes. A text revision is not authorization for an upload, retry, provider change or spending. Follow the user's budget and [retake protocol](../../references/retake-protocol.md).
+5. Do not promise acceptance or submit repeated synonym probes. A text revision is not authorization for an upload, retry, provider change or spending. Follow the user's budget and [retake protocol](../Seedance总览/references/retake-protocol.md).
 
 ## Boundary Rule
 
@@ -44,7 +44,7 @@ When context is uncertain, state what is unresolved. When content is prohibited,
 
 Face-limit or portrait-verification workarounds are not safe prompt tricks. If a surface offers sanctioned virtual portrait, trusted model-output, or authorization asset flows, route the user to those current official paths instead of evasion language.
 
-Load [filter-vocab](../../references/filter-vocab.md) for conditional wording examples and clearly labeled content alternatives. Load [multilingual-community-examples](../../references/multilingual-community-examples.md) only when a benign clarification needs those language patterns; do not treat them as evidence of acceptance or permission.
+Load [filter-vocab](../Seedance总览/references/filter-vocab.md) for conditional wording examples and clearly labeled content alternatives. Load [multilingual-community-examples](../Seedance总览/references/multilingual-community-examples.md) only when a benign clarification needs those language patterns; do not treat them as evidence of acceptance or permission.
 
 ## Output Contract
 

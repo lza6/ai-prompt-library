@@ -305,7 +305,7 @@ POST host multipart: success_action_status/policy/x-oss-signature/x-oss-signatur
 ## PhotoFlux AI / imggen81 (2026-10-28) ✅ 全链路破译
 
 **APK**: `AI_Image_Generator_81.0_xs_fixed.apk` · `com.technosub.unlimitedaiimagen` · pairip 加固 + ApkSignatureKillerEx
-**完整报告**: [APK逆向知识库/PhotoFlux-imggen81-逆向报告.md](APK逆向知识库/PhotoFlux-imggen81-逆向报告.md) · GitHub: lza6/imggen81-app-2api
+**完整报告**: 《PhotoFlux-imggen81 逆向报告》（见 编码规则/APK逆向知识库） · GitHub: lza6/imggen81-app-2api
 
 ### 核心协议（模拟器动态分析确认）
 

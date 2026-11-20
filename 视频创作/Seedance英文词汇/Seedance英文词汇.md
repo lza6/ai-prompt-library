@@ -21,7 +21,7 @@ metadata:
 
 # seedance-vocab-en
 
-Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../../references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
+Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../Seedance总览/references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
 
 Use this skill when the user chooses English prompt wording. Concrete production language can make the intended scene easier to review; it is not a demonstrated cure for moderation errors. This repository has no matched evidence that English receives heavier moderation than other languages. Preserve actual reference tags exactly; their spelling is independent of the prompt language.
 
@@ -45,17 +45,17 @@ Use visible or audible detail when a phrase leaves a relevant production choice 
 
 ## De-Slop Pass
 
-Preserve the intended energy and useful style choices; clarify ambiguity and remove redundant praise in context. Do not turn every "cinematic" into a slow push-in or every "epic" into a crowd. Follow the [anti-slop lexicon](../../references/anti-slop-lexicon.md) for conditional repairs. Keep an explicit resolution target as a delivery requirement, using a supported setting when available and stating any gap. Prompt wording alone cannot guarantee output dimensions. Preserve exact dialogue, actual reference tokens, safety boundaries and chosen settings; respect decisions already delegated by the user.
+Preserve the intended energy and useful style choices; clarify ambiguity and remove redundant praise in context. Do not turn every "cinematic" into a slow push-in or every "epic" into a crowd. Follow the [anti-slop lexicon](../Seedance总览/references/anti-slop-lexicon.md) for conditional repairs. Keep an explicit resolution target as a delivery requirement, using a supported setting when available and stating any gap. Prompt wording alone cannot guarantee output dimensions. Preserve exact dialogue, actual reference tokens, safety boundaries and chosen settings; respect decisions already delegated by the user.
 
 ## Filter-Aware Wording
 
-For a blocked prompt, load [seedance-filter](../seedance-filter/SKILL.md) and assess the actual request before rewriting. A rejection alone does not establish a false positive or identify a trigger word. The examples in [filter-vocab](../../references/filter-vocab.md) clarify known benign meanings; they are not a tested trigger list or an approval guarantee. Do not invent ownership, consent, prop status or harmless intent. If an alternative changes the content, state that change and offer it as a choice; never disguise prohibited intent.
+For a blocked prompt, load [seedance-filter](../Seedance滤镜/Seedance滤镜.md) and assess the actual request before rewriting. A rejection alone does not establish a false positive or identify a trigger word. The examples in [filter-vocab](../Seedance总览/references/filter-vocab.md) clarify known benign meanings; they are not a tested trigger list or an approval guarantee. Do not invent ownership, consent, prop status or harmless intent. If an alternative changes the content, state that change and offer it as a choice; never disguise prohibited intent.
 
 ## Compact Pattern
 
 `@Image1 is the reference; keep identity, color, and shape unchanged. Only [motion/light/camera] changes. Camera: [one move]. Sound: [one cue]. Constraints: [lock].`
 
-Load [English vocabulary](../../references/vocab/en.md) for the full function-organized vocabulary, slop traps, and context-dependent wording examples. Load [anti-slop-lexicon](../../references/anti-slop-lexicon.md) for intent-preserving editorial guidance and [filter-vocab](../../references/filter-vocab.md) for the distinction between faithful clarification and a different content proposal.
+Load [English vocabulary](../Seedance总览/references/vocab/en.md) for the full function-organized vocabulary, slop traps, and context-dependent wording examples. Load [anti-slop-lexicon](../Seedance总览/references/anti-slop-lexicon.md) for intent-preserving editorial guidance and [filter-vocab](../Seedance总览/references/filter-vocab.md) for the distinction between faithful clarification and a different content proposal.
 
 ## Output Contract
 

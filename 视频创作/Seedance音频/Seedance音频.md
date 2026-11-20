@@ -21,11 +21,11 @@ metadata:
 
 # seedance-audio
 
-Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../../references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
+Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../Seedance总览/references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
 
 Use this for dialogue, lip-sync, sound layers, music, ambience, beat-sync, audio-reference mapping, desync troubleshooting, or sound-driven visual timing. Audio should support the visible beat instead of becoming a second competing prompt.
 
-Load [audio-guide](../../references/audio-guide.md) for the audio evidence boundary, dialogue timing, supported voice-reference options, beat-sync, desync repair, audio-reference conflicts, and multi-character workarounds. Load [audio-post-delivery](../../references/audio-post-delivery.md) when the user needs stems, M&E, dubbing, loudness, sync, mix, or delivery guidance.
+Load [audio-guide](../Seedance总览/references/audio-guide.md) for the audio evidence boundary, dialogue timing, supported voice-reference options, beat-sync, desync repair, audio-reference conflicts, and multi-character workarounds. Load [audio-post-delivery](../Seedance总览/references/audio-post-delivery.md) when the user needs stems, M&E, dubbing, loudness, sync, mix, or delivery guidance.
 
 ## Intent
 
@@ -35,7 +35,7 @@ Half of every emotion enters through the ears, and users almost always forget so
 
 Preserve the user's exact dialogue, language, script, and register. Quote each line and name its speaker. Stable framing and one speaker turn are useful starting heuristics when mouth accuracy matters; do not remove required performance or rewrite words without authorization. Check spoken duration and inspect the returned words, performance, and visible sync separately.
 
-Treat `@Audio1` as a reference for its assigned role. Use a spoken-voice workflow only when the active operation supports it, with rights-cleared material; do not promise exact playback or guaranteed lip-sync. Offer native generation, a supported reference workflow, and post dubbing with their tradeoffs. No universal Mandarin-first ranking or per-language line ceiling is established by this repository. See [audio-guide](../../references/audio-guide.md) for the scoped model-card evidence and [dialogue calibration](../../references/sync-budget-protocol.md) for an optional pilot within the user's existing take/spend authorization.
+Treat `@Audio1` as a reference for its assigned role. Use a spoken-voice workflow only when the active operation supports it, with rights-cleared material; do not promise exact playback or guaranteed lip-sync. Offer native generation, a supported reference workflow, and post dubbing with their tradeoffs. No universal Mandarin-first ranking or per-language line ceiling is established by this repository. See [audio-guide](../Seedance总览/references/audio-guide.md) for the scoped model-card evidence and [dialogue calibration](../Seedance总览/references/sync-budget-protocol.md) for an optional pilot within the user's existing take/spend authorization.
 
 ## Sound Layer Pattern
 
@@ -67,4 +67,4 @@ When sequence state is present, inherit completed dialogue, active dialogue, amb
 
 Return speaker map, quoted dialogue, sound layers, audio reference role, lip-sync constraints, post/delivery notes if needed, and a compact prompt-ready audio block.
 
-For worked examples with a chosen approach, copyable prompt, evidence boundary and failure checks, load [performance and dialogue cards](../../references/performance-example-cards.md). These are authored concepts, not observed generation results.
+For worked examples with a chosen approach, copyable prompt, evidence boundary and failure checks, load [performance and dialogue cards](../Seedance总览/references/performance-example-cards.md). These are authored concepts, not observed generation results.

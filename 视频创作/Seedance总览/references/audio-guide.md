@@ -44,7 +44,7 @@ Register changes character and wording. Choose it from the relationship and the 
 
 `@Audio1` can be used for rhythm, pacing, mood, voice tone, ambience, music texture, or beat timing. Do not promise exact audio playback unless the active platform documents exact playback behavior. If the source contains a real voice or recognizable song, treat it as authorization-sensitive and convert it into broad sonic descriptors when rights are unclear.
 
-A spoken-voice reference is an option only when the active operation supports the intended use. A reference-input feature alone does not promise verbatim playback or exact mouth motion. Compare the returned words, performance, and sync with the source. Use only your own recorded, licensed, or rights-cleared voice; route unclear real-person voice authorization through [seedance-copyright](../skills/seedance-copyright/SKILL.md). Post dubbing is a separate option when exact delivery matters.
+A spoken-voice reference is an option only when the active operation supports the intended use. A reference-input feature alone does not promise verbatim playback or exact mouth motion. Compare the returned words, performance, and sync with the source. Use only your own recorded, licensed, or rights-cleared voice; route unclear real-person voice authorization through [seedance-copyright](../../Seedance版权/Seedance版权.md). Post dubbing is a separate option when exact delivery matters.
 
 When an audio reference and video reference compete, silence or mute the video reference before upload when the audio should control timing. If the video must keep sound, state the priority: `@Video1 controls only camera/motion; @Audio1 controls tempo and energy`.
 

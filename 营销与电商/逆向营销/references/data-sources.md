@@ -69,13 +69,13 @@ Use whichever of these the user already has. Pick one for the curve and keep it 
 
 | Source | Monthly history | Keywords by URL | Backlinks and anchors | Access |
 |---|---|---|---|---|
-| [DataForSEO](../../../tools/integrations/dataforseo.md) | Historical rank overview | Ranked keywords | Backlinks summary, anchors | Pay per call; CLI in the repo |
-| [Semrush](../../../tools/integrations/semrush.md) | Organic traffic history | Organic positions | Backlinks, anchors | Subscription; MCP |
-| [Ahrefs](../../../tools/integrations/ahrefs.md) | Organic traffic history | Organic keywords | Referring domains, anchors | Subscription; MCP |
-| [Similarweb](../../../tools/integrations/similarweb.md) | Visits and traffic sources by month | Top keywords | - | Subscription |
-| [RankParse](../../../tools/integrations/rankparse.md) | - | - | Backlinks, tech stack | Pay per call |
+| ](../../tools/integrations/dataforseo.md) | Historical rank overview | Ranked keywords | Backlinks summary, anchors | Pay per call; CLI in the repo |
+| ](../../tools/integrations/semrush.md) | Organic traffic history | Organic positions | Backlinks, anchors | Subscription; MCP |
+| ](../../tools/integrations/ahrefs.md) | Organic traffic history | Organic keywords | Referring domains, anchors | Subscription; MCP |
+| ](../../tools/integrations/similarweb.md) | Visits and traffic sources by month | Top keywords | - | Subscription |
+| ](../../tools/integrations/rankparse.md) | - | - | Backlinks, tech stack | Pay per call |
 
-For tech stack beyond the page source, [TheirStack](../../../tools/integrations/theirstack.md) infers tools from job posts and also covers the hiring check. For news, funding, and mentions, [Exa](../../../tools/integrations/exa.md) searches the web by meaning. Multi-provider data gateways (one key, many vendors, billed per call) are listed in the [tools registry](../../../tools/REGISTRY.md).
+For tech stack beyond the page source, ](../../tools/integrations/theirstack.md) infers tools from job posts and also covers the hiring check. For news, funding, and mentions, ](../../tools/integrations/exa.md) searches the web by meaning. Multi-provider data gateways (one key, many vendors, billed per call) are listed in the ](../../tools/REGISTRY.md).
 
 ## AI Mentions and Citations
 
@@ -91,7 +91,7 @@ Use the prompt tracker the user has connected. It gives share of voice and citat
 
 ## Social Posts and Ad Libraries
 
-| Need | [ScrapeCreators](../../../tools/integrations/scrapecreators.md) | [Apify](../../../tools/integrations/apify.md) |
+| Need | ](../../tools/integrations/scrapecreators.md) | ](../../tools/integrations/apify.md) |
 |---|---|---|
 | YouTube videos and Shorts | `/v1/youtube/channel-videos`, `/v1/youtube/channel/shorts` | YouTube scraper actors |
 | TikTok videos | `/v3/tiktok/profile/videos` | TikTok scraper actors |
@@ -124,7 +124,7 @@ For stage 3, with the user's approval for each action:
 
 | Need | Options |
 |---|---|
-| A browser the agent drives and screenshots | Claude in Chrome, agent-browser, [Browserbase](../../../tools/integrations/browserbase.md) |
+| A browser the agent drives and screenshots | Claude in Chrome, agent-browser, ](../../tools/integrations/browserbase.md) |
 | An inbox for the email sequence | A dedicated address or alias on the user's own domain |
 
 ## The User's Own Data
@@ -133,9 +133,9 @@ For stage 8:
 
 | Source | What it adds |
 |---|---|
-| [Google Search Console](../../../tools/integrations/google-search-console.md) | Impressions and clicks by page family; whether the user has the target's winning families |
-| [GA4](../../../tools/integrations/ga4.md), [PostHog](../../../tools/integrations/posthog.md), [Plausible](../../../tools/integrations/plausible.md) | Channel mix and signup conversion |
-| [Google Ads](../../../tools/integrations/google-ads.md), [Meta Ads](../../../tools/integrations/meta-ads.md) | Which networks the user runs and what works there |
+| ](../../tools/integrations/google-search-console.md) | Impressions and clicks by page family; whether the user has the target's winning families |
+| ](../../tools/integrations/ga4.md), ](../../tools/integrations/posthog.md), ](../../tools/integrations/plausible.md) | Channel mix and signup conversion |
+| ](../../tools/integrations/google-ads.md), ](../../tools/integrations/meta-ads.md) | Which networks the user runs and what works there |
 | The user's social accounts | The same content pull as stage 6, for a side-by-side |
 
 Compare the user's real numbers only with each other. Against the target, use the same vendor's estimate for both domains.

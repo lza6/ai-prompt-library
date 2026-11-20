@@ -29,9 +29,9 @@ Behind every API question is a person with a deadline, a budget, and something a
 
 ## Status Rule
 
-Always load [api-status](../../references/api-status.md) for current API and platform claims. Load [model-name-map](../../references/model-name-map.md) when a user says Pro, Fast, V2, or a wrapper model ID. Do not rely on old release-status memory.
-Load [api-workflow](../../references/api-workflow.md) for implementation planning, task lifecycle, Runway/Volcengine/provider field differences, pricing caveats, upload handling, and production readiness.
-Load [pro-filmmaking-standards](../../references/pro-filmmaking-standards.md) for professional film, commercial, agency, localization, post, and delivery workflows. Load [delivery-qc](../../references/delivery-qc.md) before saying an asset is delivery-ready.
+Always load [api-status](../Seedance总览/references/api-status.md) for current API and platform claims. Load [model-name-map](../Seedance总览/references/model-name-map.md) when a user says Pro, Fast, V2, or a wrapper model ID. Do not rely on old release-status memory.
+Load [api-workflow](../Seedance总览/references/api-workflow.md) for implementation planning, task lifecycle, Runway/Volcengine/provider field differences, pricing caveats, upload handling, and production readiness.
+Load [pro-filmmaking-standards](../Seedance总览/references/pro-filmmaking-standards.md) for professional film, commercial, agency, localization, post, and delivery workflows. Load [delivery-qc](../Seedance总览/references/delivery-qc.md) before saying an asset is delivery-ready.
 
 ## Workflow Split
 

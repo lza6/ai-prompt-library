@@ -20,11 +20,11 @@ metadata:
 
 # seedance-prompt-short
 
-Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../../references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
+Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../Seedance总览/references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
 
 Compress Seedance prompts without losing the production signal. A short prompt still needs mode, subject, action, camera, light, sound when useful, and constraints. Remove filler before removing physical details.
 
-Load the [Director's Read](../../references/directors-read.md) before compression, even when the requested output is only one line. Briefs with a dramatic story turn complete its ten-field narrative record first. Observation/performance without that turn and utility briefs use its two-line non-narrative intent and refusal without fabricated drama; short output must still preserve the requested expression or rhythm. Short means compressed output, not skipped judgment.
+Load the [Director's Read](../Seedance总览/references/directors-read.md) before compression, even when the requested output is only one line. Briefs with a dramatic story turn complete its ten-field narrative record first. Observation/performance without that turn and utility briefs use its two-line non-narrative intent and refusal without fabricated drama; short output must still preserve the requested expression or rhythm. Short means compressed output, not skipped judgment.
 
 When sequence state is present, compression must preserve continuity locks, exact reference tags, actual opening state, current clip action, endpoint, completed beat exclusions, and reserved future beats. Do not compress away the words that keep a continuation from replaying completed action or leaking future action.
 
@@ -48,7 +48,7 @@ Preserve in this order:
 
 Delete generic adjectives, duplicate style labels, obvious background details, secondary camera moves, and secondary actions before deleting preservation constraints.
 
-For bilingual or mixed-language compression, load [multilingual-community-examples](../../references/multilingual-community-examples.md). Keep only the language mix that clarifies reference roles, dialogue, camera terms, or safe production constraints.
+For bilingual or mixed-language compression, load [multilingual-community-examples](../Seedance总览/references/multilingual-community-examples.md). Keep only the language mix that clarifies reference roles, dialogue, camera terms, or safe production constraints.
 
 ## Compact Templates
 

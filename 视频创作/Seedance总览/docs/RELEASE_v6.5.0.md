@@ -25,4 +25,4 @@ Long-form clips were converging on *continuity-correct but affect-flat*: the cli
 
 28 sub-skills, 58 references, **124 eval cases**. Eleven deterministic CI validators plus unit tests on every push, with the model-in-the-loop harness as the semantic quality gate.
 
-Full history in [`CHANGELOG.md`](../CHANGELOG.md).
+Full history in `CHANGELOG.md`.

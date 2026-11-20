@@ -20,7 +20,7 @@ metadata:
 
 # seedance-vocab-es
 
-Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../../references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
+Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../Seedance总览/references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
 
 Use Spanish cinematic vocabulary when the user asks for Spanish prompts, bilingual delivery, or compact translation of camera, lighting, action, VFX, audio, and production constraints. Preserve actual reference tags exactly; their spelling is independent of the prompt language.
 
@@ -48,7 +48,7 @@ Translate production meaning, not word-for-word English. Keep the prompt concret
 
 ## De-Slop Rule
 
-When the prompt leans on `cinematográfico`, `épico`, `impresionante`, `mágico`, or `de alta calidad`, load the Slop Traps table in [Spanish vocabulary](../../references/vocab/es.md) and decompose each into the physical elements that produce it - movimiento de cámara, fuente de luz, material, sonido.
+When the prompt leans on `cinematográfico`, `épico`, `impresionante`, `mágico`, or `de alta calidad`, load the Slop Traps table in [Spanish vocabulary](../Seedance总览/references/vocab/es.md) and decompose each into the physical elements that produce it - movimiento de cámara, fuente de luz, material, sonido.
 
 ## Output Contract
 

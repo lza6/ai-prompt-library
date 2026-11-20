@@ -199,7 +199,7 @@ You sell a tool with tiered subscriptions.
 - **Free trial design IS offer design** — length, gated features, credit-card-required vs not, automatic conversion. Each is an offer decision.
 - **Annual prepay is the offer lever** — same product, different commitment, priced 20–40% below monthly. That is a standing price for a longer commitment, not the acquisition discount [saas-offers.md](saas-offers.md) warns against. Many SaaS conversion lifts come from improving the annual offer, not the monthly.
 
-For SaaS, this skill is supplemental. Read [`pricing`](../../pricing/SKILL.md) first.
+For SaaS, this skill is supplemental. Read [`pricing`](../../定价策略/定价策略.md) first.
 
 ---
 

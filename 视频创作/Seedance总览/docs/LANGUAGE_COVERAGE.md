@@ -8,7 +8,7 @@ three named specimens, not every page written in those languages.
 
 | Language | Quickstart | Vocabulary | Full README | Independent review |
 |---|---|---|---|---|
-| EN | [Available](QUICKSTART.md) | [Available](../references/vocab/en.md) | [English source](../README.md) | Pending |
+| EN | [Available](QUICKSTART.md) | [Available](../references/vocab/en.md) | English source | Pending |
 | ZH | [Available](QUICKSTART.zh.md) | [Available](../references/vocab/zh.md) | [Available](README.zh.md) | Pending; fixture scope zh-CN / Hans only |
 | JA | [Available](QUICKSTART.ja.md) | [Available](../references/vocab/ja.md) | [Available](README.ja.md) | Pending; fixture scope ja-JP only |
 | KO | [Available](QUICKSTART.ko.md) | [Available](../references/vocab/ko.md) | [Available](README.ko.md) | Pending; fixture scope ko-KR only |

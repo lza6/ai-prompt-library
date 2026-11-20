@@ -23,4 +23,4 @@ A deep, skeptical research pass on Seedance 2.0's **native audio and dialogue**,
 
 28 sub-skills, 58 references, **122 eval cases**. Eleven deterministic CI validators plus unit tests on every push, with the model-in-the-loop harness as the semantic quality gate.
 
-Full history in [`CHANGELOG.md`](../CHANGELOG.md).
+Full history in `CHANGELOG.md`.

@@ -20,7 +20,7 @@ metadata:
 
 # seedance-vocab-ru
 
-Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../../references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
+Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../Seedance总览/references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
 
 Use Russian cinematic vocabulary when the user asks for Russian prompt wording, bilingual delivery, compact translation, role binding, first/last-frame workflow, or production vocabulary for camera, lighting, action, VFX, audio, and constraints. Preserve actual reference tags exactly; their spelling is independent of the prompt language.
 
@@ -34,7 +34,7 @@ Russian prompt direction should separate verified platform limits from field-obs
 
 Translate production intent, not every English word. Russian prompts should stay compact, concrete, and ordered by subject, action, camera, light, sound, and constraint.
 
-Load [vocab/ru](../../references/vocab/ru.md) for dense role-binding, first/last-frame, camera, lighting, audio, edit/extend, constraint, and safety vocabulary.
+Load [vocab/ru](../Seedance总览/references/vocab/ru.md) for dense role-binding, first/last-frame, camera, lighting, audio, edit/extend, constraint, and safety vocabulary.
 
 | Function | Russian wording |
 |---|---|
@@ -51,11 +51,11 @@ Load [vocab/ru](../../references/vocab/ru.md) for dense role-binding, first/last
 
 ## De-Slop Rule
 
-When the prompt leans on `кинематографичный`, `эпичный`, `атмосферный`, `потрясающий`, or `высокое качество`, load the Slop Traps table in [Russian vocabulary](../../references/vocab/ru.md) and decompose each into the physical elements that produce it - движение камеры, источник света, материал, звук.
+When the prompt leans on `кинематографичный`, `эпичный`, `атмосферный`, `потрясающий`, or `высокое качество`, load the Slop Traps table in [Russian vocabulary](../Seedance总览/references/vocab/ru.md) and decompose each into the physical elements that produce it - движение камеры, источник света, материал, звук.
 
 ## Dialogue Rule
 
-For spoken Russian, load the Russian Dialogue Notes in [Russian vocabulary](../../references/vocab/ru.md). Preserve exact supplied dialogue and Cyrillic spelling; do not transliterate, shorten, or change register without agreement. Time the actual performance. Offer supported voice-reference or post-dub options as user choices, not automatic replacements or guarantees.
+For spoken Russian, load the Russian Dialogue Notes in [Russian vocabulary](../Seedance总览/references/vocab/ru.md). Preserve exact supplied dialogue and Cyrillic spelling; do not transliterate, shorten, or change register without agreement. Time the actual performance. Offer supported voice-reference or post-dub options as user choices, not automatic replacements or guarantees.
 
 ## Output Contract
 

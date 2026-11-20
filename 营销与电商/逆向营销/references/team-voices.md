@@ -36,7 +36,7 @@ Keep it to people speaking publicly in a work capacity. Don't profile private li
 
 ## Getting the Words
 
-- **YouTube, TikTok, X videos:** transcripts via [ScrapeCreators](../../../tools/integrations/scrapecreators.md) (`/v1/youtube/video/transcript`, `/v1/tiktok/video/transcript`, `/v1/twitter/tweet/transcript`), or YouTube's own captions.
+- **YouTube, TikTok, X videos:** transcripts via ](../../tools/integrations/scrapecreators.md) (`/v1/youtube/video/transcript`, `/v1/tiktok/video/transcript`, `/v1/twitter/tweet/transcript`), or YouTube's own captions.
 - **Podcasts:** many feeds publish transcripts (a `podcast:transcript` tag in the RSS feed), and many shows post episodes to YouTube too. Otherwise, download the audio and transcribe it locally.
 - Save each transcript to `teardowns/<target>/voices/<date>-<person>-<show>.txt` with the source link.
 
@@ -68,4 +68,4 @@ What to pull from each post:
 - **Reports to:** where the function sits.
 - **First seen:** the date the post first appeared, which dates the push.
 
-Add each mandate to `moves.csv` as `kind: hire` with the posting date. [TheirStack](../../../tools/integrations/theirstack.md) searches job posts by company if the user has it.
+Add each mandate to `moves.csv` as `kind: hire` with the posting date. ](../../tools/integrations/theirstack.md) searches job posts by company if the user has it.

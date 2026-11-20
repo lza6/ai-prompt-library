@@ -28,7 +28,7 @@ Each of these is an outward-facing action. The agent confirms with the user befo
 
 ## Setup
 
-- **Browser:** a real browser the agent can drive and screenshot: Claude in Chrome, agent-browser, or [Browserbase](../../../tools/integrations/browserbase.md). Use a clean profile, so retargeting and personalization start from zero.
+- **Browser:** a real browser the agent can drive and screenshot: Claude in Chrome, agent-browser, or ](../../tools/integrations/browserbase.md). Use a clean profile, so retargeting and personalization start from zero.
 - **Inbox:** a dedicated address on the user's domain (e.g. `research@usercompany.com`) or a labeled alias, used only for this teardown. Every email that arrives is evidence.
 - **Folder:** `teardowns/<target>/inside/`, with `screens/`, `emails.csv`, and `notes.md`.
 

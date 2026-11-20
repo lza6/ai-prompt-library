@@ -17,11 +17,11 @@ The core reframe: don't ask the agent to *replace* the strategist. Offload the *
 
 ## When to use this
 
-- You need a competitor's paid-creative mix (formats, partnership share, messaging) before briefing new ads — feeds the concept slate in [ad-creative](../../ad-creative/SKILL.md).
+- You need a competitor's paid-creative mix (formats, partnership share, messaging) before briefing new ads — feeds the concept slate in [ad-creative](../../广告创意/广告创意.md).
 - You want personas grounded in real reviews, not assumptions — and the "who our ads *seem* to target vs. who actually buys" gap.
 - You're standing up a recurring competitive/creative report that should run itself and land in Slack.
 
-This is the *paid-social creative research* cut. For structured competitor dossiers from a URL list, hand off to [competitor-profiling](../../competitor-profiling/SKILL.md). For deep voice-of-customer analysis and JTBD, hand off to [customer-research](../../customer-research/SKILL.md). Persona output feeds [product-marketing](../../product-marketing/SKILL.md).
+This is the *paid-social creative research* cut. For structured competitor dossiers from a URL list, hand off to [competitor-profiling](../../竞品画像/竞品画像.md). For deep voice-of-customer analysis and JTBD, hand off to [customer-research](../../用户调研/用户调研.md). Persona output feeds [product-marketing](../../产品营销/产品营销.md).
 
 ## Prerequisites (connectors, exact links)
 
@@ -68,7 +68,7 @@ Turn a competitor's (or your own) product reviews into personas grounded in real
 - **Who the creative *seems* to target** (from Workflow 1's inferred personas).
 - **Who the customers *actually are*** (from the reviews).
 
-The gap is the insight. Creative aimed at a 25-year-old early adopter while reviews are dominated by 45-year-old repeat buyers means the targeting-in-creative is off — a concrete brief for the next round. This is the paid-creative complement to full [customer-research](../../customer-research/SKILL.md); persist the personas doc as shared context for both.
+The gap is the insight. Creative aimed at a 25-year-old early adopter while reviews are dominated by 45-year-old repeat buyers means the targeting-in-creative is off — a concrete brief for the next round. This is the paid-creative complement to full [customer-research](../../用户调研/用户调研.md); persist the personas doc as shared context for both.
 
 ## Workflow 3: Competitor / brand teardown (organic)
 
@@ -85,7 +85,7 @@ A monthly organic teardown of a competitor's (or an admired brand's) owned socia
 - **"What they're doubling down on"** — the pattern: utility/educational content vs. celebrity/creator partnerships vs. multi-phase launches vs. UGC volume.
 - **Strengths & gaps** — where they're strong, and the openings you can capitalize on.
 
-Run it against your competitors, your *clients'* competitors, or brands you admire for inspiration. Ask follow-up questions against the generated report in the same chat. For a full structured competitor dossier (pricing, positioning, SEO), hand the shortlist to [competitor-profiling](../../competitor-profiling/SKILL.md).
+Run it against your competitors, your *clients'* competitors, or brands you admire for inspiration. Ask follow-up questions against the generated report in the same chat. For a full structured competitor dossier (pricing, positioning, SEO), hand the shortlist to [competitor-profiling](../../竞品画像/竞品画像.md).
 
 ## Workflow 4: Persistent competitor ad tracker
 
@@ -117,6 +117,6 @@ Workflow 1 is a one-off teardown. When you want the same view every week, build 
 
 ## Where the outputs go
 
-- **Ad-library + format/partnership findings →** the concept slate and hook briefs in [ad-creative](../../ad-creative/SKILL.md).
-- **Personas doc →** shared context for [customer-research](../../customer-research/SKILL.md), [copywriting](../../copywriting/SKILL.md), and [product-marketing](../../product-marketing/SKILL.md).
-- **Organic teardown shortlist →** a full dossier in [competitor-profiling](../../competitor-profiling/SKILL.md).
+- **Ad-library + format/partnership findings →** the concept slate and hook briefs in [ad-creative](../../广告创意/广告创意.md).
+- **Personas doc →** shared context for [customer-research](../../用户调研/用户调研.md), [copywriting](../../文案写作/文案写作.md), and [product-marketing](../../产品营销/产品营销.md).
+- **Organic teardown shortlist →** a full dossier in [competitor-profiling](../../竞品画像/竞品画像.md).

@@ -1,6 +1,6 @@
 # 保真度评分卡
 
-**总分：96/100 · 等级A** | 测试日期：2026-07-01 | 答题/评分：独立双agent（Claude Opus 4.8），方法论见 [references/fidelity-scorecard.md](../../references/fidelity-scorecard.md)
+**总分：96/100 · 等级A** | 测试日期：2026-07-01 | 答题/评分：独立双agent（Claude Opus 4.8），方法论见 [references/fidelity-scorecard.md](../references/fidelity-scorecard.md)
 
 > 这是**主题skill**（X/Twitter运营导师），非人物skill。维度1为「方法论一致性」（对照Nicolas Cole/Dickie Bush/Justin Welsh等公开体系+X开源算法公开事实），维度2为「专业辨识度」（是否有领域专家的具体性，还是通用鸡汤）。维度3/4/5同标准rubric。
 

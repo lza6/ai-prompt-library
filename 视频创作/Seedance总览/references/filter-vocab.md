@@ -1,6 +1,6 @@
 # Prompt Clarification and Content Alternatives
 
-Use this reference after assessing the underlying request through [seedance-filter](../skills/seedance-filter/SKILL.md). A rejection alone does not prove a false positive or identify the rejected word. Use available operation/error information and the actual scene context; leave an unknown cause unknown. These examples are editorial guidance, not tested filter triggers or guarantees of acceptance.
+Use this reference after assessing the underlying request through [seedance-filter](../../Seedance滤镜/Seedance滤镜.md). A rejection alone does not prove a false positive or identify the rejected word. Use available operation/error information and the actual scene context; leave an unknown cause unknown. These examples are editorial guidance, not tested filter triggers or guarantees of acceptance.
 
 ## Faithful Clarification
 

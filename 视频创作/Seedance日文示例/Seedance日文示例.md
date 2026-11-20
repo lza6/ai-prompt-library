@@ -20,9 +20,9 @@ metadata:
 
 # seedance-examples-ja
 
-Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../../references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
+Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../Seedance总览/references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
 
-Use Japanese examples as language-specific prompt patterns, not translated English templates. Preserve reference tags exactly: `@Image1`, `@Image2`, `@Video1`, and `@Audio1` remain unchanged inside Japanese sentences. Static validation is not a language certification; use [multilingual language review](../../references/multilingual-native-review.md) for that review and do not infer who wrote the material.
+Use Japanese examples as language-specific prompt patterns, not translated English templates. Preserve reference tags exactly: `@Image1`, `@Image2`, `@Video1`, and `@Audio1` remain unchanged inside Japanese sentences. Static validation is not a language certification; use [multilingual language review](../Seedance总览/references/multilingual-native-review.md) for that review and do not infer who wrote the material.
 
 ## Intent
 

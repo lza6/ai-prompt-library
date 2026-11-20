@@ -24,4 +24,4 @@ The sequence architecture had the right epistemics ("never invent the bridge") b
 
 28 sub-skills, **59 references**, **126 eval cases**. Twelve deterministic CI checks plus unit tests on every push, with the model-in-the-loop harness as the semantic quality gate.
 
-Full history in [`CHANGELOG.md`](../CHANGELOG.md).
+Full history in `CHANGELOG.md`.

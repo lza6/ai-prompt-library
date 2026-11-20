@@ -20,9 +20,9 @@ metadata:
 
 # seedance-examples-zh
 
-Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../../references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
+Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../Seedance总览/references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
 
-Use examples as language-specific patterns, not content to copy blindly. They are not a language certification. Chinese prompts should stay compact, concrete, and production-oriented. Keep reference tags such as `@Image1`, `@Video1`, and `@Audio1` unchanged. Apply [multilingual language review](../../references/multilingual-native-review.md) for language-quality review and do not infer who wrote the material.
+Use examples as language-specific patterns, not content to copy blindly. They are not a language certification. Chinese prompts should stay compact, concrete, and production-oriented. Keep reference tags such as `@Image1`, `@Video1`, and `@Audio1` unchanged. Apply [multilingual language review](../Seedance总览/references/multilingual-native-review.md) for language-quality review and do not infer who wrote the material.
 
 ## Intent
 

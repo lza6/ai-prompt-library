@@ -20,7 +20,7 @@ metadata:
 
 # seedance-vocab-zh
 
-Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../../references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
+Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../Seedance总览/references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
 
 Use Chinese vocabulary when the user asks for Chinese prompts, Mandarin cinematic wording, role binding, first/last-frame workflow, or maximum compactness. Chinese prompt wording is often efficient, but it must still preserve mode, reference tags, action, camera, lighting, audio, and constraints.
 
@@ -34,7 +34,7 @@ Preserve actual reference tags exactly; their spelling is independent of the pro
 
 Before adapting a reference example below, load [Using Reference Examples](../../references/surface-prompt-profiles.md#using-reference-examples). Bind its placeholders to real assets by the requested role, then preserve the actual token, including its script, case, spacing and punctuation. A written example token does not attach a file.
 
-Load [vocab/zh](../../references/vocab/zh.md) for dense role-binding, first/last-frame, camera, lighting, audio, edit/extend, constraint, and safety vocabulary.
+Load [vocab/zh](../Seedance总览/references/vocab/zh.md) for dense role-binding, first/last-frame, camera, lighting, audio, edit/extend, constraint, and safety vocabulary.
 
 | Function | Chinese wording |
 |---|---|
@@ -51,11 +51,11 @@ Load [vocab/zh](../../references/vocab/zh.md) for dense role-binding, first/last
 
 ## Script Variant Rule
 
-When choosing or adapting Chinese prompt or delivery text, load Script Variant (简繁) in [Chinese vocabulary](../../references/vocab/zh.md). Preserve the user's chosen prompt script, subtitle script, locale and intended voice as separate decisions. Do not force Simplified prompting or infer a voice from written script. Keep exact dialogue and reference tags unchanged; convert or localize only the text the user asked to adapt. If a missing choice materially affects that deliverable, ask one focused question or use the user's delegated choice. Never convert by find-and-replace (头发 → 頭髮, not 頭發).
+When choosing or adapting Chinese prompt or delivery text, load Script Variant (简繁) in [Chinese vocabulary](../Seedance总览/references/vocab/zh.md). Preserve the user's chosen prompt script, subtitle script, locale and intended voice as separate decisions. Do not force Simplified prompting or infer a voice from written script. Keep exact dialogue and reference tags unchanged; convert or localize only the text the user asked to adapt. If a missing choice materially affects that deliverable, ask one focused question or use the user's delegated choice. Never convert by find-and-replace (头发 → 頭髮, not 頭發).
 
 ## De-Slop Rule
 
-When an adjective leaves the intended shot unclear, load Slop Traps in [Chinese vocabulary](../../references/vocab/zh.md). Preserve a useful style or aesthetic term and add only the scene-specific action, framing, light, or sound needed to clarify it. The table offers authored options, not a default look or a proven model-performance rule. Keep the user's chosen energy, dialogue, reference tags, and settings. Offer distinct choices only when the ambiguity changes the scene; if the user delegated the choice, decide within that scope.
+When an adjective leaves the intended shot unclear, load Slop Traps in [Chinese vocabulary](../Seedance总览/references/vocab/zh.md). Preserve a useful style or aesthetic term and add only the scene-specific action, framing, light, or sound needed to clarify it. The table offers authored options, not a default look or a proven model-performance rule. Keep the user's chosen energy, dialogue, reference tags, and settings. Offer distinct choices only when the ambiguity changes the scene; if the user delegated the choice, decide within that scope.
 
 ## Output Contract
 

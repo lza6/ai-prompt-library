@@ -20,7 +20,7 @@ metadata:
 
 # seedance-antislop
 
-Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../../references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
+Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../Seedance总览/references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
 
 Clarify wording that hides an unresolved production decision. Preserve useful style, genre and mood language; concrete detail should support the user's direction, not replace it with a stock look. These are editorial choices, not measured rules about which words improve Seedance output.
 
@@ -32,7 +32,7 @@ Keep the intended energy, medium, era, palette and performance. A word such as "
 
 1. Identify what is already decided: creative intent, exact dialogue, actual reference tokens, continuity, safety boundaries, exclusions and requested settings. Preserve those through the edit.
 2. Check whether an abstract phrase leaves a material choice unresolved. Keep it when context is sufficient. Otherwise use the brief to clarify it; if the user has delegated creative choices, propose a coherent interpretation and state any material assumption. Ask only when a necessary choice remains unresolved outside that scope.
-3. Remove redundant praise where it adds no distinct intent. Surface conflicting requirements instead of silently choosing one. Add only details that serve this brief; neither a camera move nor a lighting recipe is required for every style word. Load [anti-slop-lexicon](../../references/anti-slop-lexicon.md) for conditional repairs and delivery requirements.
+3. Remove redundant praise where it adds no distinct intent. Surface conflicting requirements instead of silently choosing one. Add only details that serve this brief; neither a camera move nor a lighting recipe is required for every style word. Load [anti-slop-lexicon](../Seedance总览/references/anti-slop-lexicon.md) for conditional repairs and delivery requirements.
 4. Apply a length limit only when the user requests it or the selected operation documents it. Do not invent a universal character budget or silently discard must-haves to fit one.
 
 ## Do Not Over-Correct
@@ -41,7 +41,7 @@ Keep useful labels such as noir, documentary or ultra-realistic when they descri
 
 Treat output resolution as a delivery requirement. Preserve the requested value and carry it into a supported setting when available. Prompt text alone does not guarantee that resolution. If support is unknown or the value is unavailable, state the gap and offer an explicit option within the user's scope; do not silently lower the target, switch providers, add an upscale or spend credits.
 
-For English wording, load [seedance-vocab-en](../seedance-vocab-en/SKILL.md) with [English vocabulary](../../references/vocab/en.md). For another prompt language, consult its Slop Traps table only when needed: [Chinese](../../references/vocab/zh.md), [Japanese](../../references/vocab/ja.md), [Korean](../../references/vocab/ko.md), [Spanish](../../references/vocab/es.md), or [Russian](../../references/vocab/ru.md). These are contextual wording examples, not language-wide lists of useless words.
+For English wording, load [seedance-vocab-en](../Seedance英文词汇/Seedance英文词汇.md) with [English vocabulary](../Seedance总览/references/vocab/en.md). For another prompt language, consult its Slop Traps table only when needed: [Chinese](../Seedance总览/references/vocab/zh.md), [Japanese](../Seedance总览/references/vocab/ja.md), [Korean](../Seedance总览/references/vocab/ko.md), [Spanish](../Seedance总览/references/vocab/es.md), or [Russian](../Seedance总览/references/vocab/ru.md). These are contextual wording examples, not language-wide lists of useless words.
 
 ## Output Contract
 

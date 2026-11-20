@@ -25,4 +25,4 @@ The sequence architecture gains the missing tier between story and clip, so a lo
 
 28 sub-skills, 58 references, **123 eval cases**. Eleven deterministic CI validators plus unit tests on every push, with the model-in-the-loop harness as the semantic quality gate.
 
-Full history in [`CHANGELOG.md`](../CHANGELOG.md).
+Full history in `CHANGELOG.md`.

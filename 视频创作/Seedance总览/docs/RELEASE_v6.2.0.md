@@ -21,4 +21,4 @@ A modular agent-skill operating system for directing ByteDance **Seedance 2.0** 
 
 28 sub-skills, 58 references, 121 eval cases. Eleven deterministic CI validators plus unit tests run on every push, with the model-in-the-loop harness as the semantic quality gate.
 
-Full history in [`CHANGELOG.md`](../CHANGELOG.md).
+Full history in `CHANGELOG.md`.

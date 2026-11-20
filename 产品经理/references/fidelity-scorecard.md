@@ -53,7 +53,7 @@
 
 - 女娲Phase 4的通过标准是**内部质检**（生成过程中的关卡）
 - 评分卡是**对外报告**（生成完成后的出厂检验，任何人可复跑验证）
-- 社区贡献的人物skill申请收录进 [COMMUNITY.md](../COMMUNITY.md) 索引时，评分卡≥B是准入门槛（见 [CONTRIBUTING.md](../CONTRIBUTING.md)）
+- 社区贡献的人物skill申请收录进 COMMUNITY.md 索引时，评分卡≥B是准入门槛（见 CONTRIBUTING.md）
 
 ## 反作弊
 

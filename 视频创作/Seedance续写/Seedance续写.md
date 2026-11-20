@@ -21,11 +21,11 @@ metadata:
 
 # seedance-continuation
 
-Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../../references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
+Before producing prompt text, a prompt-ready block, a rewrite, an example, or a compiled clip, load the [Director's Read](../Seedance总览/references/directors-read.md), classify the brief, and complete its canonical narrative or non-narrative record. Translate that record into visible or audible carriers and keep its internal labels out of final generation prose.
 
 Use this for seamless continuation, intentional next shots, bridge clips, tail repair, and re-anchoring after drift. A continuation prompt must be grounded in accepted footage, not only in the old plan.
 
-Load the [Director's Read](../../references/directors-read.md), [continuation-handoff](../../references/continuation-handoff.md), [sequence-project-state](../../references/sequence-project-state.md), [prompt-compiler](../../references/prompt-compiler.md), [reference-transfer-contract](../../references/reference-transfer-contract.md), and [continuity-qc](../../references/continuity-qc.md). Load [failure-atlas](../../references/failure-atlas.md) when the continuation failed or drift is visible. Load [directing-engine](../../references/directing-engine.md) so the next clip inherits the project's directorial voice and its position on the long-form spine; the look never re-rolls between clips.
+Load the [Director's Read](../Seedance总览/references/directors-read.md), [continuation-handoff](../Seedance总览/references/continuation-handoff.md), [sequence-project-state](../Seedance总览/references/sequence-project-state.md), [prompt-compiler](../Seedance总览/references/prompt-compiler.md), [reference-transfer-contract](../Seedance总览/references/reference-transfer-contract.md), and [continuity-qc](../Seedance总览/references/continuity-qc.md). Load [failure-atlas](../Seedance总览/references/failure-atlas.md) when the continuation failed or drift is visible. Load [directing-engine](../Seedance总览/references/directing-engine.md) so the next clip inherits the project's directorial voice and its position on the long-form spine; the look never re-rolls between clips.
 
 ## Intent
 
@@ -53,13 +53,13 @@ Before writing any continuation prompt, require:
 
 If the source is unavailable, say: "I have the story plan, but I do not have the actual ending of the previous generation. Upload the clip or its final frame - `python scripts/extract_last_frame.py <take>` pulls the final frame locally - or describe exactly what is visible at the end. I should not invent the continuation state."
 
-Once a frame or clip is attached **and this client can actually open it**, run the Observation Fast Path from [continuation-handoff](../../references/continuation-handoff.md): the agent fills the observation record from what is visible and asks only about what the attachment cannot show (for a still: open motion, camera movement phase, audio phase). Never hand the sensing work back to the user when the pixels are genuinely in hand.
+Once a frame or clip is attached **and this client can actually open it**, run the Observation Fast Path from [continuation-handoff](../Seedance总览/references/continuation-handoff.md): the agent fills the observation record from what is visible and asks only about what the attachment cannot show (for a still: open motion, camera movement phase, audio phase). Never hand the sensing work back to the user when the pixels are genuinely in hand.
 
 If the client accepts the file but cannot render it, the pixels are not in hand. Say so once, ask the user to describe the visible end state, and record it as reported: `observation_confidence: low`, `requires_user_confirmation: true`, and the unverified categories listed in `uncertainties`.
 
 Do not hide this uncertainty by writing a speculative prompt.
 
-After the source gate is satisfied and before the next prompt is compiled, classify the current clip with the [Director's Read](../../references/directors-read.md). Continuations classified in the narrative lane persist the complete canonical internal read against the observed end state, label the non-transferable detail as `source_bound` only with an exact source locator or `authored_choice` with a null source, add explicit value endpoints, and store exact prompt carriers. Observation/performance without a dramatic story turn and utility continuations use the non_narrative lane and persist exactly utility intent and non-narrative refusal in `authoring_state`; they do not invent psychology. Translate a narrative read into blocking, visible suppressed behavior, the chosen replacement for the refused stock move, camera endpoint, light, and sound; never paste internal labels into final generation prose.
+After the source gate is satisfied and before the next prompt is compiled, classify the current clip with the [Director's Read](../Seedance总览/references/directors-read.md). Continuations classified in the narrative lane persist the complete canonical internal read against the observed end state, label the non-transferable detail as `source_bound` only with an exact source locator or `authored_choice` with a null source, add explicit value endpoints, and store exact prompt carriers. Observation/performance without a dramatic story turn and utility continuations use the non_narrative lane and persist exactly utility intent and non-narrative refusal in `authoring_state`; they do not invent psychology. Translate a narrative read into blocking, visible suppressed behavior, the chosen replacement for the refused stock move, camera endpoint, light, and sound; never paste internal labels into final generation prose.
 
 ## Continuation Types
 
