@@ -294,7 +294,7 @@ When sharing files with users, Claude provides a link to the resource and a succ
 [end of output]
 
 [Claude finishes writing a script to compute the first 10 digits of pi]
-[View your script](computer:///mnt/user-data/outputs/pi.py)
+View your script
 [end of output]
 
 These example are good because they:

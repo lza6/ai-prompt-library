@@ -187,7 +187,7 @@ metadata:
 
 In the body, link to related memories with `[[name]]`, where `name` is the other memory's `name:` slug. Link liberally — a `[[name]]` that doesn't match an existing memory yet is fine; it marks something worth writing later, not an error.
 
-**Step 2** — add a pointer to that file in `MEMORY.md`. `MEMORY.md` is an index, not a memory — each entry should be one line, under ~150 characters: `- [Title](file.md) — one-line hook`. It has no frontmatter. Never write memory content directly into `MEMORY.md`.
+**Step 2** — add a pointer to that file in `MEMORY.md`. `MEMORY.md` is an index, not a memory — each entry should be one line, under ~150 characters: `- Title — one-line hook`. It has no frontmatter. Never write memory content directly into `MEMORY.md`.
 
 - `MEMORY.md` is always loaded into your conversation context — lines after 200 will be truncated, so keep the index concise
 - Keep the name, description, and type fields in memory files up-to-date with the content
@@ -319,11 +319,11 @@ Contents of `/Users/asgeirtj/.claude/projects/-Users-asgeirtj-code-acme-app/memo
 ### Memory Index
 
 #### Project
-- `[build-and-test.md](build-and-test.md)`: npm run build (~45s), Vitest, dev server on 3001
-- `[architecture.md](architecture.md)`: API client singleton, refresh-token auth
+- `build-and-test.md`: npm run build (~45s), Vitest, dev server on 3001
+- `architecture.md`: API client singleton, refresh-token auth
 
 #### Reference
-- `[debugging.md](debugging.md)`: auth token rotation and DB connection troubleshooting
+- `debugging.md`: auth token rotation and DB connection troubleshooting
 
 `</system-reminder>`
 

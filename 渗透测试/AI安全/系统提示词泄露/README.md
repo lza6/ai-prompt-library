@@ -25,6 +25,18 @@
 
 **规模**： Anthropic 615（含 claude-code 全版本系统提示词、official 官方披露历史版本、raw 原始转储）、OpenAI 124、Meta 471、Google 25、xAI 16、Misc 24、其余若干。
 
+## ClaudeCode 专用提示词
+
+[ClaudeCode专用/](ClaudeCode专用/) — claude-code-system-prompts（MIT，Piebald 维护）709 个纯 md：Claude Code 全套 agent/工具/斜杠命令提示词与版本历史系统提示词。
+
+## 中文翻译版
+
+[中文翻译版/](中文翻译版/) — system-prompts-and-models-of-ai-tools-chinese（MIT）330 篇：泄露系统提示词的中文翻译，按产品中文目录组织，便于中文检索。
+
+## 精选补充
+
+[精选补充/](精选补充/) — langgptai/awesome-system-prompts（Apache-2.0）17 篇：Agents 与 LLMs 精选系统提示词。
+
 ## 来源与许可
 
 | 上游项目 | 许可 |

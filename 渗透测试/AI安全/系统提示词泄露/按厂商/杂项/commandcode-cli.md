@@ -171,7 +171,7 @@ The main taste.md file contains category sections with H1 headings (# Category N
 2. REFERENCED (>5 learnings): Category heading with a reference link to category file
    Example:
    # CLI
-   See [cli/taste.md](./cli/taste.md)
+   See cli/taste.md
 
 WHY TASTE MATTERS:
 These preferences represent the user's actual requirements learned from real interactions. When a user corrects you (e.g., "use TypeScript not JavaScript", "use Commander.js for CLIs"), that correction is captured as taste. Following taste prevents you from making the same mistakes repeatedly and ensures consistency across the project.

@@ -88,7 +88,7 @@ The control plane validates their runtime, shortcode, and slug before upload;
 it never overwrites an active database or bucket with a later local seed.
 While shared, edits read remote snapshots and deploys apply migrations to D1.
 Unshare drains writers and restores both D1 and R2 locally before enabling
-local actions. See the [shared-state contract](../../../../docs/spaces-shared-state.md)
+local actions. See the shared-state contract
 for admission, failure, and recovery semantics.
 
 The build generates a Worker tsconfig and typechecks the space's

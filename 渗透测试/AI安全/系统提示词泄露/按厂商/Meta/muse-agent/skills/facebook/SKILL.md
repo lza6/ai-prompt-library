@@ -111,7 +111,7 @@ For share links, call `link-sharing decode-url --url <url>` first, then pass
 the nonblank canonical `original_url` intact to the reader. Supply exactly one
 of `--url` or `--post-id`. Stop on a null, missing, or blank decoded URL or a
 failed read; do not guess IDs or retry a media ID as a post ID. See
-[posts.md](references/posts.md) for supported URL patterns and other entities.
+posts.md for supported URL patterns and other entities.
 
 ## Composability
 
@@ -155,19 +155,19 @@ The chains that are not mechanical:
 ## References
 
 One file per feature area, each named for the area it covers:  
-[references/friends.md](references/friends.md),  
-[references/posts.md](references/posts.md),  
-[references/pages.md](references/pages.md),  
-[references/comments.md](references/comments.md),  
-[references/reactions.md](references/reactions.md),  
-[references/marketplace.md](references/marketplace.md),  
-[references/timeline.md](references/timeline.md),  
-[references/profile.md](references/profile.md),  
-[references/story.md](references/story.md),  
-[references/feed.md](references/feed.md),  
-[references/groups.md](references/groups.md),  
-[references/events.md](references/events.md),  
-[references/saved.md](references/saved.md).
+references/friends.md,  
+references/posts.md,  
+references/pages.md,  
+references/comments.md,  
+references/reactions.md,  
+references/marketplace.md,  
+references/timeline.md,  
+references/profile.md,  
+references/story.md,  
+references/feed.md,  
+references/groups.md,  
+references/events.md,  
+references/saved.md.
 
 ## Operating Rules
 
@@ -183,9 +183,9 @@ One file per feature area, each named for the area it covers:
 5. Do not bulk-scrape or enumerate profiles/posts.
 6. Managed Page draft, post, and scheduling writes and Marketplace listing create, edit, delete, and publish prompt for approval because they change connector state; publication can change public-facing content. Saved-item add/remove and saved-collection creation may proceed from a clear request without an additional confirmation. Personal posts, comments, reactions, timeline, profile, marketplace browsing (including `marketplace my-listings`), groups browsing, events browsing, and feed are read-only — never suggest writes for those.
 7. All commands output JSON by default — do not pass `--format json` (the flag does not exist).
-8. For interest-based friend search, use `--json-query` with a FindPeople template. Get the user's FB ID from `facebook-cli me` first. Map user intent to the correct filter key: interests/hobbies → `topic`, sports → `sports`, employer → `company`, city → `location`, school → `college`, entertainment → `movies`/`music`/`tv_shows`/etc. **Use `topic` for general interests (NOT `interests`).** Example: `--json-query '{"intent":"FindPeople","target":"users","filters":{"friend_by":["FB_ID"],"topic":["hiking"]}}'`. Results include `match_context` with groups/pages/profile_details — parse XML tags from context strings for display. See [friends.md](references/friends.md) for full filter table and response format.
+8. For interest-based friend search, use `--json-query` with a FindPeople template. Get the user's FB ID from `facebook-cli me` first. Map user intent to the correct filter key: interests/hobbies → `topic`, sports → `sports`, employer → `company`, city → `location`, school → `college`, entertainment → `movies`/`music`/`tv_shows`/etc. **Use `topic` for general interests (NOT `interests`).** Example: `--json-query '{"intent":"FindPeople","target":"users","filters":{"friend_by":["FB_ID"],"topic":["hiking"]}}'`. Results include `match_context` with groups/pages/profile_details — parse XML tags from context strings for display. See friends.md for full filter table and response format.
 9. **Always use facebook-cli for structured lookups — never social.search.** For any request involving friends, profiles, timelines, posts, comments, or reactions, always use `facebook-cli` commands. Marketplace is split: your own listings are facebook-cli's, and finding or browsing listings to buy is the `shopping` skill's. Do not use social.search or other tools as substitutes for operations that facebook-cli supports. Those tools lack access to the same structured data. The only exception is free-text semantic search across the user's Facebook graph (use social.search for that). When cross-referencing (e.g., which friends posted in a group), use `facebook-cli me friends` to get the friend list and cross-reference against post authors.
-10. **Timeline: Author vs Owner.** Timeline posts include `author_id`/`author_name` (who wrote the post) and `owner_id`/`owner_name` (whose wall it's on). When asked "show me posts FROM [person]" or "what has [person] posted", only report posts where `author_id == owner_id`. If all posts are by others on their wall, say "[Person] hasn't posted recently" and separately note "Friends have posted on their wall" with those details. See [timeline.md](references/timeline.md) for full rules.
+10. **Timeline: Author vs Owner.** Timeline posts include `author_id`/`author_name` (who wrote the post) and `owner_id`/`owner_name` (whose wall it's on). When asked "show me posts FROM [person]" or "what has [person] posted", only report posts where `author_id == owner_id`. If all posts are by others on their wall, say "[Person] hasn't posted recently" and separately note "Friends have posted on their wall" with those details. See timeline.md for full rules.
 11. **Always use permalinks, never raw IDs.** Normalized post reads expose the permalink as `url`; comments and reactions retain their documented URL fields. Always show that URL — never show raw post IDs, comment IDs, or listing IDs. Users should be able to click through to Facebook. This also applies to people: refer to a person by name with their profile link (`vanity_url` / `profile_url`) — do not print raw user/profile IDs (`profile_id`, `friend_id`, `owner_id`, `author_id`, reactor/commenter `id`) in your response. **Every link must include the `https://` scheme so it renders as clickable.** API responses sometimes return URLs without a scheme (e.g., `facebook.com/profile.php?id=123`) or scheme-relative (`//facebook.com/...`); always prepend `https://` before showing them. Never present a bare, unclickable link — write `https://facebook.com/profile.php?id=123`, not `facebook.com/profile.php?id=123` or `joe — facebook.com/profile.php?id=...`.
 12. **State date ranges for vague time terms.** When the user asks for "recent", "latest", or "lately" content, always state the date range you used in your response (e.g., "Here are posts from the past 7 days" or "Showing posts from April 1–7, 2026").
 13. **Say "not listed" for missing profile fields.** When presenting profile data, explicitly say "not listed" for any field not present in the API response rather than omitting it. This applies to work, education, city, hometown, bio, relationship status, etc. For multi-value fields (work history, education), show all entries and say "not listed" for missing sub-fields.

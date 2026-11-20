@@ -4,8 +4,10 @@
 
 本分类共 320 个技能。
 
-## 技能清单（320）
+## 技能清单（322）
 
+- [反过度防御](反过度防御/README.md)
+- [Opus5精确化](Opus5精确化/README.md)
 - [Agent指令](Agent指令/Agent指令.md)
 - [CE-PR陪跑](CE-PR陪跑/CE-PR陪跑.md)
 - [CE-Xcode测试](CE-Xcode测试/CE-Xcode测试.md)

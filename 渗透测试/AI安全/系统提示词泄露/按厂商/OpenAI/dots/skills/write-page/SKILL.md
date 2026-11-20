@@ -88,7 +88,7 @@ For `patch_page`, use the observed block ID and hash:
 
 ## Supported content
 
-Read the [Page content catalog](references/page-content.md) for new Pages, substantial layout changes, block-unit/metadata edits, or capability questions. It contains native syntax, metadata shapes, and authoring limits. Resolve the link relative to this `SKILL.md`; small wording edits need no catalog read.
+Read the Page content catalog for new Pages, substantial layout changes, block-unit/metadata edits, or capability questions. It contains native syntax, metadata shapes, and authoring limits. Resolve the link relative to this `SKILL.md`; small wording edits need no catalog read.
 
 Do not use Markdown features that are not documented in this skill or its Page content catalog. Do not infer support from other Markdown renderers or invent HTML/CSS syntax. If a requested format is not documented, explain the limit and offer a documented alternative instead of writing unsupported markup.
 

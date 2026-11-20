@@ -310,36 +310,36 @@ The full verbatim system prompts behind the most popular chatbots in the world. 
 
 | Product | Prompt |
 |---------|--------|
-| Amp Code (Sourcegraph) | [Amp Code system prompt](Misc/amp-code.md) |
-| CommandCode CLI | [CommandCode CLI system prompt](Misc/commandcode-cli.md) |
-| Devin CLI | [Devin CLI system prompt](Misc/devin-cli.md) |
-| Docker Gordon AI | [Docker Gordon AI system prompt](Misc/docker-gordon-ai.md) |
-| ElevenLabs Voice Agent | [ElevenLabs voice agent system prompt](Misc/elevenlabs-voice-agent.md) |
-| Reddit Answers | [Reddit Answers system prompt](Misc/reddit-answers.md) |
-| Warp 2.0 Agent | [Warp 2.0 agent system prompt](Misc/warp-2.0-agent.md) |
-| Zed AI | [Zed AI system prompt](Misc/zed.md) |
+| Amp Code (Sourcegraph) | Amp Code system prompt |
+| CommandCode CLI | CommandCode CLI system prompt |
+| Devin CLI | Devin CLI system prompt |
+| Docker Gordon AI | Docker Gordon AI system prompt |
+| ElevenLabs Voice Agent | ElevenLabs voice agent system prompt |
+| Reddit Answers | Reddit Answers system prompt |
+| Warp 2.0 Agent | Warp 2.0 agent system prompt |
+| Zed AI | Zed AI system prompt |
 
 <details><summary>More products</summary>
 
 | Product | Prompt |
 |---------|--------|
-| Brave Search | [Brave Search system prompt](Misc/brave-search.md) |
-| Character AI | [Character AI system prompt](Misc/character-ai.md) |
-| Confer | [Confer system prompt](Misc/confer.md) |
-| Duck.ai | [Duck.ai system prompt](Misc/duck-ai.md) |
-| Fellou Browser | [Fellou browser system prompt](Misc/fellou-browser.md) |
-| Gizmo AI | [Gizmo AI system prompt](Misc/gizmo-ai.md) |
-| Hermes | [Hermes system prompt](Misc/hermes.md) |
-| Indus AI | [Indus AI system prompt](Misc/indus-ai.md) |
-| Kagi Assistant | [Kagi assistant system prompt](Misc/kagi-assistant.md) |
-| MiniMax M2.5 | [MiniMax M2.5 system prompt](Misc/minimax-m2.5.md) |
+| Brave Search | Brave Search system prompt |
+| Character AI | Character AI system prompt |
+| Confer | Confer system prompt |
+| Duck.ai | Duck.ai system prompt |
+| Fellou Browser | Fellou browser system prompt |
+| Gizmo AI | Gizmo AI system prompt |
+| Hermes | Hermes system prompt |
+| Indus AI | Indus AI system prompt |
+| Kagi Assistant | Kagi assistant system prompt |
+| MiniMax M2.5 | MiniMax M2.5 system prompt |
 | Pi (Inflection) | [Pi system prompt](Pi/instructions.md) |
-| Proton Lumo AI | [Proton Lumo AI system prompt](Misc/proton-lumo-ai.md) |
-| Raycast AI | [Raycast AI system prompt](Misc/raycast-ai.md) |
-| Sesame AI Maya | [Sesame AI Maya system prompt](Misc/sesame-ai-maya.md) |
-| Stack Overflow AI Assist | [Stack Overflow AI Assist system prompt](Misc/stack-overflow-ai-assist.md) |
-| t3.chat | [t3.chat system prompt](Misc/t3.chat.md) |
-| t3 Code | [t3 Code system prompt](Misc/t3-code.md) |
+| Proton Lumo AI | Proton Lumo AI system prompt |
+| Raycast AI | Raycast AI system prompt |
+| Sesame AI Maya | Sesame AI Maya system prompt |
+| Stack Overflow AI Assist | Stack Overflow AI Assist system prompt |
+| t3.chat | t3.chat system prompt |
+| t3 Code | t3 Code system prompt |
 
 </details>
 

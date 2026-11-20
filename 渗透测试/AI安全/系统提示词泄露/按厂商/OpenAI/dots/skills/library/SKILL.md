@@ -62,12 +62,12 @@ skill does not expose tools or a local MCP server.
 | Literal or regex match in known files | Use `find`; follow with `read` only when the match needs more context. |
 | Shared writing block (`library_artifact_type: writing_block`) | Use `read` to reconstruct its complete local text; while `has_more`, continue with `next_read`. Preserve line boundaries, verify `size_bytes`, and retain the authoritative `version_id`; do not materialize. |
 | Local bytes from a `list` or `search` result | Reuse the complete earlier result when its file identifiers and path remain current; repeat `list` or `search` only if that metadata is missing, stale, or ambiguous. Pass it directly to the bundled stdin-only download helper. Do not call Library `read` or `prepare_materialize` first. |
-| Local bytes from a resolved reference that did not come from `list` or `search` | Use `prepare_materialize`; read [materialization.md](references/materialization.md). |
+| Local bytes from a resolved reference that did not come from `list` or `search` | Use `prepare_materialize`; read materialization.md. |
 | Explicit local path | Use local tools. Do not send local paths to Library `read` or `find`. |
 | New local deliverable | Choose one create route below. |
 | Edit a Library-backed file | For `library_artifact_type: site`, use Sites; never materialize, replace, or restore its projection. Otherwise materialize if needed, edit and validate locally, then replace the same `library_file_id`. |
-| Create, move, rename, or delete Library nodes | Use `manage_library`; read [library-management.md](references/library-management.md) before mutating. |
-| Restore an earlier version | Use `manage_library` with `restore_version`; read [library-management.md](references/library-management.md). |
+| Create, move, rename, or delete Library nodes | Use `manage_library`; read library-management.md before mutating. |
+| Restore an earlier version | Use `manage_library` with `restore_version`; read library-management.md. |
 
 For `list`, set `limit` to at most `200`. For `search`, use the canonical request
 shape `{"search_query":[{"q":"quarterly revenue"}],"top_k":5}`. `search_query`
@@ -92,7 +92,7 @@ The top-level `read` array must contain 1–5 items; do not send the identifier 
 Batch independent `read` and `find` items when possible. Use `read` after `search`
 for content claims, even with snippets; use `find` only after candidate resolution.
 
-Read [evidence-and-citations.md](references/evidence-and-citations.md) for
+Read evidence-and-citations.md for
 selected `@` mentions, image-search metadata, post-mutation search limits, result handling, and citations.
 
 ## Classify New Files
@@ -117,7 +117,7 @@ Library.
 
 - For a new item, call `create_library_file(file=...)` with the absolute local
   path. On success, invoke this skill's
-  [scripts/library_file_transfer.py](scripts/library_file_transfer.py) with
+  scripts/library_file_transfer.py with
   `python3`, the `apply-xattrs` subcommand, the original local path, and the
   returned `library_file_id`. Send the complete `xattrs` array from the create
   result (or `[]`) as JSON on stdin, as shown below. When using code mode
@@ -156,7 +156,7 @@ JSON
 
 Inspect the helper result before finishing; do not claim that local identity was
 persisted if it failed. Read
-[writeback-and-conflicts.md](references/writeback-and-conflicts.md) for direct
+writeback-and-conflicts.md for direct
 create batches, version conflicts, or detailed result correlation.
 
 ## Materialize List or Search Results
@@ -203,7 +203,7 @@ plugin cache for helpers, inspect helper source, invoke
 returned transfers again.
 
 For a resolved reference that did not come from `list` or `search`, use the
-lower-level flow in [materialization.md](references/materialization.md).
+lower-level flow in materialization.md.
 
 ## Route Larger or Multiple Writes
 
@@ -219,7 +219,7 @@ Preserve its original mutation order and use absolute local paths.
 Prepared app calls contain at most 20 files. Library write app calls are
 ordered: do not use `Promise.all(...)` for create, replace, delete, or finalize.
 Only prepared byte transfers may run in parallel. Read
-[prepared-uploads.md](references/prepared-uploads.md) before using the prepared
+prepared-uploads.md before using the prepared
 route. It defines the helper's one-shot input and owns preparation, transfer,
 finalization, result correlation, and xattr writeback. After direct batches or
 the prepared helper, inspect every per-item result in request order. A
@@ -238,7 +238,7 @@ or routing is unclear, stop.
 
 Resolve ambiguous mutation targets before writing. If several candidates
 remain, ask the user to choose. Read
-[library-management.md](references/library-management.md) for exact folder,
+library-management.md for exact folder,
 move, rename, delete, restore, protected Deep Research report, and per-operation
 result rules.
 
@@ -262,8 +262,8 @@ and unrelated content across every mutation.
 
 ## References
 
-- [evidence-and-citations.md](references/evidence-and-citations.md): mentions, search details, result handling, and citations.
-- [materialization.md](references/materialization.md): lower-level resolved-ref materialization and transfer handling.
-- [prepared-uploads.md](references/prepared-uploads.md): prepared byte transfer, finalization, xattr writeback, and cleanup.
-- [writeback-and-conflicts.md](references/writeback-and-conflicts.md): detailed create, replace, edit, and conflict mechanics.
-- [library-management.md](references/library-management.md): folders, node mutations, restore, and protected reports.
+- evidence-and-citations.md: mentions, search details, result handling, and citations.
+- materialization.md: lower-level resolved-ref materialization and transfer handling.
+- prepared-uploads.md: prepared byte transfer, finalization, xattr writeback, and cleanup.
+- writeback-and-conflicts.md: detailed create, replace, edit, and conflict mechanics.
+- library-management.md: folders, node mutations, restore, and protected reports.

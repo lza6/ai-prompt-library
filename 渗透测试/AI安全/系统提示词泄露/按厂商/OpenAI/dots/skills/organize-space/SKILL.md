@@ -28,7 +28,7 @@ Leave the Space easier to navigate and use. Treat its hierarchy, root Page, and 
 - Reduce repeated information without losing distinct requirements, sources, owners, dates, or completion state. Read candidate duplicates before combining them; matching titles do not prove matching content.
 - Choose an existing canonical Page using the user's direction, purpose, current content, and inbound references. Ask if plausible candidates conflict. Prefer updating that Page over making another copy.
 - Keep completed work out of the active path when useful, such as in a completed section or existing archive. Preserve dated notes and the reasons behind past decisions.
-- Use headings, compact tables, and child links to make the structure visible. If the redesign needs richer content or layout controls, read the [Page content catalog](../write-page/references/page-content.md). A linked child, a collapsible heading section, and a separate document type serve different purposes; do not substitute one for another silently.
+- Use headings, compact tables, and child links to make the structure visible. If the redesign needs richer content or layout controls, read the Page content catalog. A linked child, a collapsible heading section, and a separate document type serve different purposes; do not substitute one for another silently.
 
 ## Apply real changes
 

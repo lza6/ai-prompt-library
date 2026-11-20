@@ -40,7 +40,7 @@ goes only into Muse's own memory roots and Muse's own `settings.json`.
   of a linked worktree); ask when more than one plausibly matches.
 - A settings key `autoMemoryDirectory` in `~/.claude/settings.json` or the
   project's `.claude/settings*.json` relocates that directory.
-- `MEMORY.md` is the index: one line per note, `- [Title](file.md) — hook`.
+- `MEMORY.md` is the index: one line per note, `- Title — hook`.
   Read it first; it says what exists.
 - Each note is `<name>.md` with YAML frontmatter: `name`, `description`, and
   `type` (top-level or under `metadata:`) with values `user`, `feedback`,
@@ -83,7 +83,7 @@ goes only into Muse's own memory roots and Muse's own `settings.json`.
   `personal`; ask if unsure.
 - Add one index line per note to the scope's `MEMORY.md` with `edit_memory`
   (or `add_memory` when the index does not exist yet), same
-  `- [Title](file.md) — hook` shape, so the next session sees it in the
+  `- Title — hook` shape, so the next session sees it in the
   startup snapshot.
 
 ## Where Claude Code keeps MCP servers
