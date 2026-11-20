@@ -6,7 +6,7 @@
 
 | 分类 | 技能数 | 内容 |
 |------|--------|------|
-| [渗透测试](渗透测试/README.md) | 851 | Anthropic 安全技能 818 个按 18 个子类归档（Web与API渗透/云安全/网络与侦察/威胁情报与检测/恶意软件分析/容器与基础设施/取证与应急/身份与域渗透/漏洞利用/社工与钓鱼/合规与治理/移动安全/IoT与工控/AI安全/逆向分析/网络安全防护/综合与流程/安全审计）+ Obsius 中文攻防 25 + 验证码对抗 + 威胁建模 37 + 越狱提示词 66 + 系统提示词泄露 1298（asgeirtj CC0） + 系统提示词存档 75（CL4R1T4S AGPL） + GrimPrompter 威胁建模库 339 |
+| [渗透测试](渗透测试/README.md) | 851 | Anthropic 安全技能 818 个按 18 个子类归档（Web与API渗透/云安全/网络与侦察/威胁情报与检测/恶意软件分析/容器与基础设施/取证与应急/身份与域渗透/漏洞利用/社工与钓鱼/合规与治理/移动安全/IoT与工控/AI安全/逆向分析/网络安全防护/综合与流程/安全审计）+ Obsius 中文攻防 25 + 验证码对抗 + 威胁建模 + 越狱提示词 66 + 系统提示词泄露 1298（asgeirtj CC0） + 系统提示词存档 75（CL4R1T4S AGPL） + GrimPrompter 威胁建模库 339 |
 | [工作流与执行](工作流与执行/README.md) | 322 | Superpowers 方法论 15、MattPocock 工程技能 39、T3 工作流 9、复合工程 CE 36、产品工程 44、ljg 思维模型 26、多 Agent 辩论、舆情检索、ClaudeCode 提示词模式、Codex 子代理 136 等 |
 | [逆向方法论](逆向方法论/README.md) | 123 | 网页 JS 逆向 + 通用逆向 122 技 + APK 2API 方法论 |
 | [UI设计](UI设计/README.md) | 87 | 设计风格 68 式、Emil 动效 19 技、去 AI 味设计 |
@@ -42,7 +42,7 @@
 | dslsdzc/rev-skills | Apache-2.0 | 122 |
 | phuryn/product-engineering | MIT | 44 |
 | mattpocock/skills | MIT | 39 |
-| jmanico/grim-prompter | MIT | 37 |
+
 | ILOVCTRY/Obsius-AI | Apache-2.0 | 25 |
 | baoyu-skills | MIT | 22 |
 | lijigang/ljg-skills | MIT | 26 |
@@ -66,7 +66,7 @@
 | langgptai/awesome-system-prompts | Apache-2.0 | 17 |
 | wanshuiyin/HERO-Anti-OverDefense | MIT | 8 |
 | IndyDevDan/fixing-smartass-opus-5 | MIT | 4 |
-| jmanico/grim-prompter | MIT | 339 |
+| jmanico/grim-prompter | MIT | 339（含技能全集时期衍生的威胁建模 37） |
 | x1xhlol/system-prompts-and-models-of-ai-tools（leaksLab） | GPLv3 | 80 |
 | sepia | MIT | 6 |
 | humanize | MIT | 2 |
@@ -79,8 +79,8 @@
 | huangbai-AI/guoshen | MIT | 1 |
 | js-reverse-skill | MIT | 1 |
 | mvanhorn/last30days-skill | MIT | 1 |
-| fixing-smartass-opus-5 | MIT | 1 |
-| HERO-Anti-OverDefense | MIT | 1 |
-| awesome-system-prompts | Apache-2.0 | — |
-| system-prompts-and-models-of-ai-tools 中文翻译项目 | MIT | — |
-| Fabric | MIT | — |
+
+
+| langgptai/awesome-system-prompts | Apache-2.0 | 17 |
+| system-prompts-and-models-of-ai-tools 中文翻译项目 | MIT | 330 |
+
