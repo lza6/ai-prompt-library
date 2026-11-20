@@ -37,6 +37,16 @@
 
 [精选补充/](精选补充/) — langgptai/awesome-system-prompts（Apache-2.0）17 篇：Agents 与 LLMs 精选系统提示词。
 
+## leaksLab 精选
+
+[leaksLab精选/](leaksLab精选/) — system-prompts-and-models-of-ai-tools（GPLv3，LeaksLab）80 篇 txt 转 md：33 个 AI 产品（Amp/Augment/Cursor/Devin/Kiro/Trae/Windsurf/v0/Notion/Perplexity 等）的系统提示词。收录前与全库做内容指纹去重（剔除 2 篇与已收 CC0 库重复），命名冲突文件加厂商前缀。
+
+## 来源与许可（新增）
+
+| 上游项目 | 许可 |
+|----------|------|
+| x1xhlol/system-prompts-and-models-of-ai-tools | GPLv3 |
+
 ## 来源与许可
 
 | 上游项目 | 许可 |
