@@ -2,10 +2,11 @@
 
 > 安全测试与自动化渗透
 
-本分类共 846 个技能。
+本分类共 847 个技能。
 
-## 技能清单（845）
+## 技能清单（846）
 
+- [越狱提示词](AI安全/越狱提示词/README.md)
 - [LLM](AI安全/LLM/LLM.md)
 - [LLM护栏](AI安全/LLM护栏/LLM护栏.md)
 - [OpenCTI](AI安全/OpenCTI/OpenCTI.md)
