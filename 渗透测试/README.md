@@ -2,13 +2,16 @@
 
 > 安全测试与自动化渗透
 
-本分类共 851 个技能。
+本分类共 854 个技能。
 
-## 技能清单（850）
+## 技能清单（853）
 
 - [系统提示词泄露](AI安全/系统提示词泄露/README.md)
 - [系统提示词存档](AI安全/系统提示词存档/README.md)
 - [leaksLab精选](AI安全/系统提示词泄露/leaksLab精选/)
+- [攻防流程中文技能库](攻防流程中文技能库/README.md)
+- [DevOps与云安全](DevOps与云安全/README.md)
+- [网安技能路由](网安技能路由/README.md)
 - [越狱提示词](AI安全/越狱提示词/README.md)
 - [LLM](AI安全/LLM/LLM.md)
 - [LLM护栏](AI安全/LLM护栏/LLM护栏.md)

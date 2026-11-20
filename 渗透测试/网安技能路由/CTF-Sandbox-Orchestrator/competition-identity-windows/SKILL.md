@@ -1,0 +1,18 @@
+# CTF: Windows / AD 域渗透
+
+## 适用场景
+
+Kerberos攻击、DCSync、Pass-the-Hash、BloodHound、AD CS证书攻击
+
+## 工作流程
+
+1. 分析题目附件和描述
+2. 识别题目类型和考点
+3. 选择合适的工具和方法
+4. 执行攻击/分析
+5. 提取 flag
+6. 生成 writeup
+
+## 常用工具
+
+根据具体题目类型选择对应工具，详见 references/ 目录下的参考文档。
